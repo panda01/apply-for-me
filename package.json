@@ -1,0 +1,50 @@
+{
+  "name": "apply-for-me",
+  "version": "1.0.0",
+  "description": "This Project will apply to jobs for you based.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:client": "vite --config client/vite.config.ts",
+    "dev:server": "tsx watch server/src/index.ts",
+    "dev:claude": "bash dev-claude.sh",
+    "build": "vite build --config client/vite.config.ts && tsc -p server/tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "tsc": "tsc --noEmit -p client/tsconfig.json && tsc --noEmit -p server/tsconfig.json"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/material": "^7.3.8",
+    "express": "^5.2.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/express": "^5.0.6",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/supertest": "^7.2.0",
+    "@vitejs/plugin-react": "^5.1.4",
+    "@vitest/coverage-v8": "^4.0.18",
+    "concurrently": "^9.2.1",
+    "eslint": "^10.0.2",
+    "globals": "^17.4.0",
+    "jsdom": "^28.1.0",
+    "supertest": "^7.2.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1",
+    "vite": "^7.3.1",
+    "vitest": "^4.0.18"
+  }
+}

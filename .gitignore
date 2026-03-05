@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Coverage reports
+coverage/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# TypeScript incremental build cache
+*.tsbuildinfo
