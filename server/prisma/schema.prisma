@@ -1,0 +1,22 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "generated/client"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model JobListing {
+  id           Int      @id @default(autoincrement())
+  title        String
+  url          String
+  description  String
+  post_date    DateTime
+  created_date DateTime @default(now())
+
+  @@map("jobs_listing")
+}
