@@ -4,11 +4,13 @@ import globals from "globals";
 
 export default tseslint.config(
   js.configs.recommended,
-  ...tseslint.configs.recommended,
+  tseslint.configs.stylisticTypeChecked,
+  tseslint.configs.strictTypeChecked,
   {
     languageOptions: {
       parserOptions: {
         tsconfigRootDir: import.meta.dirname,
+        projectService: true
       },
     },
   },
@@ -29,6 +31,6 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ["dist/", "node_modules/", "coverage/"],
+    ignores: ["dist/", "node_modules/", "coverage/", "eslint.config.mjs", "prisma.config.ts", "vitest.config.ts"],
   }
 );
