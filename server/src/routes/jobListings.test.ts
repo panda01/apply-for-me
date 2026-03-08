@@ -10,64 +10,355 @@ vi.mock("../prismaClient.js", () => {
         findMany: vi.fn(),
         findUnique: vi.fn(),
         delete: vi.fn(),
+        update: vi.fn(),
       },
     },
   };
 });
 
+vi.mock("../services/jobListingScraperService.js", () => {
+  return {
+    fetchJobListingFromUrl: vi.fn(),
+  };
+});
+
+const { mockParseDate } = vi.hoisted(() => ({
+  mockParseDate: vi.fn(),
+}));
+vi.mock("chrono-node", () => ({
+  parseDate: mockParseDate,
+}));
+
+const { mockReadFile } = vi.hoisted(() => ({
+  mockReadFile: vi.fn(),
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    default: { ...actual, readFile: mockReadFile },
+    readFile: mockReadFile,
+  };
+});
+
 import prisma from "../prismaClient.js";
+import { fetchJobListingFromUrl } from "../services/jobListingScraperService.js";
 
 const mockJobListing = {
   id: 1,
-  title: "Software Engineer",
-  url: "https://example.com/job/1",
-  description: "Build cool stuff",
-  post_date: new Date("2026-03-01T00:00:00.000Z"),
-  created_date: new Date("2026-03-05T00:00:00.000Z"),
+  title: "",
+  url: "https://linkedin.com/jobs/1",
+  description: "",
+  live_url: null,
+  post_date: new Date("2026-03-07T00:00:00.000Z"),
+  created_date: new Date("2026-03-07T00:00:00.000Z"),
+  status: "pending",
 };
+
+const mockCompletedJobListing = {
+  id: 1,
+  title: "Acme Corp - Software Engineer",
+  url: "https://linkedin.com/jobs/1",
+  description: "Build cool stuff",
+  live_url: null,
+  post_date: new Date("2026-03-01T00:00:00.000Z"),
+  created_date: new Date("2026-03-07T00:00:00.000Z"),
+  status: "completed",
+};
+
+const mockCredentialsJson = JSON.stringify({
+  email: "user@example.com",
+  password: "pass123",
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockParseDate.mockImplementation((dateString: string) => {
+    const parsed = new Date(dateString);
+    const isValidDate = !isNaN(parsed.getTime());
+    return isValidDate ? parsed : null;
+  });
 });
 
 describe("POST /api/job-listings", () => {
-  it("should create a new job listing and return 201", async () => {
+  it("should return 202 with a pending record when url is provided", async () => {
     vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
+    mockReadFile.mockResolvedValue(mockCredentialsJson);
+    vi.mocked(fetchJobListingFromUrl).mockResolvedValue({
+      title: "Software Engineer",
+      company: "Acme Corp",
+      description: "Build cool stuff",
+      postDate: "2026-03-01",
+      url: "https://linkedin.com/jobs/1",
+    });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
 
     const response = await request(app)
       .post("/api/job-listings")
-      .send({
-        title: "Software Engineer",
-        url: "https://example.com/job/1",
-        description: "Build cool stuff",
-        post_date: "2026-03-01T00:00:00.000Z",
-      });
+      .send({ url: "https://linkedin.com/jobs/1" });
 
-    expect(response.status).toBe(201);
-    expect(response.body.title).toBe("Software Engineer");
+    expect(response.status).toBe(202);
+    expect(response.body.status).toBe("pending");
+    expect(response.body.url).toBe("https://linkedin.com/jobs/1");
     expect(prisma.jobListing.create).toHaveBeenCalledOnce();
   });
 
-  it("should return 400 when required fields are missing", async () => {
+  it("should return 400 when url is missing", async () => {
     const response = await request(app)
       .post("/api/job-listings")
-      .send({ title: "Incomplete Listing" });
+      .send({});
 
     expect(response.status).toBe(400);
-    expect(response.body.error).toMatch(/Missing required fields/);
+    expect(response.body.error).toMatch(/Missing required field: url/);
     expect(prisma.jobListing.create).not.toHaveBeenCalled();
+  });
+
+  it("should return 400 when url is not a valid HTTP URL", async () => {
+    const response = await request(app)
+      .post("/api/job-listings")
+      .send({ url: "not-a-url" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Invalid url/);
+    expect(prisma.jobListing.create).not.toHaveBeenCalled();
+  });
+
+  it("should return 400 when url uses a non-HTTP protocol", async () => {
+    const response = await request(app)
+      .post("/api/job-listings")
+      .send({ url: "ftp://example.com/file" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Invalid url/);
+    expect(prisma.jobListing.create).not.toHaveBeenCalled();
+  });
+
+  it("should return 400 for javascript: protocol URLs", async () => {
+    const response = await request(app)
+      .post("/api/job-listings")
+      .send({ url: "javascript:alert(1)" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Invalid url/);
+    expect(prisma.jobListing.create).not.toHaveBeenCalled();
+  });
+
+  it("should update the record to completed after successful scraping", async () => {
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
+    mockReadFile.mockResolvedValue(mockCredentialsJson);
+    vi.mocked(fetchJobListingFromUrl).mockResolvedValue({
+      title: "Software Engineer",
+      company: "Acme Corp",
+      description: "Build cool stuff",
+      postDate: "2026-03-01",
+      url: "https://linkedin.com/jobs/1",
+    });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app)
+      .post("/api/job-listings")
+      .send({ url: "https://linkedin.com/jobs/1" });
+
+    // Wait for background scraping to complete
+    await vi.waitFor(() => {
+      expect(prisma.jobListing.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: {
+          title: "Acme Corp - Software Engineer",
+          description: "Build cool stuff",
+          post_date: expect.any(Date),
+          status: "completed",
+          live_url: null,
+        },
+      });
+    });
+  });
+
+  it("should set status to failed when scraping fails", async () => {
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
+    mockReadFile.mockResolvedValue(mockCredentialsJson);
+    vi.mocked(fetchJobListingFromUrl).mockRejectedValue(new Error("Scraping failed"));
+    vi.mocked(prisma.jobListing.update).mockResolvedValue({ ...mockJobListing, status: "failed" });
+
+    await request(app)
+      .post("/api/job-listings")
+      .send({ url: "https://linkedin.com/jobs/1" });
+
+    await vi.waitFor(() => {
+      expect(prisma.jobListing.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: { status: "failed", live_url: null },
+      });
+    });
+  });
+
+  it("should set status to failed when credentials file read fails", async () => {
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
+    mockReadFile.mockRejectedValue(new Error("ENOENT: no such file"));
+    vi.mocked(prisma.jobListing.update).mockResolvedValue({ ...mockJobListing, status: "failed" });
+
+    await request(app)
+      .post("/api/job-listings")
+      .send({ url: "https://linkedin.com/jobs/1" });
+
+    await vi.waitFor(() => {
+      expect(prisma.jobListing.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: { status: "failed", live_url: null },
+      });
+    });
+  });
+
+  it("should read credentials file for linkedin.com URLs and pass credentials to scraper", async () => {
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
+    mockReadFile.mockResolvedValue(mockCredentialsJson);
+    vi.mocked(fetchJobListingFromUrl).mockResolvedValue({
+      title: "Software Engineer",
+      company: "Acme Corp",
+      description: "Build cool stuff",
+      postDate: "2026-03-01",
+      url: "https://www.linkedin.com/jobs/view/123",
+    });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app)
+      .post("/api/job-listings")
+      .send({ url: "https://www.linkedin.com/jobs/view/123" });
+
+    await vi.waitFor(() => {
+      expect(mockReadFile).toHaveBeenCalledOnce();
+      expect(fetchJobListingFromUrl).toHaveBeenCalledWith(
+        "https://www.linkedin.com/jobs/view/123",
+        { email: "user@example.com", password: "pass123" },
+        expect.any(Function),
+      );
+    });
+  });
+
+  it("should not read credentials file for non-LinkedIn URLs", async () => {
+    const nonLinkedInPending = { ...mockJobListing, url: "https://example.com/jobs/1" };
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(nonLinkedInPending);
+    vi.mocked(fetchJobListingFromUrl).mockResolvedValue({
+      title: "Software Engineer",
+      company: "Example Inc",
+      description: "Build things",
+      postDate: "2026-03-01",
+      url: "https://example.com/jobs/1",
+    });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue({ ...nonLinkedInPending, status: "completed" });
+
+    await request(app)
+      .post("/api/job-listings")
+      .send({ url: "https://example.com/jobs/1" });
+
+    await vi.waitFor(() => {
+      expect(fetchJobListingFromUrl).toHaveBeenCalledWith("https://example.com/jobs/1", null, expect.any(Function));
+    });
+
+    expect(mockReadFile).not.toHaveBeenCalled();
+  });
+
+  it("should successfully parse a relative post date like '2 hours ago'", async () => {
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    mockParseDate.mockReturnValue(twoHoursAgo);
+
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
+    mockReadFile.mockResolvedValue(mockCredentialsJson);
+    vi.mocked(fetchJobListingFromUrl).mockResolvedValue({
+      title: "Software Engineer",
+      company: "Acme Corp",
+      description: "Build cool stuff",
+      postDate: "2 hours ago",
+      url: "https://linkedin.com/jobs/1",
+    });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app)
+      .post("/api/job-listings")
+      .send({ url: "https://linkedin.com/jobs/1" });
+
+    await vi.waitFor(() => {
+      expect(prisma.jobListing.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: {
+          title: "Acme Corp - Software Engineer",
+          description: "Build cool stuff",
+          post_date: twoHoursAgo,
+          status: "completed",
+          live_url: null,
+        },
+      });
+    });
+  });
+
+  it("should fall back to current date when postDate is unparseable", async () => {
+    mockParseDate.mockReturnValue(null);
+
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
+    mockReadFile.mockResolvedValue(mockCredentialsJson);
+    vi.mocked(fetchJobListingFromUrl).mockResolvedValue({
+      title: "Software Engineer",
+      company: "Acme Corp",
+      description: "Build cool stuff",
+      postDate: "not a real date",
+      url: "https://linkedin.com/jobs/1",
+    });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app)
+      .post("/api/job-listings")
+      .send({ url: "https://linkedin.com/jobs/1" });
+
+    await vi.waitFor(() => {
+      expect(prisma.jobListing.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: {
+          title: "Acme Corp - Software Engineer",
+          description: "Build cool stuff",
+          post_date: expect.any(Date),
+          status: "completed",
+          live_url: null,
+        },
+      });
+    });
+  });
+
+  it("should format title without company when company is empty", async () => {
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
+    mockReadFile.mockResolvedValue(mockCredentialsJson);
+    vi.mocked(fetchJobListingFromUrl).mockResolvedValue({
+      title: "Software Engineer",
+      company: "",
+      description: "Build cool stuff",
+      postDate: "2026-03-01",
+      url: "https://linkedin.com/jobs/1",
+    });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue({ ...mockCompletedJobListing, title: "Software Engineer" });
+
+    await request(app)
+      .post("/api/job-listings")
+      .send({ url: "https://linkedin.com/jobs/1" });
+
+    await vi.waitFor(() => {
+      expect(prisma.jobListing.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: expect.objectContaining({
+          title: "Software Engineer",
+        }),
+      });
+    });
   });
 });
 
 describe("GET /api/job-listings", () => {
   it("should return all job listings", async () => {
-    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockJobListing]);
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
 
     const response = await request(app).get("/api/job-listings");
 
     expect(response.status).toBe(200);
     expect(response.body).toHaveLength(1);
-    expect(response.body[0].title).toBe("Software Engineer");
+    expect(response.body[0].title).toBe("Acme Corp - Software Engineer");
   });
 
   it("should return an empty array when no listings exist", async () => {
@@ -82,12 +373,12 @@ describe("GET /api/job-listings", () => {
 
 describe("GET /api/job-listings/:id", () => {
   it("should return a job listing by id", async () => {
-    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockCompletedJobListing);
 
     const response = await request(app).get("/api/job-listings/1");
 
     expect(response.status).toBe(200);
-    expect(response.body.title).toBe("Software Engineer");
+    expect(response.body.title).toBe("Acme Corp - Software Engineer");
   });
 
   it("should return 404 when job listing is not found", async () => {
@@ -109,13 +400,13 @@ describe("GET /api/job-listings/:id", () => {
 
 describe("DELETE /api/job-listings/:id", () => {
   it("should delete a job listing and return it", async () => {
-    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
-    vi.mocked(prisma.jobListing.delete).mockResolvedValue(mockJobListing);
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockCompletedJobListing);
+    vi.mocked(prisma.jobListing.delete).mockResolvedValue(mockCompletedJobListing);
 
     const response = await request(app).delete("/api/job-listings/1");
 
     expect(response.status).toBe(200);
-    expect(response.body.title).toBe("Software Engineer");
+    expect(response.body.title).toBe("Acme Corp - Software Engineer");
     expect(prisma.jobListing.delete).toHaveBeenCalledOnce();
   });
 

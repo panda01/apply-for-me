@@ -9,10 +9,10 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "lcov"],
       thresholds: {
-        statements: 80,
-        branches: 80,
-        functions: 80,
-        lines: 80,
+        statements: 90,
+        branches: 90,
+        functions: 90,
+        lines: 90,
       },
       include: ["client/src/**/*.{ts,tsx}", "server/src/**/*.ts"],
       exclude: [
@@ -20,6 +20,8 @@ export default defineConfig({
         "**/*.d.ts",
         "client/src/main.tsx",
         "server/src/index.ts",
+        "server/src/scripts/**",
+        "server/src/prismaClient.ts",
       ],
     },
     environment: "jsdom",

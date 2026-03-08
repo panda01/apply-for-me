@@ -16,3 +16,7 @@ coverage/
 *.tsbuildinfo
 
 /server/prisma/generated/
+dev.db
+
+# LinkedIn credentials
+server/src/scripts/linkedin_credentials.json

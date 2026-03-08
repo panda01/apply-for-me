@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -e
 
+# Load environment variables from .env
+set -a
+source .env
+set +a
+
+# Verify required port variables are set
+if [ -z "$SERVER_PORT" ]; then
+  echo "SERVER_PORT is not set in .env"
+  exit 1
+fi
+
+if [ -z "$CLIENT_PORT" ]; then
+  echo "CLIENT_PORT is not set in .env"
+  exit 1
+fi
+
 # Start both dev servers in the background
 npx concurrently \
   --names "server,client" \
@@ -13,7 +29,7 @@ CONCURRENTLY_PID=$!
 sleep 5
 
 # Check if the backend is alive
-if curl -s http://localhost:3001/api/health > /dev/null 2>&1; then
+if curl -s http://localhost:${SERVER_PORT}/api/health > /dev/null 2>&1; then
   echo "Backend is running"
 else
   echo "Backend failed to start"
@@ -24,7 +40,7 @@ else
 fi
 
 # Check if the frontend is alive
-if curl -s http://localhost:5173 > /dev/null 2>&1; then
+if curl -s http://localhost:${CLIENT_PORT} > /dev/null 2>&1; then
   echo "Frontend is running"
 else
   echo "Frontend failed to start"

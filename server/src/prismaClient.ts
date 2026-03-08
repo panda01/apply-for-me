@@ -7,8 +7,14 @@ import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
  * Reuses the same connection across the application to avoid
  * creating multiple database connections.
  */
+const databaseUrl = process.env["DATABASE_URL"];
+const isMissingDatabaseUrl = !databaseUrl;
+if (isMissingDatabaseUrl) {
+  throw new Error("DATABASE_URL environment variable is not set");
+}
+
 const adapter = new PrismaBetterSqlite3({
-  url: process.env["DATABASE_URL"] ?? "file:./prisma/dev.db",
+  url: databaseUrl,
 });
 
 const prisma = new PrismaClient({ adapter });

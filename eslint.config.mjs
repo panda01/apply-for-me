@@ -29,6 +29,17 @@ export default tseslint.config(
         ...globals.node,
       },
     },
+    rules: {
+      "require-jsdoc": ["error", {
+        "require": {
+          "FunctionDeclaration": true,
+          "MethodDefinition": false,
+          "ClassDeclaration": false,
+          "ArrowFunctionExpression": false,
+          "FunctionExpression": false
+        }
+      }]
+    }
   },
   {
     ignores: ["dist/", "node_modules/", "coverage/", "eslint.config.mjs", "prisma.config.ts", "vitest.config.ts"],
