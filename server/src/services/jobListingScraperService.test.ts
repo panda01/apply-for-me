@@ -281,6 +281,38 @@ describe("fetchJobListingFromUrl", () => {
     expect(onLiveUrlReady).not.toHaveBeenCalled();
   });
 
+  it("should warn when sessionId is not available within timeout", async () => {
+    process.env["BROWSER_USE_API"] = "test-key";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const originalSetTimeout = globalThis.setTimeout;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    vi.spyOn(globalThis, "setTimeout").mockImplementation((fn: any) => {
+      return originalSetTimeout(fn, 0);
+    });
+
+    const mockSessionRunWithNullId = {
+      sessionId: null as string | null,
+      then(onFulfilled: (value: Record<string, unknown>) => unknown, onRejected?: (reason: unknown) => unknown) {
+        return Promise.resolve({
+          id: "session-timeout",
+          status: "idle",
+          output: { title: "Engineer", company: "Corp", description: "Work", postDate: "1 day ago" },
+        }).then(onFulfilled, onRejected);
+      },
+    };
+    mockRun.mockReturnValue(mockSessionRunWithNullId);
+
+    const onLiveUrlReady = vi.fn();
+    await fetchJobListingFromUrl("https://example.com/jobs/1", null, onLiveUrlReady);
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Session ID not available within timeout"));
+    expect(onLiveUrlReady).not.toHaveBeenCalled();
+
+    vi.mocked(globalThis.setTimeout).mockRestore();
+    warnSpy.mockRestore();
+  });
+
   it("should not call onLiveUrlReady when session has no liveUrl", async () => {
     process.env["BROWSER_USE_API"] = "test-key";
 

@@ -16,29 +16,29 @@ const mockCompletedListing: JobListingResponse = {
   title: "Acme Corp - Software Engineer",
   url: "https://linkedin.com/jobs/1",
   description: "Build cool stuff with great teams",
-  status: "completed",
+  status: "init",
   live_url: null,
   post_date: "2026-03-01T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
 };
 
-const mockPendingListing: JobListingResponse = {
+const mockApplyingListing: JobListingResponse = {
   id: 2,
   title: "",
   url: "https://linkedin.com/jobs/2",
   description: "",
-  status: "pending",
+  status: "applying",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
 };
 
-const mockFailedListing: JobListingResponse = {
+const mockErrorListing: JobListingResponse = {
   id: 3,
   title: "",
   url: "https://linkedin.com/jobs/3",
   description: "",
-  status: "failed",
+  status: "error_applying",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
@@ -72,20 +72,20 @@ describe("JobList", () => {
     renderJobList([mockCompletedListing]);
 
     expect(screen.getByText("Acme Corp - Software Engineer")).toBeDefined();
-    expect(screen.getByText("Completed")).toBeDefined();
+    expect(screen.getByText("Ready")).toBeDefined();
   });
 
   it("should render pending listings with scraping indicator", () => {
-    renderJobList([mockPendingListing]);
+    renderJobList([mockApplyingListing]);
 
     expect(screen.getByText("Scraping...")).toBeDefined();
-    expect(screen.getByText("Pending")).toBeDefined();
+    expect(screen.getByText("Applying")).toBeDefined();
   });
 
   it("should render failed listings with error status", () => {
-    renderJobList([mockFailedListing]);
+    renderJobList([mockErrorListing]);
 
-    expect(screen.getByText("Failed")).toBeDefined();
+    expect(screen.getByText("Error")).toBeDefined();
   });
 
   it("should show delete confirmation dialog and delete on confirm", async () => {
@@ -123,11 +123,11 @@ describe("JobList", () => {
   });
 
   it("should display all status types correctly", () => {
-    renderJobList([mockCompletedListing, mockPendingListing, mockFailedListing]);
+    renderJobList([mockCompletedListing, mockApplyingListing, mockErrorListing]);
 
-    expect(screen.getByText("Completed")).toBeDefined();
-    expect(screen.getByText("Pending")).toBeDefined();
-    expect(screen.getByText("Failed")).toBeDefined();
+    expect(screen.getByText("Ready")).toBeDefined();
+    expect(screen.getByText("Applying")).toBeDefined();
+    expect(screen.getByText("Error")).toBeDefined();
   });
 
   it("should render unknown status with fallback chip", () => {

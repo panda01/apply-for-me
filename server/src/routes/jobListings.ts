@@ -31,17 +31,17 @@ router.post("/", async (req: Request, res: Response) => {
     return;
   }
 
-  const pendingJobListing = await prisma.jobListing.create({
+  const newJobListing = await prisma.jobListing.create({
     data: {
       url,
       title: "",
       description: "",
       post_date: new Date(),
-      status: "pending",
+      status: "init",
     },
   });
 
-  res.status(202).json(pendingJobListing);
+  res.status(202).json(newJobListing);
 
   const parsedUrl = new URL(url);
   const isLinkedInUrl = parsedUrl.hostname === "linkedin.com" || parsedUrl.hostname.endsWith(".linkedin.com");
@@ -49,7 +49,7 @@ router.post("/", async (req: Request, res: Response) => {
     ? resolve(__dirname, "../scripts/linkedin_credentials.json")
     : null;
 
-  scrapeAndUpdateJobListing(pendingJobListing.id, url, credentialsPath).catch(() => {
+  scrapeAndUpdateJobListing(newJobListing.id, url, credentialsPath).catch(() => {
     /* error already handled inside */
   });
 });
@@ -72,8 +72,9 @@ function parsePostDate(postDateString: string): Date {
 
 /**
  * Reads the credentials file (if provided), scrapes the job listing, and updates
- * the database record with the scraped data or a failed status.
- * @param {number} jobListingId - The ID of the pending job listing record
+ * the database record with the scraped title, description, and post date.
+ * Does not modify the job's application status — status only tracks the application lifecycle.
+ * @param {number} jobListingId - The ID of the job listing record to enrich
  * @param {string} url - The job listing URL to scrape
  * @param {string | null} credentialsPath - Absolute path to the LinkedIn credentials JSON file, or null if no login is needed
  */
@@ -85,14 +86,8 @@ async function scrapeAndUpdateJobListing(jobListingId: number, url: string, cred
       const credentialsJson = await readFile(credentialsPath, "utf-8");
       credentials = JSON.parse(credentialsJson) as LinkedInCredentials;
     }
-    const handleLiveUrlReady = async (liveUrl: string) => {
-      await prisma.jobListing.update({
-        where: { id: jobListingId },
-        data: { live_url: liveUrl },
-      });
-    };
 
-    const scrapedData = await fetchJobListingFromUrl(url, credentials, handleLiveUrlReady);
+    const scrapedData = await fetchJobListingFromUrl(url, credentials);
 
     const formattedTitle = scrapedData.company
       ? `${scrapedData.company} - ${scrapedData.title}`
@@ -104,17 +99,62 @@ async function scrapeAndUpdateJobListing(jobListingId: number, url: string, cred
         title: formattedTitle,
         description: scrapedData.description,
         post_date: parsePostDate(scrapedData.postDate),
-        status: "completed",
-        live_url: null,
       },
     });
   } catch {
-    await prisma.jobListing.update({
-      where: { id: jobListingId },
-      data: { status: "failed", live_url: null },
-    });
+    console.error(`[scraper] Failed to scrape job listing ${jobListingId} at ${url}`);
   }
 }
+
+/**
+ * POST /api/job-listings/bulk
+ * Accepts an array of job listing URLs and inserts them all with status "init".
+ * No background scraping is triggered — the records are created with just the URL.
+ * @param {string[]} req.body.urls - Array of job posting URLs to import
+ * @returns {object} 201 - The count of created records and the records themselves
+ * @returns {object} 400 - Missing or invalid urls field error
+ */
+router.post("/bulk", async (req: Request, res: Response) => {
+  const { urls } = req.body;
+
+  const isMissingUrls = !urls || !Array.isArray(urls);
+  if (isMissingUrls) {
+    res.status(400).json({ error: "Missing required field: urls (must be an array)" });
+    return;
+  }
+
+  const hasNoUrls = urls.length === 0;
+  if (hasNoUrls) {
+    res.status(400).json({ error: "urls array must not be empty" });
+    return;
+  }
+
+  const invalidUrls = urls.filter((url: unknown) => {
+    const isValidHttpUrl = typeof url === "string" && /^https?:\/\//i.test(url) && URL.canParse(url);
+    return !isValidHttpUrl;
+  });
+
+  const hasInvalidUrls = invalidUrls.length > 0;
+  if (hasInvalidUrls) {
+    res.status(400).json({ error: "Invalid URLs found", invalidUrls });
+    return;
+  }
+
+  const createdListings = await Promise.all(
+    urls.map((url: string) =>
+      prisma.jobListing.create({
+        data: {
+          url,
+          title: "",
+          description: "",
+          status: "init",
+        },
+      })
+    )
+  );
+
+  res.status(201).json({ count: createdListings.length, listings: createdListings });
+});
 
 /**
  * GET /api/job-listings

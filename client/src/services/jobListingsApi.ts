@@ -88,3 +88,92 @@ export async function deleteJobListing(id: number): Promise<JobListingResponse> 
 
   return response.json() as Promise<JobListingResponse>;
 }
+
+/**
+ * Bulk-creates job listings from an array of URLs.
+ * @param {string[]} urls - The job listing URLs to import
+ * @returns {Promise<{ count: number; listings: JobListingResponse[] }>} The created records
+ * @throws {Error} If the API request fails
+ */
+export async function bulkCreateJobListings(urls: string[]): Promise<{ count: number; listings: JobListingResponse[] }> {
+  const response = await fetch("/api/job-listings/bulk", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ urls }),
+  });
+
+  const isNotOk = !response.ok;
+  if (isNotOk) {
+    const errorBody = await response.json() as { error?: string };
+    throw new Error(errorBody.error ?? "Failed to bulk create job listings");
+  }
+
+  return response.json() as Promise<{ count: number; listings: JobListingResponse[] }>;
+}
+
+/**
+ * Starts the application process for a single job listing.
+ * @param {number} id - The ID of the job listing to apply to
+ * @returns {Promise<JobListingResponse>} The job listing with status "applying"
+ * @throws {Error} If the API request fails
+ */
+export async function applyToJob(id: number): Promise<JobListingResponse> {
+  const response = await fetch(`/api/job-listings/${id}/apply`, {
+    method: "POST",
+  });
+
+  const isNotOk = !response.ok;
+  if (isNotOk) {
+    const errorBody = await response.json() as { error?: string };
+    throw new Error(errorBody.error ?? "Failed to start job application");
+  }
+
+  return response.json() as Promise<JobListingResponse>;
+}
+
+/**
+ * Response from the batch apply status endpoint.
+ */
+export interface BatchApplyStatusResponse {
+  isRunning: boolean;
+  currentJobId: number | null;
+  completed: number[];
+  errors: Array<{ jobId: number; error: string }>;
+  totalJobs: number;
+  remaining: number;
+}
+
+/**
+ * Starts the batch application process for all eligible job listings.
+ * @returns {Promise<{ message: string; totalJobs: number }>} Batch start confirmation
+ * @throws {Error} If the API request fails
+ */
+export async function startBatchApply(): Promise<{ message: string; totalJobs: number }> {
+  const response = await fetch("/api/job-listings/apply-batch", {
+    method: "POST",
+  });
+
+  const isNotOk = !response.ok;
+  if (isNotOk) {
+    const errorBody = await response.json() as { error?: string };
+    throw new Error(errorBody.error ?? "Failed to start batch application");
+  }
+
+  return response.json() as Promise<{ message: string; totalJobs: number }>;
+}
+
+/**
+ * Gets the current status of the batch application process.
+ * @returns {Promise<BatchApplyStatusResponse>} The current batch status
+ * @throws {Error} If the API request fails
+ */
+export async function getBatchApplyStatus(): Promise<BatchApplyStatusResponse> {
+  const response = await fetch("/api/job-listings/apply-batch/status");
+
+  const isNotOk = !response.ok;
+  if (isNotOk) {
+    throw new Error("Failed to fetch batch apply status");
+  }
+
+  return response.json() as Promise<BatchApplyStatusResponse>;
+}

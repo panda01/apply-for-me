@@ -22,11 +22,12 @@ describe("NavMenu", () => {
     expect(screen.getByText("Apply For Me")).toBeDefined();
   });
 
-  it("should render navigation links for Add Job and Jobs List", () => {
+  it("should render navigation links for Add Job, Jobs List, and Apply", () => {
     renderNavMenu();
 
     expect(screen.getByRole("link", { name: /Add Job/ })).toBeDefined();
     expect(screen.getByRole("link", { name: /Jobs List/ })).toBeDefined();
+    expect(screen.getByRole("link", { name: /Apply/ })).toBeDefined();
   });
 
   it("should highlight Add Job link when on the root route", () => {

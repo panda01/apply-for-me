@@ -34,7 +34,7 @@ describe("AddJobForm", () => {
     const onJobAdded = vi.fn();
     vi.mocked(createJobListing).mockResolvedValue({
       id: 42, title: "", url: "https://linkedin.com/jobs/1",
-      description: "", post_date: "", created_date: "", status: "pending", live_url: null,
+      description: "", post_date: "", created_date: "", status: "init", live_url: null,
     });
 
     render(<AddJobForm onJobAdded={onJobAdded} />);
@@ -82,7 +82,7 @@ describe("AddJobForm", () => {
     const user = userEvent.setup();
     vi.mocked(createJobListing).mockResolvedValue({
       id: 1, title: "", url: "https://linkedin.com/jobs/1",
-      description: "", post_date: "", created_date: "", status: "pending", live_url: null,
+      description: "", post_date: "", created_date: "", status: "init", live_url: null,
     });
 
     render(<AddJobForm onJobAdded={vi.fn()} />);

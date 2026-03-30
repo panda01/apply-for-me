@@ -9,7 +9,7 @@ import { getJobListing, type JobListingResponse } from "../services/jobListingsA
 
 /**
  * Page that displays the full details of a single job listing.
- * When the listing is pending, shows a live browser view iframe and polls for updates.
+ * When the listing is applying, shows a live browser view iframe and polls for updates.
  * When completed or failed, shows the final job details.
  */
 function JobViewPage() {
@@ -44,7 +44,7 @@ function JobViewPage() {
   }, [fetchJobListing]);
 
   useEffect(() => {
-    const isPending = jobListing?.status === "pending";
+    const isPending = jobListing?.status === "applying";
 
     if (isPending) {
       const hasNoExistingPoll = !pollIntervalRef.current;
@@ -67,16 +67,18 @@ function JobViewPage() {
   }, [jobListing, fetchJobListing]);
 
   const getStatusChip = (status: string) => {
-    const statusConfig: Record<string, { color: "warning" | "success" | "error"; label: string }> = {
-      pending: { color: "warning", label: "Pending" },
-      completed: { color: "success", label: "Completed" },
-      failed: { color: "error", label: "Failed" },
+    const statusConfig: Record<string, { color: "default" | "warning" | "success" | "error" | "info"; label: string }> = {
+      init: { color: "default", label: "Ready" },
+      applying: { color: "info", label: "Applying" },
+      applied: { color: "success", label: "Applied" },
+      error_applying: { color: "error", label: "Error" },
+      closed: { color: "default", label: "Closed" },
     };
     const config = statusConfig[status] ?? { color: "warning" as const, label: status };
     return <Chip color={config.color} label={config.label} />;
   };
 
-  const isPending = jobListing?.status === "pending";
+  const isPending = jobListing?.status === "applying";
   const hasLiveUrl = !!jobListing?.live_url;
 
   return (
@@ -105,13 +107,13 @@ function JobViewPage() {
           <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
             <CircularProgress size={24} />
             <Typography variant="h5" component="h1">
-              Scraping Job Details...
+              Applying to Job...
             </Typography>
             {getStatusChip(jobListing.status)}
           </Box>
 
           <Typography color="text.secondary" sx={{ mb: 2 }}>
-            The browser agent is extracting job details from the posted URL. This may take up to a minute.
+            The browser agent is applying to this job. This may take a few minutes.
           </Typography>
 
           {hasLiveUrl && (

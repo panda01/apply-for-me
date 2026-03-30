@@ -5,7 +5,7 @@ import JobList from "../components/JobList";
 
 /**
  * Page that displays all job listings with automatic polling.
- * Fetches listings on mount and polls every 5 seconds while any listing is pending.
+ * Fetches listings on mount and polls every 5 seconds while any listing is applying.
  */
 function JobsListPage() {
   const [jobListings, setJobListings] = useState<JobListingResponse[]>([]);
@@ -31,9 +31,9 @@ function JobsListPage() {
   }, [fetchListings]);
 
   useEffect(() => {
-    const hasPendingListings = jobListings.some((listing) => listing.status === "pending");
+    const hasApplyingListings = jobListings.some((listing) => listing.status === "applying");
 
-    if (hasPendingListings) {
+    if (hasApplyingListings) {
       const hasNoExistingPoll = !pollIntervalRef.current;
       if (hasNoExistingPoll) {
         pollIntervalRef.current = setInterval(fetchListings, 5000);

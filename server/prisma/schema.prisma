@@ -10,15 +10,47 @@ datasource db {
   provider = "sqlite"
 }
 
+// Tracks the application lifecycle of a job listing.
+// Other lifecycle statuses (e.g. waiting_for_response, approved, rejected)
+// will be handled by separate services and added later.
+enum JobStatus {
+  init // Just have the job URL, not yet applied
+  applying // Application in progress via browser-use
+  applied // Application submitted without error
+  error_applying // Something went wrong during the application process
+  closed // Job listing is no longer accepting applications
+}
+
 model JobListing {
-  id           Int      @id @default(autoincrement())
-  title        String
+  id           Int       @id @default(autoincrement())
+  title        String?
   url          String
-  description  String
-  status       String   @default("pending")
-  live_url     String?
-  post_date    DateTime
-  created_date DateTime @default(now())
+  description  String?
+  live_url     String? // Temporarily holds the browser-use live view URL for the iframe during application
+  status       JobStatus @default(init)
+  post_date    DateTime?
+  created_date DateTime  @default(now())
 
   @@map("jobs_listing")
+}
+
+model ApplicationAttemptLogs {
+  id             Int      @id @default(autoincrement())
+  job_listing_id Int
+  logs           String // Stores the logs from the application attempt, can be used for debugging and improving the application process
+  end_response   String
+  created_date   DateTime @default(now())
+
+  @@map("application_attempt_logs")
+}
+
+// This model is used to store the email responses for each job listing
+model EmailResponses {
+  id             Int      @id @default(autoincrement())
+  job_listing_id Int
+  email          String
+  response       String?
+  created_date   DateTime @default(now())
+
+  @@map("email_responses")
 }

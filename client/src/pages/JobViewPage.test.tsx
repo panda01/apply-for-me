@@ -14,18 +14,18 @@ const mockCompletedListing = {
   title: "Acme Corp - Software Engineer",
   url: "https://linkedin.com/jobs/1",
   description: "Build cool stuff with great teams and cutting-edge technology.",
-  status: "completed",
+  status: "init",
   live_url: null,
   post_date: "2026-03-01T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
 };
 
-const mockPendingListing = {
+const mockApplyingListing = {
   id: 1,
   title: "",
   url: "https://linkedin.com/jobs/1",
   description: "",
-  status: "pending",
+  status: "applying",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
@@ -71,7 +71,7 @@ describe("JobViewPage", () => {
       expect(screen.getByText("Acme Corp - Software Engineer")).toBeDefined();
     });
 
-    expect(screen.getByText("Completed")).toBeDefined();
+    expect(screen.getByText("Ready")).toBeDefined();
     expect(screen.getByText(/Build cool stuff with great teams/)).toBeDefined();
     expect(screen.getByText("https://linkedin.com/jobs/1")).toBeDefined();
   });
@@ -145,7 +145,7 @@ describe("JobViewPage", () => {
 
   it("should show scraping progress view when listing is pending", async () => {
     vi.useFakeTimers();
-    vi.mocked(getJobListing).mockResolvedValue(mockPendingListing);
+    vi.mocked(getJobListing).mockResolvedValue(mockApplyingListing);
 
     await act(async () => {
       renderJobViewPage();
@@ -155,15 +155,15 @@ describe("JobViewPage", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
 
-    expect(screen.getByText("Scraping Job Details...")).toBeDefined();
-    expect(screen.getByText("Pending")).toBeDefined();
+    expect(screen.getByText("Applying to Job...")).toBeDefined();
+    expect(screen.getByText("Applying")).toBeDefined();
     expect(screen.getByText(/Waiting for browser session to start/)).toBeDefined();
   });
 
   it("should show iframe when pending listing has a live_url", async () => {
     vi.useFakeTimers();
     const pendingWithLiveUrl = {
-      ...mockPendingListing,
+      ...mockApplyingListing,
       live_url: "https://live.browser-use.com/session/abc123",
     };
     vi.mocked(getJobListing).mockResolvedValue(pendingWithLiveUrl);
@@ -185,7 +185,7 @@ describe("JobViewPage", () => {
   it("should poll every 3 seconds when listing is pending", async () => {
     vi.useFakeTimers();
     vi.mocked(getJobListing)
-      .mockResolvedValueOnce(mockPendingListing)
+      .mockResolvedValueOnce(mockApplyingListing)
       .mockResolvedValueOnce(mockCompletedListing);
 
     await act(async () => {
@@ -208,7 +208,7 @@ describe("JobViewPage", () => {
   it("should stop polling and show details when listing becomes completed", async () => {
     vi.useFakeTimers();
     vi.mocked(getJobListing)
-      .mockResolvedValueOnce(mockPendingListing)
+      .mockResolvedValueOnce(mockApplyingListing)
       .mockResolvedValueOnce(mockCompletedListing);
 
     await act(async () => {
@@ -220,7 +220,7 @@ describe("JobViewPage", () => {
     });
 
     // Should be in pending state
-    expect(screen.getByText("Scraping Job Details...")).toBeDefined();
+    expect(screen.getByText("Applying to Job...")).toBeDefined();
 
     // Advance to trigger poll — the resolved mock will update state
     await act(async () => {
@@ -229,7 +229,7 @@ describe("JobViewPage", () => {
 
     // Should now show completed details
     expect(screen.getByText("Acme Corp - Software Engineer")).toBeDefined();
-    expect(screen.getByText("Completed")).toBeDefined();
+    expect(screen.getByText("Ready")).toBeDefined();
 
     // Advance more - should not poll again
     await act(async () => {

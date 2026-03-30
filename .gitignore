@@ -20,3 +20,6 @@ dev.db
 
 # LinkedIn credentials
 server/src/scripts/linkedin_credentials.json
+
+# Application logs and screenshots
+logs/

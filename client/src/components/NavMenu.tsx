@@ -11,6 +11,7 @@ function NavMenu() {
   const navItems = [
     { label: "Add Job", path: "/" },
     { label: "Jobs List", path: "/jobs" },
+    { label: "Apply", path: "/apply" },
   ];
 
   return (

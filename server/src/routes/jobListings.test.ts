@@ -52,7 +52,7 @@ const mockJobListing = {
   live_url: null,
   post_date: new Date("2026-03-07T00:00:00.000Z"),
   created_date: new Date("2026-03-07T00:00:00.000Z"),
-  status: "pending",
+  status: "init" as const,
 };
 
 const mockCompletedJobListing = {
@@ -63,7 +63,7 @@ const mockCompletedJobListing = {
   live_url: null,
   post_date: new Date("2026-03-01T00:00:00.000Z"),
   created_date: new Date("2026-03-07T00:00:00.000Z"),
-  status: "completed",
+  status: "init" as const,
 };
 
 const mockCredentialsJson = JSON.stringify({
@@ -98,7 +98,7 @@ describe("POST /api/job-listings", () => {
       .send({ url: "https://linkedin.com/jobs/1" });
 
     expect(response.status).toBe(202);
-    expect(response.body.status).toBe("pending");
+    expect(response.body.status).toBe("init");
     expect(response.body.url).toBe("https://linkedin.com/jobs/1");
     expect(prisma.jobListing.create).toHaveBeenCalledOnce();
   });
@@ -143,7 +143,7 @@ describe("POST /api/job-listings", () => {
     expect(prisma.jobListing.create).not.toHaveBeenCalled();
   });
 
-  it("should update the record to completed after successful scraping", async () => {
+  it("should enrich the record with scraped data after successful scraping", async () => {
     vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
     mockReadFile.mockResolvedValue(mockCredentialsJson);
     vi.mocked(fetchJobListingFromUrl).mockResolvedValue({
@@ -159,7 +159,7 @@ describe("POST /api/job-listings", () => {
       .post("/api/job-listings")
       .send({ url: "https://linkedin.com/jobs/1" });
 
-    // Wait for background scraping to complete
+    // Wait for background scraping to complete — only title/description/post_date are updated, not status
     await vi.waitFor(() => {
       expect(prisma.jobListing.update).toHaveBeenCalledWith({
         where: { id: 1 },
@@ -167,46 +167,44 @@ describe("POST /api/job-listings", () => {
           title: "Acme Corp - Software Engineer",
           description: "Build cool stuff",
           post_date: expect.any(Date),
-          status: "completed",
-          live_url: null,
         },
       });
     });
   });
 
-  it("should set status to failed when scraping fails", async () => {
+  it("should not update the record when scraping fails", async () => {
     vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
     mockReadFile.mockResolvedValue(mockCredentialsJson);
     vi.mocked(fetchJobListingFromUrl).mockRejectedValue(new Error("Scraping failed"));
-    vi.mocked(prisma.jobListing.update).mockResolvedValue({ ...mockJobListing, status: "failed" });
 
     await request(app)
       .post("/api/job-listings")
       .send({ url: "https://linkedin.com/jobs/1" });
 
+    // Give the background task time to run
     await vi.waitFor(() => {
-      expect(prisma.jobListing.update).toHaveBeenCalledWith({
-        where: { id: 1 },
-        data: { status: "failed", live_url: null },
-      });
+      expect(fetchJobListingFromUrl).toHaveBeenCalled();
     });
+
+    // Scraping failure should not trigger a status update
+    expect(prisma.jobListing.update).not.toHaveBeenCalled();
   });
 
-  it("should set status to failed when credentials file read fails", async () => {
+  it("should not update the record when credentials file read fails", async () => {
     vi.mocked(prisma.jobListing.create).mockResolvedValue(mockJobListing);
     mockReadFile.mockRejectedValue(new Error("ENOENT: no such file"));
-    vi.mocked(prisma.jobListing.update).mockResolvedValue({ ...mockJobListing, status: "failed" });
 
     await request(app)
       .post("/api/job-listings")
       .send({ url: "https://linkedin.com/jobs/1" });
 
+    // Give the background task time to run
     await vi.waitFor(() => {
-      expect(prisma.jobListing.update).toHaveBeenCalledWith({
-        where: { id: 1 },
-        data: { status: "failed", live_url: null },
-      });
+      expect(mockReadFile).toHaveBeenCalled();
     });
+
+    // Credentials failure should not trigger a status update
+    expect(prisma.jobListing.update).not.toHaveBeenCalled();
   });
 
   it("should read credentials file for linkedin.com URLs and pass credentials to scraper", async () => {
@@ -230,7 +228,6 @@ describe("POST /api/job-listings", () => {
       expect(fetchJobListingFromUrl).toHaveBeenCalledWith(
         "https://www.linkedin.com/jobs/view/123",
         { email: "user@example.com", password: "pass123" },
-        expect.any(Function),
       );
     });
   });
@@ -245,14 +242,14 @@ describe("POST /api/job-listings", () => {
       postDate: "2026-03-01",
       url: "https://example.com/jobs/1",
     });
-    vi.mocked(prisma.jobListing.update).mockResolvedValue({ ...nonLinkedInPending, status: "completed" });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue({ ...nonLinkedInPending, status: "init" as const });
 
     await request(app)
       .post("/api/job-listings")
       .send({ url: "https://example.com/jobs/1" });
 
     await vi.waitFor(() => {
-      expect(fetchJobListingFromUrl).toHaveBeenCalledWith("https://example.com/jobs/1", null, expect.any(Function));
+      expect(fetchJobListingFromUrl).toHaveBeenCalledWith("https://example.com/jobs/1", null);
     });
 
     expect(mockReadFile).not.toHaveBeenCalled();
@@ -284,8 +281,6 @@ describe("POST /api/job-listings", () => {
           title: "Acme Corp - Software Engineer",
           description: "Build cool stuff",
           post_date: twoHoursAgo,
-          status: "completed",
-          live_url: null,
         },
       });
     });
@@ -316,8 +311,6 @@ describe("POST /api/job-listings", () => {
           title: "Acme Corp - Software Engineer",
           description: "Build cool stuff",
           post_date: expect.any(Date),
-          status: "completed",
-          live_url: null,
         },
       });
     });
@@ -340,13 +333,71 @@ describe("POST /api/job-listings", () => {
       .send({ url: "https://linkedin.com/jobs/1" });
 
     await vi.waitFor(() => {
-      expect(prisma.jobListing.update).toHaveBeenCalledWith({
-        where: { id: 1 },
-        data: expect.objectContaining({
-          title: "Software Engineer",
+      expect(prisma.jobListing.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            title: "Software Engineer",
+          }),
         }),
-      });
+      );
     });
+  });
+});
+
+describe("POST /api/job-listings/bulk", () => {
+  it("should return 201 with created records when urls are valid", async () => {
+    const mockCreated1 = { ...mockJobListing, id: 10, url: "https://example.com/job/1" };
+    const mockCreated2 = { ...mockJobListing, id: 11, url: "https://example.com/job/2" };
+    vi.mocked(prisma.jobListing.create)
+      .mockResolvedValueOnce(mockCreated1)
+      .mockResolvedValueOnce(mockCreated2);
+
+    const response = await request(app)
+      .post("/api/job-listings/bulk")
+      .send({ urls: ["https://example.com/job/1", "https://example.com/job/2"] });
+
+    expect(response.status).toBe(201);
+    expect(response.body.count).toBe(2);
+    expect(response.body.listings).toHaveLength(2);
+    expect(prisma.jobListing.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("should return 400 when urls field is missing", async () => {
+    const response = await request(app)
+      .post("/api/job-listings/bulk")
+      .send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Missing required field: urls/);
+  });
+
+  it("should return 400 when urls is not an array", async () => {
+    const response = await request(app)
+      .post("/api/job-listings/bulk")
+      .send({ urls: "https://example.com/job/1" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Missing required field: urls/);
+  });
+
+  it("should return 400 when urls array is empty", async () => {
+    const response = await request(app)
+      .post("/api/job-listings/bulk")
+      .send({ urls: [] });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/must not be empty/);
+  });
+
+  it("should return 400 when any URL is invalid", async () => {
+    const response = await request(app)
+      .post("/api/job-listings/bulk")
+      .send({ urls: ["https://example.com/job/1", "not-a-url"] });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Invalid URLs/);
+    expect(response.body.invalidUrls).toContain("not-a-url");
+    expect(prisma.jobListing.create).not.toHaveBeenCalled();
   });
 });
 

@@ -52,10 +52,12 @@ function JobList({ jobListings, onJobDeleted }: JobListProps) {
   };
 
   const getStatusChip = (status: string) => {
-    const statusConfig: Record<string, { color: "warning" | "success" | "error"; label: string }> = {
-      pending: { color: "warning", label: "Pending" },
-      completed: { color: "success", label: "Completed" },
-      failed: { color: "error", label: "Failed" },
+    const statusConfig: Record<string, { color: "default" | "warning" | "success" | "error" | "info"; label: string }> = {
+      init: { color: "default", label: "Ready" },
+      applying: { color: "info", label: "Applying" },
+      applied: { color: "success", label: "Applied" },
+      error_applying: { color: "error", label: "Error" },
+      closed: { color: "default", label: "Closed" },
     };
     const config = statusConfig[status] ?? { color: "warning" as const, label: status };
     return <Chip size="small" color={config.color} label={config.label} />;
@@ -74,7 +76,7 @@ function JobList({ jobListings, onJobDeleted }: JobListProps) {
     <>
       <List>
         {jobListings.map((listing) => {
-          const isPending = listing.status === "pending";
+          const isPending = listing.status === "applying";
           return (
             <Paper key={listing.id} elevation={1} sx={{ mb: 1 }}>
               <ListItem

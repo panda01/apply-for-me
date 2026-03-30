@@ -50,7 +50,7 @@ describe("JobsListPage", () => {
         description: "Build cool stuff",
         post_date: "2026-03-01T00:00:00.000Z",
         created_date: "2026-03-07T00:00:00.000Z",
-        status: "completed",
+        status: "init",
         live_url: null,
       },
     ]);
@@ -100,28 +100,28 @@ describe("JobsListPage", () => {
     });
   });
 
-  it("should poll every 5 seconds when a listing is pending", async () => {
+  it("should poll every 5 seconds when a listing is applying", async () => {
     vi.useFakeTimers();
 
-    const pendingListing = {
+    const applyingListing = {
       id: 1,
       title: "",
       url: "https://linkedin.com/jobs/1",
       description: "",
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
-      status: "pending",
+      status: "applying",
       live_url: null,
     };
 
     const completedListing = {
-      ...pendingListing,
+      ...applyingListing,
       title: "Acme Corp - Engineer",
-      status: "completed",
+      status: "applied",
     };
 
     vi.mocked(getJobListings)
-      .mockResolvedValueOnce([pendingListing])
+      .mockResolvedValueOnce([applyingListing])
       .mockResolvedValueOnce([completedListing]);
 
     await act(async () => {
@@ -141,7 +141,7 @@ describe("JobsListPage", () => {
     expect(getJobListings).toHaveBeenCalledTimes(2);
   });
 
-  it("should stop polling when no listings are pending", async () => {
+  it("should stop polling when no listings are applying", async () => {
     vi.useFakeTimers();
 
     const completedListing = {
@@ -151,7 +151,7 @@ describe("JobsListPage", () => {
       description: "Build stuff",
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
-      status: "completed",
+      status: "applied",
       live_url: null,
     };
 

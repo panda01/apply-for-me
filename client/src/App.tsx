@@ -3,6 +3,7 @@ import NavMenu from "./components/NavMenu";
 import AddJobPage from "./pages/AddJobPage";
 import JobsListPage from "./pages/JobsListPage";
 import JobViewPage from "./pages/JobViewPage";
+import ApplicationDashboardPage from "./pages/ApplicationDashboardPage";
 
 /**
  * Root application component that sets up routing and the navigation menu.
@@ -10,6 +11,7 @@ import JobViewPage from "./pages/JobViewPage";
  *   / — Add a new job listing
  *   /jobs — View all job listings
  *   /jobs/:id — View a single job listing
+ *   /apply — Application dashboard for applying to jobs
  */
 function App() {
   return (
@@ -19,6 +21,7 @@ function App() {
         <Route path="/" element={<AddJobPage />} />
         <Route path="/jobs" element={<JobsListPage />} />
         <Route path="/jobs/:id" element={<JobViewPage />} />
+        <Route path="/apply" element={<ApplicationDashboardPage />} />
       </Routes>
     </BrowserRouter>
   );
