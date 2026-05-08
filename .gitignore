@@ -15,7 +15,10 @@ coverage/
 # TypeScript incremental build cache
 *.tsbuildinfo
 
+.claude/settings.local.json
+
 /server/prisma/generated/
+/server/prisma/dev.db
 dev.db
 
 # LinkedIn credentials
