@@ -9,9 +9,9 @@ interface AddJobFormProps {
 
 /**
  * Form component for adding a new job listing by URL.
- * Submits the URL to the backend for background scraping.
+ * Saves the URL to the database without triggering any scraping.
  * @param {AddJobFormProps} props
- * @param {(jobId: number) => void} props.onJobAdded - Called with the new listing ID when the job is successfully submitted
+ * @param {(jobId: number) => void} props.onJobAdded - Called with the new listing ID when the job is successfully saved
  */
 function AddJobForm({ onJobAdded }: AddJobFormProps) {
   const [url, setUrl] = useState("");
@@ -28,7 +28,7 @@ function AddJobForm({ onJobAdded }: AddJobFormProps) {
     try {
       const createdListing = await createJobListing(url);
       setUrl("");
-      setSuccessMessage("Scraping job details... This may take up to 30 seconds.");
+      setSuccessMessage("Job saved successfully!");
       onJobAdded(createdListing.id);
     } catch (err) {
       const errorText = err instanceof Error ? err.message : "An unexpected error occurred";

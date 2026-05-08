@@ -16,6 +16,7 @@ const mockCompletedListing: JobListingResponse = {
   title: "Acme Corp - Software Engineer",
   url: "https://linkedin.com/jobs/1",
   description: "Build cool stuff with great teams",
+  salary: null,
   status: "init",
   live_url: null,
   post_date: "2026-03-01T00:00:00.000Z",
@@ -27,6 +28,7 @@ const mockApplyingListing: JobListingResponse = {
   title: "",
   url: "https://linkedin.com/jobs/2",
   description: "",
+  salary: null,
   status: "applying",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
@@ -38,6 +40,7 @@ const mockErrorListing: JobListingResponse = {
   title: "",
   url: "https://linkedin.com/jobs/3",
   description: "",
+  salary: null,
   status: "error_applying",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
@@ -142,11 +145,13 @@ describe("JobList", () => {
     expect(screen.getByText("unknown_status")).toBeDefined();
   });
 
-  it("should make list items clickable to navigate to job view", () => {
+  it("should make list items clickable to navigate to job view", async () => {
+    const user = userEvent.setup();
     renderJobList([mockCompletedListing]);
 
     const listItemButton = screen.getByText("Acme Corp - Software Engineer").closest("[role='button']");
-
     expect(listItemButton).toBeDefined();
+
+    await user.click(listItemButton!);
   });
 });

@@ -11,6 +11,7 @@ export interface JobListing {
   title: string;
   company: string;
   description: string;
+  salary: string;
   postDate: string;
   url: string;
 }
@@ -23,6 +24,7 @@ const JobListingSchema = z.object({
   title: z.string(),
   company: z.string(),
   description: z.string(),
+  salary: z.string().describe("The salary or compensation range listed for the job, or empty string if not found"),
   postDate: z.string(),
 });
 
@@ -83,7 +85,7 @@ async function notifyLiveUrl(
  * @returns {string} The full prompt string for the Browser Use agent
  */
 function buildExtractionPrompt(jobUrl: string, credentials: LinkedInCredentials | null): string {
-  const basePrompt = `Navigate to ${jobUrl}. If there is a "Show more" or "See more" button on the job description, click it to expand the full description. Extract the job listing details: the job title, the company name, the full job description text, and when it was posted.`;
+  const basePrompt = `Navigate to ${jobUrl}. If there is a "Show more" or "See more" button on the job description, click it to expand the full description. Extract the job listing details: the job title, the company name, the full job description text, the salary or compensation range (if listed), and when it was posted.`;
 
   const hasCredentials = credentials !== null;
   if (hasCredentials) {
@@ -152,6 +154,7 @@ export async function fetchJobListingFromUrl(
       title: extractedData.title,
       company: extractedData.company,
       description: extractedData.description,
+      salary: extractedData.salary,
       postDate: extractedData.postDate,
       url: jobUrl,
     };

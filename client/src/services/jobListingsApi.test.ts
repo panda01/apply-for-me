@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
-  getJobListings, getJobListing, createJobListing, deleteJobListing,
+  getJobListings, getJobListing, createJobListing, fetchJobData, deleteJobListing,
   bulkCreateJobListings, applyToJob, startBatchApply, getBatchApplyStatus,
 } from "./jobListingsApi";
 
@@ -9,6 +9,7 @@ const mockListing = {
   title: "Acme Corp - Software Engineer",
   url: "https://linkedin.com/jobs/1",
   description: "Build cool stuff",
+  salary: null,
   status: "init",
   live_url: null,
   post_date: "2026-03-01T00:00:00.000Z",
@@ -106,6 +107,38 @@ describe("createJobListing", () => {
     }));
 
     await expect(createJobListing("bad")).rejects.toThrow("Failed to create job listing");
+  });
+});
+
+describe("fetchJobData", () => {
+  it("should trigger fetch and return the listing", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(mockListing),
+    }));
+
+    const result = await fetchJobData(1);
+
+    expect(result).toEqual(mockListing);
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings/1/fetch", { method: "POST" });
+  });
+
+  it("should throw with API error message on failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "Job listing not found" }),
+    }));
+
+    await expect(fetchJobData(999)).rejects.toThrow("Job listing not found");
+  });
+
+  it("should throw generic message when error body has no error field", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({}),
+    }));
+
+    await expect(fetchJobData(1)).rejects.toThrow("Failed to fetch job data");
   });
 });
 

@@ -5,6 +5,7 @@ export default defineConfig({
   plugins: [react()],
   test: {
     globals: true,
+    exclude: ["tests/**", "node_modules/**"],
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov"],

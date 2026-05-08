@@ -26,6 +26,8 @@ model JobListing {
   title        String?
   url          String
   description  String?
+  salary       String?
+  location     String?
   live_url     String? // Temporarily holds the browser-use live view URL for the iframe during application
   status       JobStatus @default(init)
   post_date    DateTime?

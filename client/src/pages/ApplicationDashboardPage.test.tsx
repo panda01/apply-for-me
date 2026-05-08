@@ -21,6 +21,7 @@ const mockInitListing = {
   title: "Test Company - Software Engineer",
   url: "https://linkedin.com/jobs/view/123",
   description: "Test description",
+  salary: null,
   status: "init",
   live_url: null,
   post_date: "2026-03-01T00:00:00.000Z",

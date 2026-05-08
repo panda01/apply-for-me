@@ -1,5 +1,35 @@
 # AI Journal
 
+## 2026-03-30 20:15: Decouple job adding from data fetching, add salary field, redesign JobViewPage
+
+### What Changed
+Decoupled the job-add flow from scraping. Adding a job now just saves the URL to the database — no background scraping is triggered. A new on-demand `POST /api/job-listings/:id/fetch` endpoint lets users trigger scraping when they want. Added a `salary` field to the `JobListing` schema and updated the scraper to extract salary information. Redesigned the JobViewPage to show the URL with "Fetch Data" and "Apply" action buttons.
+
+### Files Modified
+- **`server/prisma/schema.prisma`** — Added `salary String?` to `JobListing` model.
+- **`server/src/routes/jobListings.ts`** — Removed async `scrapeAndUpdateJobListing()` call from `POST /` route. Added new `POST /:id/fetch` route that triggers on-demand scraping. Updated `scrapeAndUpdateJobListing()` to persist `salary`. Updated JSDoc on `POST /` and `scrapeAndUpdateJobListing`.
+- **`server/src/services/jobListingScraperService.ts`** — Added `salary` to `JobListing` interface, `JobListingSchema` Zod schema, extraction prompt, and return value from `fetchJobListingFromUrl()`.
+- **`client/src/services/jobListingsApi.ts`** — Added `salary: string | null` to `JobListingResponse`. Added `fetchJobData(id)` function calling `POST /api/job-listings/:id/fetch`.
+- **`client/src/pages/JobViewPage.tsx`** — Full redesign: shows URL prominently with "Fetch Data" and "Apply" buttons, polls after fetch data is clicked, displays salary when available, shows job details once data is fetched, keeps applying/live-iframe behavior.
+- **`client/src/components/AddJobForm.tsx`** — Changed success message from "Scraping job details..." to "Job saved successfully!". Updated JSDoc.
+- **`vitest.config.ts`** — Added `tests/**` to exclude so vitest doesn't run Playwright tests.
+- **`tests/tsconfig.json`** — New: TypeScript config for Playwright tests.
+- **`tests/playwright.config.ts`** — New: Playwright test runner configuration.
+- **`tests/playwright/addAndViewJob.spec.ts`** — New: Playwright e2e test for the add-and-view-job flow.
+
+### Test Files Updated (salary in mock data, new test cases)
+- **`server/src/routes/jobListings.test.ts`** — Moved scraping tests from `POST /` to `POST /:id/fetch`. Added `salary` to mocks. Added test for null salary on empty string. Added test that `POST /` no longer triggers scraping.
+- **`server/src/routes/jobApplications.test.ts`** — Added `salary: null` to `mockInitJobListing`.
+- **`client/src/services/jobListingsApi.test.ts`** — Added `salary` to mock. Added `fetchJobData` test suite.
+- **`client/src/pages/JobViewPage.test.tsx`** — Rewrote tests for new page structure. Added tests for Fetch Data button, Apply button, error states, action error dismiss, salary display.
+- **`client/src/components/AddJobForm.test.tsx`** — Updated success message assertion. Added `salary` to mocks.
+- **`client/src/components/JobList.test.tsx`** — Added `salary` to mock data.
+- **`client/src/pages/AddJobPage.test.tsx`** — Added `salary` to mock data.
+- **`client/src/pages/JobsListPage.test.tsx`** — Added `salary` to mock data.
+- **`client/src/pages/ApplicationDashboardPage.test.tsx`** — Added `salary` to mock data.
+
+---
+
 ## 2026-03-28: Add closed status for jobs no longer accepting applications
 
 ### What Changed

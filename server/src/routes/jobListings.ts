@@ -10,10 +10,10 @@ const router = Router();
 
 /**
  * POST /api/job-listings
- * Accepts a job listing URL and kicks off background scraping.
- * Returns 202 immediately with a pending record while the scraping runs asynchronously.
- * @param {string} req.body.url - The URL of the job posting to scrape
- * @returns {object} 202 - The pending job listing record
+ * Accepts a job listing URL and saves it to the database.
+ * No scraping is triggered — use POST /api/job-listings/:id/fetch to enrich the record later.
+ * @param {string} req.body.url - The URL of the job posting to save
+ * @returns {object} 202 - The created job listing record
  * @returns {object} 400 - Missing or invalid url field error
  */
 router.post("/", async (req: Request, res: Response) => {
@@ -42,16 +42,6 @@ router.post("/", async (req: Request, res: Response) => {
   });
 
   res.status(202).json(newJobListing);
-
-  const parsedUrl = new URL(url);
-  const isLinkedInUrl = parsedUrl.hostname === "linkedin.com" || parsedUrl.hostname.endsWith(".linkedin.com");
-  const credentialsPath = isLinkedInUrl
-    ? resolve(__dirname, "../scripts/linkedin_credentials.json")
-    : null;
-
-  scrapeAndUpdateJobListing(newJobListing.id, url, credentialsPath).catch(() => {
-    /* error already handled inside */
-  });
 });
 
 /**
@@ -72,7 +62,7 @@ function parsePostDate(postDateString: string): Date {
 
 /**
  * Reads the credentials file (if provided), scrapes the job listing, and updates
- * the database record with the scraped title, description, and post date.
+ * the database record with the scraped title, description, salary, and post date.
  * Does not modify the job's application status — status only tracks the application lifecycle.
  * @param {number} jobListingId - The ID of the job listing record to enrich
  * @param {string} url - The job listing URL to scrape
@@ -98,6 +88,7 @@ async function scrapeAndUpdateJobListing(jobListingId: number, url: string, cred
       data: {
         title: formattedTitle,
         description: scrapedData.description,
+        salary: scrapedData.salary || null,
         post_date: parsePostDate(scrapedData.postDate),
       },
     });
@@ -154,6 +145,54 @@ router.post("/bulk", async (req: Request, res: Response) => {
   );
 
   res.status(201).json({ count: createdListings.length, listings: createdListings });
+});
+
+/**
+ * POST /api/job-listings/:id/fetch
+ * Triggers background scraping to enrich a job listing with title, description, salary, and post date.
+ * Returns 202 immediately while the scraping runs asynchronously.
+ * @param {number} req.params.id - The ID of the job listing to fetch data for
+ * @returns {object} 202 - The current job listing record (data will update once scraping completes)
+ * @returns {object} 400 - Invalid id parameter error
+ * @returns {object} 404 - Job listing not found error
+ */
+router.post("/:id/fetch", async (req: Request, res: Response) => {
+  const rawId = req.params.id;
+  const isArrayParam = Array.isArray(rawId);
+  if (isArrayParam) {
+    res.status(400).json({ error: "Invalid id parameter" });
+    return;
+  }
+
+  const id = parseInt(rawId, 10);
+
+  const isInvalidId = isNaN(id);
+  if (isInvalidId) {
+    res.status(400).json({ error: "Invalid id parameter" });
+    return;
+  }
+
+  const jobListing = await prisma.jobListing.findUnique({
+    where: { id },
+  });
+
+  const isNotFound = !jobListing;
+  if (isNotFound) {
+    res.status(404).json({ error: "Job listing not found" });
+    return;
+  }
+
+  res.status(202).json(jobListing);
+
+  const parsedUrl = new URL(jobListing.url);
+  const isLinkedInUrl = parsedUrl.hostname === "linkedin.com" || parsedUrl.hostname.endsWith(".linkedin.com");
+  const credentialsPath = isLinkedInUrl
+    ? resolve(__dirname, "../scripts/linkedin_credentials.json")
+    : null;
+
+  scrapeAndUpdateJobListing(jobListing.id, jobListing.url, credentialsPath).catch(() => {
+    /* error already handled inside scrapeAndUpdateJobListing */
+  });
 });
 
 /**

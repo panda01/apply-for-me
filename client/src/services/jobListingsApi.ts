@@ -7,6 +7,7 @@ export interface JobListingResponse {
   title: string;
   url: string;
   description: string;
+  salary: string | null;
   status: string;
   live_url: string | null;
   post_date: string;
@@ -64,6 +65,27 @@ export async function createJobListing(url: string): Promise<JobListingResponse>
   if (isNotOk) {
     const errorBody = await response.json() as { error?: string };
     throw new Error(errorBody.error ?? "Failed to create job listing");
+  }
+
+  return response.json() as Promise<JobListingResponse>;
+}
+
+/**
+ * Triggers background scraping to enrich a job listing with title, description, salary, and post date.
+ * Returns the current job listing record immediately — poll GET /api/job-listings/:id for updates.
+ * @param {number} id - The ID of the job listing to fetch data for
+ * @returns {Promise<JobListingResponse>} The current job listing (data will update after scraping completes)
+ * @throws {Error} If the API request fails
+ */
+export async function fetchJobData(id: number): Promise<JobListingResponse> {
+  const response = await fetch(`/api/job-listings/${id}/fetch`, {
+    method: "POST",
+  });
+
+  const isNotOk = !response.ok;
+  if (isNotOk) {
+    const errorBody = await response.json() as { error?: string };
+    throw new Error(errorBody.error ?? "Failed to fetch job data");
   }
 
   return response.json() as Promise<JobListingResponse>;
