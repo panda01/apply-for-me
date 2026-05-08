@@ -1,5 +1,88 @@
 # AI Journal
 
+## 2026-05-07 23:45: Simplify container DNS handling + clean up containers on server shutdown
+
+### Intent
+Two related fixes:
+1. The container's WG entrypoint was doing DNS handling itself (stripping `DNS=` from the config, writing `/etc/resolv.conf` directly) because Ubuntu Noble's `resolvconf` package is a systemd-resolved wrapper that needs dbus. Replaced with the conventional approach: install the `wireguard` meta-package and provide a tiny `resolvconf` shim at `/usr/local/sbin/resolvconf` that wg-quick invokes. The WG config is now used as-is — no custom DNS munging.
+2. The server had no shutdown handler, so spawned containers leaked when the server exited (verified empirically: spawn → kill server → `docker ps` shows the container still up, `managed_containers` table still has the row). Added SIGINT/SIGTERM handlers in `index.ts` that stop+remove every tracked container and delete its DB row.
+
+### What Changed
+- **Dockerfile**: install `wireguard` (meta-package) instead of `wireguard-tools` and `COPY` `resolvconf-shim.sh` to `/usr/local/sbin/resolvconf` so wg-quick can call it. Also include the new file in the dockerode build context's `src` array.
+- **resolvconf-shim.sh** (new): minimal POSIX-sh wrapper that handles wg-quick's `-a` (apply, write resolv.conf from stdin) and `-d` (delete, clear resolv.conf) invocations. Other flags are accepted and ignored. Does the same job as the real openresolv but doesn't need dbus.
+- **entrypoint.sh**: removed the custom `WG_DNS_SERVER` extraction, the DNS-line-stripping `grep -v`, and the manual `/etc/resolv.conf` write. The script is now: validate env → copy config → `wg-quick up wg0` → install connmark rules → exec CMD.
+- **server/src/services/managedContainerCleanup.ts** (new): exports `cleanupAllManagedContainers()` — loads all `managed_containers` rows, calls `stopAndRemove` on each in parallel, deletes the row only if Docker removal succeeded. Failures are logged, not thrown.
+- **server/src/services/managedContainerCleanup.test.ts** (new): 7 tests covering empty list, full happy path, partial failures (Docker error → keeps row), DB-delete error after success, mixed-success batch, and non-Error rejection logging for both Docker and DB.
+- **server/src/index.ts**: added `gracefulShutdown(httpServer, signal)` with a 30 s timeout, re-entry guard, `httpServer.close()` → `cleanupAllManagedContainers()` → `prisma.$disconnect()` → `process.exit(0)`. Registered as SIGINT and SIGTERM listeners after `app.listen`.
+
+### Files Added
+- `docker/managed-container/resolvconf-shim.sh`
+- `server/src/services/managedContainerCleanup.ts`
+- `server/src/services/managedContainerCleanup.test.ts`
+
+### Files Modified
+- `docker/managed-container/Dockerfile` — `wireguard-tools` → `wireguard`, copy + chmod the shim
+- `docker/managed-container/entrypoint.sh` — removed custom DNS handling
+- `server/src/index.ts` — added graceful shutdown for SIGINT/SIGTERM
+- `server/src/services/dockerContainerService.ts` — included `resolvconf-shim.sh` in the build-context src list
+
+### Verification
+- `npm run lint`: clean
+- `npm run tsc`: clean
+- `npm run test`: 334/334 passing (+7 new)
+- `npm run test:coverage`: 98.42% statements / 90.71% branches (above 90% threshold)
+- `npm run check:duplication`: 3.1%
+- Manual end-to-end with simpler entrypoint: spawned a container, `wg show` reports `latest handshake: 14 seconds ago` and the peer is mullvad; `docker exec ... curl https://ifconfig.me` returns `146.70.165.36` (NYC exit); `/etc/resolv.conf` reads `nameserver 10.64.0.1` (written by wg-quick via the shim, not by entrypoint code)
+- Manual shutdown test: `kill -INT $SERVER_PID` → server logs `[shutdown] Received SIGINT`, `Cleaning up 2 managed container(s)`, `Done`; exits in 2 s. Both `docker ps -a --filter name=afm-` and `SELECT * FROM managed_containers` return empty afterward — confirms no leak.
+
+## 2026-05-07 23:30: Force container egress through WireGuard + add per-container Playwright screenshot
+
+### Intent
+Each managed container now (a) routes all outbound traffic through one of the WireGuard configs in `wg_configs/` and (b) exposes a screenshot endpoint that renders a URL with Playwright/chromium and returns a PNG. The screenshot is taken from inside the container, so the rendering traffic egresses via the WG exit IP — not the host. Surfaced on the frontend as a "Screenshot a URL" panel on `/containers/:id`, with the result rendered inline as a `<img>` and any failure shown as a clear MUI Alert with the underlying server error message.
+
+### What Changed
+- **Container image**: switched base from `node:22-alpine` to `mcr.microsoft.com/playwright:v1.58.2-noble` (chromium pre-installed, debian/noble), added `wireguard-tools iproute2 iptables` via apt, and a new `entrypoint.sh` that:
+  - reads `WG_CONFIG_NAME` from env, copies the config from the read-only mount at `/etc/wireguard-configs`
+  - strips the `DNS=` line and writes `/etc/resolv.conf` directly (resolvconf on Noble is a systemd-resolved wrapper that needs dbus)
+  - hard-fails the container if `wg-quick up wg0` fails (kill switch — Node never starts without the tunnel)
+  - installs portable connmark rules so port-forward replies (Linux-native + Docker Desktop) go back via eth0; rules are scoped to TCP only so they don't clobber WG's own UDP fwmark
+- **In-container server** (`docker/managed-container/server.ts`): added `POST /screenshot` using a cached chromium browser with disconnect-recovery, full-page PNG, per-request newContext/newPage cleanup
+- **Host service** (`server/src/services/dockerContainerService.ts`): added `pickRandomWireGuardConfig()`, set Docker `CapAdd: NET_ADMIN`, `Devices: /dev/net/tun`, sysctl `net.ipv4.conf.all.src_valid_mark=1`, bind `wg_configs:/etc/wireguard-configs:ro`, env `WG_CONFIG_NAME`, return `wgConfigName` from `runContainer`, bumped readiness timeout to 45 s
+- **Host route** (`server/src/routes/managedContainers.ts`): added `POST /api/managed-containers/:id/screenshot` that proxies to the container, streams `image/png` back, surfaces upstream Playwright errors in the 503 body
+- **Prisma**: added nullable `wgConfigName String?` to `ManagedContainer`, ran `db push` + `generate`
+- **Frontend**: added `captureScreenshot()` in `managedContainersApi.ts`, new `ScreenshotPanel` component (URL field + Capture button + blob-URL `<img>` + error Alert), wired into `ContainerViewPage`, surfaced `wgConfigName` as a labeled field
+- **Tests**: extended `dockerContainerService.test.ts` to assert new HostConfig (CapAdd/Devices/Sysctls/Binds/Env/wgConfigName) and added a `pickRandomWireGuardConfig` test; added 6 new tests for `POST /:id/screenshot`; added 4 new tests for `captureScreenshot`; added a 7-test `ScreenshotPanel.test.tsx`; added `tests/playwright/screenshotContainer.spec.ts`
+- **Backwards compat**: existing rows without `wgConfigName` keep working (column is nullable)
+
+### Files Added
+- `docker/managed-container/entrypoint.sh`
+- `client/src/components/ScreenshotPanel.tsx`
+- `client/src/components/ScreenshotPanel.test.tsx`
+- `tests/playwright/screenshotContainer.spec.ts`
+
+### Files Modified
+- `docker/managed-container/Dockerfile` — base image swap + wireguard-tools/iproute2/iptables apt-install + ENTRYPOINT
+- `docker/managed-container/package.json` — added `playwright: 1.58.2`
+- `docker/managed-container/server.ts` — added `getBrowser()` (with disconnect-recovery), `POST /screenshot`
+- `server/src/services/dockerContainerService.ts` — added `pickRandomWireGuardConfig()`, updated `runContainer()` HostConfig, returns `wgConfigName`, readiness timeout 15s → 45s, image build context now includes `entrypoint.sh`
+- `server/src/services/dockerContainerService.test.ts` — assertions for new HostConfig fields, `pickRandomWireGuardConfig` test
+- `server/src/routes/managedContainers.ts` — persists `wgConfigName` on create, added `POST /:id/screenshot` proxy + `readUpstreamErrorMessage()` helper, alias type `FetchResponse`
+- `server/src/routes/managedContainers.test.ts` — `wgConfigName` in mock data + `runContainer` mock returns; 6 new tests for the screenshot route
+- `server/prisma/schema.prisma` — `wgConfigName String?`
+- `client/src/services/managedContainersApi.ts` — added `wgConfigName` to `ManagedContainerResponse`, added `captureScreenshot()`
+- `client/src/services/managedContainersApi.test.ts` — `wgConfigName` in mock + 4 tests for `captureScreenshot`
+- `client/src/pages/ContainerViewPage.tsx` — render `wgConfigName` field + `<ScreenshotPanel/>`
+- `client/src/pages/ContainerViewPage.test.tsx` + `ContainersListPage.test.tsx` — `wgConfigName` in mock data, mock `captureScreenshot`
+
+### Verification
+- `npm run lint`: clean
+- `npm run tsc`: clean
+- `npm run test`: 327/327 passing
+- `npm run test:coverage`: 98.4% statements / 90.6% branches (above 90% threshold)
+- `npm run check:duplication`: 3.16% (below 4% threshold)
+- Manual end-to-end: spawned a container via `POST /api/managed-containers`, screenshot via `POST /:id/screenshot` of `https://google.com` returned a 138 KB PNG (1280×720) of the actual Google homepage; `docker exec ... curl https://ifconfig.me` confirmed exit IP `146.70.185.36` (Mullvad NYC) — distinct from the host IP — proving the egress traversed WireGuard
+- Cross-config rotation confirmed: a debug container with `us-nyc-wg-301` exited via `143.244.47.73`; the API-spawned container with `us-nyc-wg-601` exited via `146.70.185.36`
+
 ## 2026-05-07 22:25: Refactor to pass `npm run check:duplication` (4% threshold)
 
 ### What Changed

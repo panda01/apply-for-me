@@ -37,6 +37,7 @@ const baseRecord = {
   name: "abc123def456",
   dockerId: "docker-id-1",
   hostPort: 41123,
+  wgConfigName: "us-nyc-wg-301",
   status: "running" as const,
   created_date: new Date("2026-05-07T00:00:00.000Z"),
 };
@@ -52,7 +53,7 @@ beforeEach(() => {
 describe("POST /api/managed-containers", () => {
   it("creates a container with an auto-generated name and returns 201", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
-    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-1", hostPort: 41123 });
+    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-1", hostPort: 41123, wgConfigName: "us-nyc-wg-301" });
     vi.mocked(prisma.managedContainer.create).mockResolvedValue(baseRecord);
 
     const response = await request(app).post("/api/managed-containers").send({});
@@ -66,7 +67,7 @@ describe("POST /api/managed-containers", () => {
 
   it("uses a user-supplied name when provided", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
-    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-2", hostPort: 41124 });
+    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-2", hostPort: 41124, wgConfigName: "us-nyc-wg-302" });
     vi.mocked(prisma.managedContainer.create).mockResolvedValue({
       ...baseRecord,
       name: "user-name",
@@ -114,7 +115,7 @@ describe("POST /api/managed-containers", () => {
 
   it("rolls back the docker container when the DB insert fails", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
-    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-X", hostPort: 41200 });
+    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-X", hostPort: 41200, wgConfigName: "us-nyc-wg-301" });
     vi.mocked(prisma.managedContainer.create).mockRejectedValue(new Error("db down"));
     vi.mocked(stopAndRemove).mockResolvedValue();
 
@@ -127,7 +128,7 @@ describe("POST /api/managed-containers", () => {
 
   it("returns 409 when the DB insert fails with a Prisma unique-constraint violation", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
-    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-Y", hostPort: 41201 });
+    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-Y", hostPort: 41201, wgConfigName: "us-nyc-wg-301" });
     const uniqueViolation = Object.assign(new Error("Unique constraint failed"), { code: "P2002" });
     vi.mocked(prisma.managedContainer.create).mockRejectedValue(uniqueViolation);
     vi.mocked(stopAndRemove).mockResolvedValue();
@@ -140,7 +141,7 @@ describe("POST /api/managed-containers", () => {
 
   it("returns 500 when the DB insert rejects with a non-object reason", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
-    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-S", hostPort: 41203 });
+    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-S", hostPort: 41203, wgConfigName: "us-nyc-wg-301" });
     vi.mocked(prisma.managedContainer.create).mockRejectedValue("string-reject");
     vi.mocked(stopAndRemove).mockResolvedValue();
 
@@ -153,7 +154,7 @@ describe("POST /api/managed-containers", () => {
 
   it("logs but does not crash if the rollback also fails", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
-    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-Z", hostPort: 41202 });
+    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-Z", hostPort: 41202, wgConfigName: "us-nyc-wg-301" });
     vi.mocked(prisma.managedContainer.create).mockRejectedValue(new Error("db down"));
     vi.mocked(stopAndRemove).mockRejectedValue(new Error("docker also offline"));
 
@@ -305,6 +306,103 @@ describe("DELETE /api/managed-containers/:id", () => {
 
     expect(response.status).toBe(500);
     expect(response.body.error).toMatch(/string-error/);
+  });
+});
+
+describe("POST /api/managed-containers/:id/screenshot", () => {
+  const pngMagicHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47]); // \x89PNG
+
+  it("returns 400 when id is not a number", async () => {
+    const response = await request(app)
+      .post("/api/managed-containers/abc/screenshot")
+      .send({ url: "https://google.com" });
+
+    expect(response.status).toBe(400);
+    expect(prisma.managedContainer.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the record is missing", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
+
+    const response = await request(app)
+      .post("/api/managed-containers/999/screenshot")
+      .send({ url: "https://google.com" });
+
+    expect(response.status).toBe(404);
+  });
+
+  it("returns 400 when the request body is missing the url", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/screenshot")
+      .send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/url/);
+  });
+
+  it("proxies the screenshot and streams the image bytes back", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(pngMagicHeader, { status: 200, headers: { "Content-Type": "image/png" } })
+    );
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/screenshot")
+      .send({ url: "https://google.com" });
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toMatch(/image\/png/);
+    expect(response.body.slice(0, 4)).toEqual(pngMagicHeader);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "http://127.0.0.1:41123/screenshot",
+      expect.objectContaining({ method: "POST" })
+    );
+    fetchSpy.mockRestore();
+  });
+
+  it("returns 503 when the container itself reports a screenshot failure", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ error: "page.goto: net::ERR_NAME_NOT_RESOLVED" }), { status: 500 })
+    );
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/screenshot")
+      .send({ url: "https://nonexistent.invalid" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/ERR_NAME_NOT_RESOLVED/);
+    fetchSpy.mockRestore();
+  });
+
+  it("returns 503 with the status text when the upstream non-OK body is not JSON", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("not json", { status: 502, statusText: "Bad Gateway" })
+    );
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/screenshot")
+      .send({ url: "https://google.com" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/502/);
+    fetchSpy.mockRestore();
+  });
+
+  it("returns 503 when the container is unreachable", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/screenshot")
+      .send({ url: "https://google.com" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/ECONNREFUSED/);
+    fetchSpy.mockRestore();
   });
 });
 

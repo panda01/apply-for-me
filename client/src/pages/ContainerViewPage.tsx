@@ -17,6 +17,7 @@ import {
 import BackLink from "../components/BackLink";
 import LoadingOrErrorPanel from "../components/LoadingOrErrorPanel";
 import LabeledField from "../components/LabeledField";
+import ScreenshotPanel from "../components/ScreenshotPanel";
 
 /**
  * Page that displays a single managed container's details and provides:
@@ -130,6 +131,9 @@ function ContainerViewPage() {
 
             <LabeledField label="Docker ID" breakLongValues>{container.dockerId}</LabeledField>
             <LabeledField label="Host Port" valueTestId="container-host-port">{container.hostPort}</LabeledField>
+            <LabeledField label="WireGuard Config" valueTestId="container-wg-config">
+              {container.wgConfigName ?? "—"}
+            </LabeledField>
             <LabeledField label="Created">{new Date(container.created_date).toLocaleString()}</LabeledField>
 
             <Box sx={{ display: "flex", gap: 2, mt: 2 }}>
@@ -152,6 +156,8 @@ function ContainerViewPage() {
               </Button>
             </Box>
           </Paper>
+
+          <ScreenshotPanel containerId={container.id} />
 
           {pingResult && (
             <Paper elevation={1} sx={{ p: 3, mb: 2 }} data-testid="ping-success">

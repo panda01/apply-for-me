@@ -2,6 +2,7 @@ import Docker from "dockerode";
 import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { randomBytes } from "node:crypto";
+import { readdirSync } from "node:fs";
 
 /**
  * Service module wrapping dockerode to spawn, stop, and remove
@@ -9,6 +10,13 @@ import { randomBytes } from "node:crypto";
  *
  * The first call to runContainer ensures the image has been built; subsequent calls reuse it.
  * Each container exposes its internal port 3000 on a free host port in the configured range.
+ *
+ * Each container is also started with a WireGuard config (one of the *.conf files in
+ * the repo's wg_configs directory). The config dir is bind-mounted read-only into the
+ * container at /etc/wireguard-configs, NET_ADMIN + /dev/net/tun are granted, and the
+ * container entrypoint hard-fails if it cannot bring wg0 up. As a result, all egress
+ * from the container is forced through WireGuard; if the tunnel cannot start, the
+ * container does not start.
  */
 
 const IMAGE_TAG = "afm-managed-container:latest";
@@ -17,6 +25,10 @@ const HOST_NAME_PREFIX = "afm-";
 const HOST_PORT_RANGE_START = 41000;
 const HOST_PORT_RANGE_END = 41999;
 const IMAGE_BUILD_CONTEXT = resolve(__dirname, "../../../docker/managed-container");
+const WG_CONFIGS_HOST_DIR = resolve(__dirname, "../../../wg_configs");
+const WG_CONFIGS_CONTAINER_MOUNT = "/etc/wireguard-configs";
+const CONTAINER_READINESS_TIMEOUT_MS = 45000;
+const CONTAINER_READINESS_INTERVAL_MS = 250;
 
 const docker: Docker = new Docker();
 
@@ -28,6 +40,7 @@ let imageBuildPromise: Promise<void> | null = null;
 export interface RunContainerResult {
   dockerId: string;
   hostPort: number;
+  wgConfigName: string;
 }
 
 /**
@@ -56,6 +69,26 @@ export function toDockerName(name: string): string {
 export function isValidContainerName(name: string): boolean {
   const containerNamePattern = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,40}$/;
   return containerNamePattern.test(name);
+}
+
+/**
+ * Picks a random WireGuard config from the repo's wg_configs directory.
+ * Reuse is allowed: the same config may be assigned to multiple running containers.
+ * Throws if the directory exists but contains no *.conf files.
+ * @returns {string} The basename (without .conf extension) of the chosen config
+ */
+export function pickRandomWireGuardConfig(): string {
+  const entries = readdirSync(WG_CONFIGS_HOST_DIR);
+  const configBasenames = entries
+    .filter((entry) => entry.endsWith(".conf"))
+    .map((entry) => entry.slice(0, -".conf".length));
+  const hasNoConfigs = configBasenames.length === 0;
+  if (hasNoConfigs) {
+    throw new Error(`No WireGuard configs found in ${WG_CONFIGS_HOST_DIR}`);
+  }
+  const chosenIndex = Math.floor(Math.random() * configBasenames.length);
+  // Non-empty array guarded above, so [chosenIndex] is always defined.
+  return configBasenames[chosenIndex] as string;
 }
 
 /**
@@ -111,7 +144,17 @@ export async function ensureImageBuilt(): Promise<void> {
 
   imageBuildPromise = (async () => {
     const buildStream = await docker.buildImage(
-      { context: IMAGE_BUILD_CONTEXT, src: ["Dockerfile", "server.ts", "package.json", "tsconfig.json"] },
+      {
+        context: IMAGE_BUILD_CONTEXT,
+        src: [
+          "Dockerfile",
+          "server.ts",
+          "package.json",
+          "tsconfig.json",
+          "entrypoint.sh",
+          "resolvconf-shim.sh",
+        ],
+      },
       { t: IMAGE_TAG }
     );
     await new Promise<void>((resolveBuild, rejectBuild) => {
@@ -136,27 +179,37 @@ export async function ensureImageBuilt(): Promise<void> {
 
 /**
  * Spawns a new managed container with the given user-visible name.
- * Builds the image if needed, allocates a free host port, creates+starts the container,
- * waits until its /health endpoint responds, and returns the Docker container id and host port.
- * If readiness times out, the container is stopped and removed so it doesn't leak.
+ * Builds the image if needed, allocates a free host port, picks a random WireGuard
+ * config, and creates+starts the container with the privileges WireGuard requires
+ * (NET_ADMIN, /dev/net/tun, src_valid_mark sysctl) and the wg_configs dir bind-mounted
+ * read-only. Waits until /health responds, then returns the docker id, host port, and
+ * the assigned WG config name. If readiness times out, the container is stopped and
+ * removed so it doesn't leak.
  * @param {string} name - The user-visible container name (without afm- prefix)
- * @returns {Promise<RunContainerResult>} The new container's docker id and host port
+ * @returns {Promise<RunContainerResult>} The new container's docker id, host port, and WG config name
  */
 export async function runContainer(name: string): Promise<RunContainerResult> {
   await ensureImageBuilt();
   const hostPort = await findFreeHostPort();
   const dockerName = toDockerName(name);
+  const wgConfigName = pickRandomWireGuardConfig();
 
   const container = await docker.createContainer({
     Image: IMAGE_TAG,
     name: dockerName,
-    Env: [`CONTAINER_NAME=${name}`],
+    Env: [`CONTAINER_NAME=${name}`, `WG_CONFIG_NAME=${wgConfigName}`],
     ExposedPorts: { [CONTAINER_INTERNAL_PORT]: {} },
     HostConfig: {
       PortBindings: {
         [CONTAINER_INTERNAL_PORT]: [{ HostIp: "127.0.0.1", HostPort: String(hostPort) }],
       },
       AutoRemove: false,
+      CapAdd: ["NET_ADMIN"],
+      Devices: [
+        { PathOnHost: "/dev/net/tun", PathInContainer: "/dev/net/tun", CgroupPermissions: "rwm" },
+      ],
+      Sysctls: { "net.ipv4.conf.all.src_valid_mark": "1" },
+      Binds: [`${WG_CONFIGS_HOST_DIR}:${WG_CONFIGS_CONTAINER_MOUNT}:ro`],
     },
   });
 
@@ -171,22 +224,21 @@ export async function runContainer(name: string): Promise<RunContainerResult> {
     throw err;
   }
 
-  return { dockerId: container.id, hostPort };
+  return { dockerId: container.id, hostPort, wgConfigName };
 }
 
 /**
  * Polls the container's /health endpoint until it returns 200 or the timeout expires.
  * Required because tsx + npm install inside the container take a few seconds to start
- * Express, so the API would otherwise respond 201 with an unreachable container.
+ * Express, and the WireGuard handshake adds further startup latency, so the API would
+ * otherwise respond with an unreachable container.
  * @param {number} hostPort - The host port the container's /health is mapped to
  * @returns {Promise<void>} Resolves when the container responds 200; rejects on timeout
  */
 async function waitForContainerReady(hostPort: number): Promise<void> {
-  const totalTimeoutMs = 15000;
-  const intervalMs = 250;
   const start = Date.now();
 
-  while (Date.now() - start < totalTimeoutMs) {
+  while (Date.now() - start < CONTAINER_READINESS_TIMEOUT_MS) {
     try {
       const response = await fetch(`http://127.0.0.1:${String(hostPort)}/health`);
       if (response.ok) {
@@ -195,10 +247,10 @@ async function waitForContainerReady(hostPort: number): Promise<void> {
     } catch {
       /* container not yet listening — keep polling */
     }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, intervalMs));
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, CONTAINER_READINESS_INTERVAL_MS));
   }
 
-  throw new Error(`Container did not become ready within ${String(totalTimeoutMs)}ms`);
+  throw new Error(`Container did not become ready within ${String(CONTAINER_READINESS_TIMEOUT_MS)}ms`);
 }
 
 /**

@@ -68,12 +68,13 @@ enum ManagedContainerStatus {
 // Records each Docker container spawned through the managed-containers API.
 // dockerId is Docker's full container ID; name is the user-visible name (without the afm- prefix).
 model ManagedContainer {
-  id           Int                    @id @default(autoincrement())
-  name         String                 @unique
-  dockerId     String                 @unique
-  hostPort     Int                    @unique
-  status       ManagedContainerStatus @default(starting)
-  created_date DateTime               @default(now())
+  id            Int                    @id @default(autoincrement())
+  name          String                 @unique
+  dockerId      String                 @unique
+  hostPort      Int                    @unique
+  wgConfigName  String? // Filename (without .conf) of the WireGuard config used by this container; null on records created before WG support
+  status        ManagedContainerStatus @default(starting)
+  created_date  DateTime               @default(now())
 
   @@map("managed_containers")
 }

@@ -21,6 +21,7 @@ const mockContainer = {
   name: "abc123def456",
   dockerId: "docker-id-1",
   hostPort: 41123,
+  wgConfigName: "us-nyc-wg-301",
   status: "running",
   created_date: "2026-05-07T00:00:00.000Z",
 };

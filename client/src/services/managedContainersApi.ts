@@ -8,6 +8,7 @@ export interface ManagedContainerResponse {
   name: string;
   dockerId: string;
   hostPort: number;
+  wgConfigName: string | null;
   status: string;
   created_date: string;
 }
@@ -87,4 +88,36 @@ export async function pingManagedContainerHealth(id: number): Promise<ManagedCon
     undefined,
     "Container health check failed"
   );
+}
+
+/**
+ * Captures a full-page screenshot of the given URL by proxying through the managed
+ * container, which performs the navigation through its WireGuard tunnel. Returns the
+ * raw image bytes as a Blob so callers can render them via URL.createObjectURL.
+ * On failure, throws an Error whose message is the server-provided error string when
+ * available (e.g. the Playwright failure reason), so the UI can show it verbatim.
+ * @param {number} id - The id of the managed container that should perform the capture
+ * @param {string} url - The URL to render and screenshot
+ * @returns {Promise<Blob>} A Blob containing the image/png response bytes
+ * @throws {Error} If the response is not ok, with the server's error message or a fallback
+ */
+export async function captureScreenshot(id: number, url: string): Promise<Blob> {
+  const response = await fetch(`/api/managed-containers/${String(id)}/screenshot`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+
+  const isNotOk = !response.ok;
+  if (isNotOk) {
+    let errorBody: { error?: string } = {};
+    try {
+      errorBody = await response.json() as { error?: string };
+    } catch {
+      // Response had no readable JSON body — fall through to default message.
+    }
+    throw new Error(errorBody.error ?? "Failed to capture screenshot");
+  }
+
+  return response.blob();
 }

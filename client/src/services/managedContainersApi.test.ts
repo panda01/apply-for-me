@@ -5,6 +5,7 @@ import {
   createManagedContainer,
   deleteManagedContainer,
   pingManagedContainerHealth,
+  captureScreenshot,
 } from "./managedContainersApi";
 
 const mockRecord = {
@@ -12,6 +13,7 @@ const mockRecord = {
   name: "abc123def456",
   dockerId: "docker-id-1",
   hostPort: 41123,
+  wgConfigName: "us-nyc-wg-301",
   status: "running",
   created_date: "2026-05-07T00:00:00.000Z",
 };
@@ -155,5 +157,54 @@ describe("pingManagedContainerHealth", () => {
     }));
 
     await expect(pingManagedContainerHealth(1)).rejects.toThrow("Container health check failed");
+  });
+});
+
+describe("captureScreenshot", () => {
+  it("returns a Blob on success", async () => {
+    const blob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      blob: () => Promise.resolve(blob),
+    }));
+
+    const result = await captureScreenshot(1, "https://google.com");
+
+    expect(result).toBe(blob);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/managed-containers/1/screenshot",
+      expect.objectContaining({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: "https://google.com" }),
+      })
+    );
+  });
+
+  it("throws with the server's error message on non-OK responses", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "Container screenshot failed: page.goto timeout" }),
+    }));
+
+    await expect(captureScreenshot(1, "https://google.com")).rejects.toThrow(/page\.goto timeout/);
+  });
+
+  it("throws a generic message when the error body lacks an error field", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({}),
+    }));
+
+    await expect(captureScreenshot(1, "https://google.com")).rejects.toThrow("Failed to capture screenshot");
+  });
+
+  it("throws a generic message when the error body is not JSON", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.reject(new Error("not json")),
+    }));
+
+    await expect(captureScreenshot(1, "https://google.com")).rejects.toThrow("Failed to capture screenshot");
   });
 });

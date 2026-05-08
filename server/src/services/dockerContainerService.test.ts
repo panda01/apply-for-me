@@ -26,6 +26,7 @@ import {
   ensureImageBuilt,
   runContainer,
   stopAndRemove,
+  pickRandomWireGuardConfig,
   resetImageBuildCacheForTesting,
 } from "./dockerContainerService.js";
 
@@ -83,6 +84,16 @@ describe("findFreeHostPort", () => {
   });
 });
 
+describe("pickRandomWireGuardConfig", () => {
+  it("returns a config basename without the .conf extension", () => {
+    const chosen = pickRandomWireGuardConfig();
+    // wg_configs/ in the repo holds real us-nyc-wg-* configs; either way the
+    // returned name should never include a .conf suffix and should be non-empty.
+    expect(chosen).not.toMatch(/\.conf$/);
+    expect(chosen.length).toBeGreaterThan(0);
+  });
+});
+
 describe("ensureImageBuilt", () => {
   it("builds the image once and caches the result", async () => {
     mockBuildImage.mockResolvedValue({ on: vi.fn() });
@@ -121,15 +132,27 @@ describe("runContainer", () => {
     expect(result.dockerId).toBe("docker-id-xyz");
     expect(result.hostPort).toBeGreaterThanOrEqual(41000);
     expect(result.hostPort).toBeLessThanOrEqual(41999);
+    expect(result.wgConfigName.length).toBeGreaterThan(0);
 
     const createArgs = mockCreateContainer.mock.calls[0]?.[0] as {
       name: string;
       Env: string[];
-      HostConfig: { PortBindings: Record<string, Array<{ HostIp: string; HostPort: string }>> };
+      HostConfig: {
+        PortBindings: Record<string, Array<{ HostIp: string; HostPort: string }>>;
+        CapAdd: string[];
+        Devices: Array<{ PathOnHost: string; PathInContainer: string; CgroupPermissions: string }>;
+        Sysctls: Record<string, string>;
+        Binds: string[];
+      };
     };
     expect(createArgs.name).toBe("afm-foo");
     expect(createArgs.Env).toContain("CONTAINER_NAME=foo");
+    expect(createArgs.Env.some((entry) => entry.startsWith("WG_CONFIG_NAME="))).toBe(true);
     expect(createArgs.HostConfig.PortBindings["3000/tcp"]?.[0]?.HostIp).toBe("127.0.0.1");
+    expect(createArgs.HostConfig.CapAdd).toContain("NET_ADMIN");
+    expect(createArgs.HostConfig.Devices[0]?.PathOnHost).toBe("/dev/net/tun");
+    expect(createArgs.HostConfig.Sysctls["net.ipv4.conf.all.src_valid_mark"]).toBe("1");
+    expect(createArgs.HostConfig.Binds.some((bind) => bind.endsWith("/etc/wireguard-configs:ro"))).toBe(true);
     expect(startMock).toHaveBeenCalledOnce();
     expect(fetchSpy).toHaveBeenCalled();
     fetchSpy.mockRestore();
@@ -147,7 +170,7 @@ describe("runContainer", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
 
     const promise = runContainer("foo").catch((err: unknown) => err);
-    await vi.advanceTimersByTimeAsync(20000);
+    await vi.advanceTimersByTimeAsync(50000);
     const result = await promise;
 
     expect(result).toBeInstanceOf(Error);

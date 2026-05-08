@@ -16,6 +16,14 @@ const router = Router();
 const HEALTH_CHECK_TIMEOUT_MS = 3000;
 
 /**
+ * Maximum time (ms) to wait when proxying a screenshot request to a managed container.
+ * Kept generous because the page is fetched through the WireGuard tunnel and Playwright's
+ * own navigation timeout is 30s, so this must be longer than that to surface the upstream
+ * error rather than aborting it.
+ */
+const SCREENSHOT_TIMEOUT_MS = 60000;
+
+/**
  * POST /api/managed-containers
  * Creates and starts a new managed Docker container with an auto-generated name,
  * then persists a record. Optionally accepts { name } in the body to override the auto-generated name.
@@ -47,10 +55,12 @@ router.post("/", async (req: Request, res: Response) => {
 
   let dockerId: string;
   let hostPort: number;
+  let wgConfigName: string;
   try {
     const result = await runContainer(containerName);
     dockerId = result.dockerId;
     hostPort = result.hostPort;
+    wgConfigName = result.wgConfigName;
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.error(`[managed-containers] Failed to start container "${containerName}": ${errorMessage}`);
@@ -66,6 +76,7 @@ router.post("/", async (req: Request, res: Response) => {
         name: containerName,
         dockerId,
         hostPort,
+        wgConfigName,
         status: "running",
       },
     });
@@ -167,6 +178,89 @@ router.get("/:id/health", async (req: Request, res: Response) => {
     clearTimeout(timeoutHandle);
   }
 });
+
+/**
+ * POST /api/managed-containers/:id/screenshot
+ * Proxies a screenshot request to the managed container's /screenshot endpoint.
+ * The container fetches the URL through WireGuard and returns image/png bytes,
+ * which this route streams back to the caller untouched. Validates the URL on
+ * the host before contacting the container so obvious bad input doesn't waste
+ * a Playwright launch.
+ * @param {number} req.params.id - The managed container id
+ * @param {string} req.body.url - The URL to screenshot through the container
+ * @returns {Buffer} 200 - image/png bytes of the rendered page
+ * @returns {object} 400 - Invalid id or missing/invalid URL
+ * @returns {object} 404 - Managed container not found
+ * @returns {object} 503 - Container unreachable or upstream capture failed
+ */
+router.post("/:id/screenshot", async (req: Request, res: Response) => {
+  const record = await loadManagedContainerOrSend404(req, res);
+  if (record === null) {
+    return;
+  }
+
+  const rawUrl = (req.body as { url?: unknown } | undefined)?.url;
+  const isInvalidUrl = typeof rawUrl !== "string" || rawUrl.length === 0;
+  if (isInvalidUrl) {
+    res.status(400).json({ error: "Request body must include a non-empty 'url' string" });
+    return;
+  }
+  const targetUrl = rawUrl;
+
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => abortController.abort(), SCREENSHOT_TIMEOUT_MS);
+
+  try {
+    const upstreamResponse = await fetch(`http://127.0.0.1:${String(record.hostPort)}/screenshot`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: targetUrl }),
+      signal: abortController.signal,
+    });
+
+    const isUpstreamOk = upstreamResponse.ok;
+    if (!isUpstreamOk) {
+      const upstreamErrorMessage = await readUpstreamErrorMessage(upstreamResponse);
+      res.status(503).json({ error: `Container screenshot failed: ${upstreamErrorMessage}` });
+      return;
+    }
+
+    const pngArrayBuffer = await upstreamResponse.arrayBuffer();
+    res.setHeader("Content-Type", "image/png");
+    res.send(Buffer.from(pngArrayBuffer));
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[managed-containers] Screenshot proxy failed for container ${String(record.id)}: ${errorMessage}`);
+    res.status(503).json({ error: `Container unreachable: ${errorMessage}` });
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+});
+
+/**
+ * The whatwg/fetch Response type, aliased to avoid the name collision with
+ * Express's Response type that's already in scope in this file.
+ */
+type FetchResponse = Awaited<ReturnType<typeof fetch>>;
+
+/**
+ * Reads an `error` field from a non-OK upstream response, falling back to the HTTP status text.
+ * Used so the host's 503 response can include the underlying Playwright/WG failure message.
+ * @param {FetchResponse} upstreamResponse - The non-OK fetch Response from the container
+ * @returns {Promise<string>} The extracted error message, or the status text if the body wasn't parseable
+ */
+async function readUpstreamErrorMessage(upstreamResponse: FetchResponse): Promise<string> {
+  try {
+    const errorBody = await upstreamResponse.json() as { error?: unknown };
+    const hasErrorString = typeof errorBody.error === "string" && errorBody.error.length > 0;
+    if (hasErrorString) {
+      return errorBody.error as string;
+    }
+  } catch {
+    /* upstream returned non-JSON or empty body — fall through to status text */
+  }
+  return `${String(upstreamResponse.status)} ${upstreamResponse.statusText}`;
+}
 
 /**
  * DELETE /api/managed-containers/:id
