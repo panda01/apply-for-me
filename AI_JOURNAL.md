@@ -1,5 +1,49 @@
 # AI Journal
 
+## 2026-05-07 22:25: Refactor to pass `npm run check:duplication` (4% threshold)
+
+### What Changed
+Brought duplication from 11.64% (25 clones) down to 3.27% (11 clones) by extracting shared helpers and components. No tests were changed; all 308 tests still pass with branch coverage at 90.5%. Refactors fall into three groups:
+
+1. **Server route helpers.** Extracted `parseIdParam` + `findJobListingOrSend404` into `server/src/routes/_helpers.ts`. Refactored `jobListings.ts` (3 routes) and `jobApplications.ts` (1 route) to use them, and added `loadConfigOrSend400` in `jobApplications.ts` to dedupe the readUserInfo+getProfileId+catch pattern shared by `/apply` and `/apply-batch`.
+2. **Managed-containers route.** Extracted `loadManagedContainerOrSend404` to share the parse-id+findUnique+404 logic across the 3 GET/DELETE handlers.
+3. **Frontend.** Extracted six small reusable pieces:
+   - `client/src/services/httpClient.ts` — `requestJson<T>` helper now backing every function in `jobListingsApi.ts` and `managedContainersApi.ts`.
+   - `client/src/components/BackLink.tsx` — the standard back-arrow button used at the top of detail pages.
+   - `client/src/components/LoadingOrErrorPanel.tsx` — the loading-spinner-or-error-alert pair shown above page content.
+   - `client/src/components/JobRow.tsx` — single job-listing row used by all four sections of the dashboard.
+   - `client/src/components/JobSection.tsx` — Paper+heading+List wrapper for the Applied/Closed/Errors sections.
+   - `client/src/components/LiveBrowserView.tsx` — the iframe-or-waiting placeholder for the Browser Use live view.
+   - `client/src/components/LabeledField.tsx` — the subtitle-label-then-value pattern used on detail pages.
+
+### Files Added
+- `server/src/routes/_helpers.ts`
+- `client/src/services/httpClient.ts`
+- `client/src/components/BackLink.tsx`
+- `client/src/components/LoadingOrErrorPanel.tsx`
+- `client/src/components/JobRow.tsx`
+- `client/src/components/JobSection.tsx`
+- `client/src/components/LiveBrowserView.tsx`
+- `client/src/components/LabeledField.tsx`
+
+### Files Modified
+- `server/src/routes/jobListings.ts` — Switched 3 handlers to `findJobListingOrSend404`; removed inline parse/find blocks.
+- `server/src/routes/jobApplications.ts` — Switched the apply handler to `findJobListingOrSend404`; added `loadConfigOrSend400` and used it from `/apply` and `/apply-batch`.
+- `server/src/routes/managedContainers.ts` — Added local `loadManagedContainerOrSend404`; switched GET/:id, GET/:id/health, and DELETE/:id to use it.
+- `client/src/services/jobListingsApi.ts` — Each function now delegates to `requestJson` from `httpClient.ts`.
+- `client/src/services/managedContainersApi.ts` — Same delegation as above.
+- `client/src/pages/JobViewPage.tsx` — Replaced inline back-link, loading/error block, iframe block, and 4 label-value pairs with the new components.
+- `client/src/pages/ContainerViewPage.tsx` — Same replacements as above (back-link, loading/error, 3 label-value pairs).
+- `client/src/pages/ApplicationDashboardPage.tsx` — Replaced 4 list sections with `<JobSection><JobRow/></JobSection>` and the iframe block with `<LiveBrowserView>`.
+
+### Verification
+- `npm run lint`: clean
+- `npm run tsc`: clean
+- `npm run test`: 308/308 passing (no test file modified)
+- `npm run test:coverage`: 90.5% branch (above 90% threshold)
+- `npm run check:duplication`: **3.27%** duplication, **exits 0** (down from 11.64%)
+- Playwright `tests/playwright/managedContainers.spec.ts`: passing
+
 ## 2026-05-07 20:58: Inline create on /containers; clickable name links
 
 ### What Changed

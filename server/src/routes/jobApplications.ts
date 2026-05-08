@@ -5,6 +5,7 @@ import prisma from "../prismaClient.js";
 import { applyToJob } from "../services/jobApplicationService.js";
 import type { UserInfo, StepLog } from "../services/jobApplicationService.js";
 import { scrapeAndUpdateJobListing } from "./jobListings.js";
+import { findJobListingOrSend404 } from "./_helpers.js";
 
 const router = Router();
 
@@ -53,6 +54,29 @@ function getProfileId(): string {
 }
 
 /**
+ * Loads the user info file and the Browser Use profile id, returning both on success.
+ * Sends a 400 response and returns null when either fails so the caller can early-exit.
+ * @param {Response} res - The response (used to write 400 on error)
+ * @param {string} logTag - Prefix for the error log line (e.g., "applicator:route")
+ * @returns {Promise<{ userInfo: UserInfo; profileId: string } | null>} The loaded values or null on error
+ */
+async function loadConfigOrSend400(
+  res: Response,
+  logTag: string
+): Promise<{ userInfo: UserInfo; profileId: string } | null> {
+  try {
+    const userInfo = await readUserInfo();
+    const profileId = getProfileId();
+    return { userInfo, profileId };
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${logTag}] Config error: ${errorMessage}`);
+    res.status(400).json({ error: errorMessage });
+    return null;
+  }
+}
+
+/**
  * POST /api/job-listings/:id/apply
  * Starts the application process for a single job listing.
  * Sets the job status to "applying" and kicks off the Browser Use agent in the background.
@@ -63,25 +87,8 @@ function getProfileId(): string {
  * @returns {object} 404 - Job listing not found
  */
 router.post("/:id/apply", async (req: Request, res: Response) => {
-  const rawId = req.params.id;
-  const isArrayParam = Array.isArray(rawId);
-  if (isArrayParam) {
-    res.status(400).json({ error: "Invalid id parameter" });
-    return;
-  }
-
-  const id = parseInt(rawId, 10);
-
-  const isInvalidId = isNaN(id);
-  if (isInvalidId) {
-    res.status(400).json({ error: "Invalid id parameter" });
-    return;
-  }
-
-  const jobListing = await prisma.jobListing.findUnique({ where: { id } });
-  const isNotFound = !jobListing;
-  if (isNotFound) {
-    res.status(404).json({ error: "Job listing not found" });
+  const jobListing = await findJobListingOrSend404(req, res);
+  if (jobListing === null) {
     return;
   }
 
@@ -91,28 +98,21 @@ router.post("/:id/apply", async (req: Request, res: Response) => {
     return;
   }
 
-  let userInfo: UserInfo;
-  let profileId: string;
-  try {
-    userInfo = await readUserInfo();
-    profileId = getProfileId();
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    console.error(`[applicator:route] Config error for job ${id}: ${errorMessage}`);
-    res.status(400).json({ error: errorMessage });
+  const config = await loadConfigOrSend400(res, "applicator:route");
+  if (config === null) {
     return;
   }
 
-  console.log(`[applicator:route] Starting application for job ${id}: ${jobListing.url}`);
+  console.log(`[applicator:route] Starting application for job ${String(jobListing.id)}: ${jobListing.url}`);
 
   const updatedListing = await prisma.jobListing.update({
-    where: { id },
+    where: { id: jobListing.id },
     data: { status: "applying", live_url: null },
   });
 
   res.status(202).json(updatedListing);
 
-  applyToSingleJob(id, jobListing.url, userInfo, profileId).catch(() => {
+  applyToSingleJob(jobListing.id, jobListing.url, config.userInfo, config.profileId).catch(() => {
     /* error already handled inside */
   });
 });
@@ -246,17 +246,11 @@ router.post("/apply-batch", async (_req: Request, res: Response) => {
     return;
   }
 
-  let userInfo: UserInfo;
-  let profileId: string;
-  try {
-    userInfo = await readUserInfo();
-    profileId = getProfileId();
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    console.error(`[applicator:batch] Config error: ${errorMessage}`);
-    res.status(400).json({ error: errorMessage });
+  const config = await loadConfigOrSend400(res, "applicator:batch");
+  if (config === null) {
     return;
   }
+  const { userInfo, profileId } = config;
 
   const eligibleJobs = await prisma.jobListing.findMany({
     where: { status: "init" },

@@ -123,19 +123,10 @@ router.get("/", async (_req: Request, res: Response) => {
  * @returns {object} 404 - Not found error
  */
 router.get("/:id", async (req: Request, res: Response) => {
-  const id = parseManagedContainerId(req, res);
-  const isInvalidId = id === null;
-  if (isInvalidId) {
+  const record = await loadManagedContainerOrSend404(req, res);
+  if (record === null) {
     return;
   }
-
-  const record = await prisma.managedContainer.findUnique({ where: { id } });
-  const isNotFound = record === null;
-  if (isNotFound) {
-    res.status(404).json({ error: "Managed container not found" });
-    return;
-  }
-
   res.json(record);
 });
 
@@ -150,16 +141,8 @@ router.get("/:id", async (req: Request, res: Response) => {
  * @returns {object} 503 - Container unreachable
  */
 router.get("/:id/health", async (req: Request, res: Response) => {
-  const id = parseManagedContainerId(req, res);
-  const isInvalidId = id === null;
-  if (isInvalidId) {
-    return;
-  }
-
-  const record = await prisma.managedContainer.findUnique({ where: { id } });
-  const isNotFound = record === null;
-  if (isNotFound) {
-    res.status(404).json({ error: "Managed container not found" });
+  const record = await loadManagedContainerOrSend404(req, res);
+  if (record === null) {
     return;
   }
 
@@ -196,16 +179,8 @@ router.get("/:id/health", async (req: Request, res: Response) => {
  * @returns {object} 500 - Docker failure error
  */
 router.delete("/:id", async (req: Request, res: Response) => {
-  const id = parseManagedContainerId(req, res);
-  const isInvalidId = id === null;
-  if (isInvalidId) {
-    return;
-  }
-
-  const existing = await prisma.managedContainer.findUnique({ where: { id } });
-  const isNotFound = existing === null;
-  if (isNotFound) {
-    res.status(404).json({ error: "Managed container not found" });
+  const existing = await loadManagedContainerOrSend404(req, res);
+  if (existing === null) {
     return;
   }
 
@@ -218,7 +193,7 @@ router.delete("/:id", async (req: Request, res: Response) => {
     return;
   }
 
-  const deleted = await prisma.managedContainer.delete({ where: { id } });
+  const deleted = await prisma.managedContainer.delete({ where: { id: existing.id } });
   res.json(deleted);
 });
 
@@ -230,13 +205,37 @@ router.delete("/:id", async (req: Request, res: Response) => {
  * @returns {number | null} The parsed id, or null if invalid (response already written)
  */
 function parseManagedContainerId(req: Request, res: Response): number | null {
-  const id = parseInt(req.params.id, 10);
+  const rawId = req.params.id;
+  const id = typeof rawId === "string" ? parseInt(rawId, 10) : NaN;
   const isInvalidId = isNaN(id);
   if (isInvalidId) {
     res.status(400).json({ error: "Invalid id parameter" });
     return null;
   }
   return id;
+}
+
+/**
+ * Parses the :id param, looks up the managed container, and writes 400/404 responses
+ * for missing or invalid ids. Returns the record on success, or null if a response was sent.
+ * @param {Request} req - The incoming request
+ * @param {Response} res - The response (used to write 400/404 on error)
+ * @returns {Promise<{ id: number; name: string; dockerId: string; hostPort: number; status: string; created_date: Date } | null>} The record or null
+ */
+async function loadManagedContainerOrSend404(
+  req: Request,
+  res: Response
+): Promise<Awaited<ReturnType<typeof prisma.managedContainer.findUnique>> | null> {
+  const id = parseManagedContainerId(req, res);
+  if (id === null) {
+    return null;
+  }
+  const record = await prisma.managedContainer.findUnique({ where: { id } });
+  if (record === null) {
+    res.status(404).json({ error: "Managed container not found" });
+    return null;
+  }
+  return record;
 }
 
 export { router as managedContainersRouter };

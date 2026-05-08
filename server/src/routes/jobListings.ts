@@ -5,6 +5,7 @@ import { parseDate } from "chrono-node";
 import prisma from "../prismaClient.js";
 import { fetchJobListingFromUrl } from "../services/jobListingScraperService.js";
 import type { LinkedInCredentials } from "../services/jobListingScraperService.js";
+import { findJobListingOrSend404 } from "./_helpers.js";
 
 const router = Router();
 
@@ -157,28 +158,8 @@ router.post("/bulk", async (req: Request, res: Response) => {
  * @returns {object} 404 - Job listing not found error
  */
 router.post("/:id/fetch", async (req: Request, res: Response) => {
-  const rawId = req.params.id;
-  const isArrayParam = Array.isArray(rawId);
-  if (isArrayParam) {
-    res.status(400).json({ error: "Invalid id parameter" });
-    return;
-  }
-
-  const id = parseInt(rawId, 10);
-
-  const isInvalidId = isNaN(id);
-  if (isInvalidId) {
-    res.status(400).json({ error: "Invalid id parameter" });
-    return;
-  }
-
-  const jobListing = await prisma.jobListing.findUnique({
-    where: { id },
-  });
-
-  const isNotFound = !jobListing;
-  if (isNotFound) {
-    res.status(404).json({ error: "Job listing not found" });
+  const jobListing = await findJobListingOrSend404(req, res);
+  if (jobListing === null) {
     return;
   }
 
@@ -216,31 +197,10 @@ router.get("/", async (_req: Request, res: Response) => {
  * @returns {object} 404 - Job listing not found error
  */
 router.get("/:id", async (req: Request, res: Response) => {
-  const rawId = req.params.id;
-  const isArrayParam = Array.isArray(rawId);
-  if (isArrayParam) {
-    res.status(400).json({ error: "Invalid id parameter" });
+  const jobListing = await findJobListingOrSend404(req, res);
+  if (jobListing === null) {
     return;
   }
-
-  const id = parseInt(rawId, 10);
-
-  const isInvalidId = isNaN(id);
-  if (isInvalidId) {
-    res.status(400).json({ error: "Invalid id parameter" });
-    return;
-  }
-
-  const jobListing = await prisma.jobListing.findUnique({
-    where: { id },
-  });
-
-  const isNotFound = !jobListing;
-  if (isNotFound) {
-    res.status(404).json({ error: "Job listing not found" });
-    return;
-  }
-
   res.json(jobListing);
 });
 
@@ -252,33 +212,13 @@ router.get("/:id", async (req: Request, res: Response) => {
  * @returns {object} 404 - Job listing not found error
  */
 router.delete("/:id", async (req: Request, res: Response) => {
-  const rawId = req.params.id;
-  const isArrayParam = Array.isArray(rawId);
-  if (isArrayParam) {
-    res.status(400).json({ error: "Invalid id parameter" });
-    return;
-  }
-
-  const id = parseInt(rawId, 10);
-
-  const isInvalidId = isNaN(id);
-  if (isInvalidId) {
-    res.status(400).json({ error: "Invalid id parameter" });
-    return;
-  }
-
-  const existingJobListing = await prisma.jobListing.findUnique({
-    where: { id },
-  });
-
-  const isNotFound = !existingJobListing;
-  if (isNotFound) {
-    res.status(404).json({ error: "Job listing not found" });
+  const existingJobListing = await findJobListingOrSend404(req, res);
+  if (existingJobListing === null) {
     return;
   }
 
   const deletedJobListing = await prisma.jobListing.delete({
-    where: { id },
+    where: { id: existingJobListing.id },
   });
 
   res.json(deletedJobListing);

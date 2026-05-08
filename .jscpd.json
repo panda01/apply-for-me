@@ -1,0 +1,27 @@
+{
+  "threshold": 4,
+  "minTokens": 50,
+  "reporters": ["console"],
+  "ignore": [
+    "node_modules/**",
+    "tests/**",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "server/prisma/generated/**",
+    "dist/**",
+    "dist-server/**",
+    "coverage/**",
+    "**/*.d.ts",
+    "package-lock.json"
+  ],
+  "format": [
+    "typescript",
+    "tsx",
+    "jsx",
+    "css",
+    "html"
+  ],
+  "absolute": true
+}

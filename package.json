@@ -12,6 +12,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "check:duplication": "npx jscpd .",
     "tsc": "tsc --noEmit -p client/tsconfig.json && tsc --noEmit -p server/tsconfig.json"
   },
   "keywords": [],
@@ -58,6 +59,7 @@
     "jsdom": "^28.1.0",
     "prisma": "^7.4.2",
     "supertest": "^7.2.2",
+    "jscpd": "^4.0.8",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.56.1",

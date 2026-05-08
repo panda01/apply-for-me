@@ -1,10 +1,9 @@
 import { useEffect, useState, useCallback } from "react";
-import { Link as RouterLink, useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import {
   Container, Typography, CircularProgress, Alert, Box, Paper, Button, Chip, Divider,
 } from "@mui/material";
 import {
-  ArrowBack as ArrowBackIcon,
   HealthAndSafety as HealthIcon,
   Delete as DeleteIcon,
 } from "@mui/icons-material";
@@ -15,6 +14,9 @@ import {
   type ManagedContainerResponse,
   type ManagedContainerHealthResponse,
 } from "../services/managedContainersApi";
+import BackLink from "../components/BackLink";
+import LoadingOrErrorPanel from "../components/LoadingOrErrorPanel";
+import LabeledField from "../components/LabeledField";
 
 /**
  * Page that displays a single managed container's details and provides:
@@ -106,21 +108,13 @@ function ContainerViewPage() {
 
   return (
     <Container maxWidth="md" sx={{ mt: 4, mb: 4 }}>
-      <Button component={RouterLink} to="/containers" startIcon={<ArrowBackIcon />} sx={{ mb: 2 }}>
-        Back to Containers
-      </Button>
+      <BackLink to="/containers">Back to Containers</BackLink>
 
-      {isLoading && (
-        <Box sx={{ display: "flex", justifyContent: "center", mt: 4 }}>
-          <CircularProgress />
-        </Box>
-      )}
-
-      {errorMessage && (
-        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setErrorMessage("")}>
-          {errorMessage}
-        </Alert>
-      )}
+      <LoadingOrErrorPanel
+        isLoading={isLoading}
+        errorMessage={errorMessage}
+        onClearError={() => setErrorMessage("")}
+      />
 
       {container && (
         <>
@@ -134,14 +128,9 @@ function ContainerViewPage() {
 
             <Divider sx={{ mb: 2 }} />
 
-            <Typography variant="subtitle2" color="text.secondary">Docker ID</Typography>
-            <Typography sx={{ mb: 2, wordBreak: "break-all" }}>{container.dockerId}</Typography>
-
-            <Typography variant="subtitle2" color="text.secondary">Host Port</Typography>
-            <Typography sx={{ mb: 2 }} data-testid="container-host-port">{container.hostPort}</Typography>
-
-            <Typography variant="subtitle2" color="text.secondary">Created</Typography>
-            <Typography sx={{ mb: 2 }}>{new Date(container.created_date).toLocaleString()}</Typography>
+            <LabeledField label="Docker ID" breakLongValues>{container.dockerId}</LabeledField>
+            <LabeledField label="Host Port" valueTestId="container-host-port">{container.hostPort}</LabeledField>
+            <LabeledField label="Created">{new Date(container.created_date).toLocaleString()}</LabeledField>
 
             <Box sx={{ display: "flex", gap: 2, mt: 2 }}>
               <Button

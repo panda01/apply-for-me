@@ -1,18 +1,19 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
   Container, Typography, CircularProgress, Alert, Box,
-  Paper, Chip, Button, List, ListItem, ListItemText,
+  Paper, Chip, Button, List,
   Divider, LinearProgress,
 } from "@mui/material";
 import {
-  PlayArrow as PlayArrowIcon,
   PlaylistPlay as PlaylistPlayIcon,
-  OpenInNew as OpenInNewIcon,
 } from "@mui/icons-material";
 import {
   getJobListings, applyToJob, startBatchApply, getBatchApplyStatus,
   type JobListingResponse, type BatchApplyStatusResponse,
 } from "../services/jobListingsApi";
+import JobRow from "../components/JobRow";
+import JobSection from "../components/JobSection";
+import LiveBrowserView from "../components/LiveBrowserView";
 
 /**
  * Dashboard page for managing and monitoring job applications.
@@ -118,7 +119,6 @@ function ApplicationDashboardPage() {
   const closedJobs = jobListings.filter((listing) => listing.status === "closed");
 
   const currentlyApplyingJob = applyingJobs.length > 0 ? applyingJobs[0] : null;
-  const hasLiveUrl = !!currentlyApplyingJob?.live_url;
 
   const getStatusChip = (status: string) => {
     const statusConfig: Record<string, { color: "default" | "warning" | "success" | "error" | "info"; label: string }> = {
@@ -167,32 +167,7 @@ function ApplicationDashboardPage() {
                 {getStatusChip("applying")}
               </Box>
 
-              {hasLiveUrl && (
-                <Box
-                  component="iframe"
-                  src={currentlyApplyingJob.live_url!}
-                  title="Browser Use Live View"
-                  sx={{
-                    width: "100%",
-                    height: 500,
-                    border: "1px solid",
-                    borderColor: "divider",
-                    borderRadius: 1,
-                  }}
-                  sandbox="allow-scripts allow-same-origin"
-                />
-              )}
-
-              {!hasLiveUrl && (
-                <Box sx={{ display: "flex", justifyContent: "center", alignItems: "center", height: 300, bgcolor: "grey.100", borderRadius: 1 }}>
-                  <Box sx={{ textAlign: "center" }}>
-                    <CircularProgress size={32} sx={{ mb: 1 }} />
-                    <Typography color="text.secondary">
-                      Waiting for browser session to start...
-                    </Typography>
-                  </Box>
-                </Box>
-              )}
+              <LiveBrowserView liveUrl={currentlyApplyingJob.live_url} />
             </Paper>
           )}
 
@@ -240,172 +215,56 @@ function ApplicationDashboardPage() {
 
             <List disablePadding>
               {initJobs.map((listing) => (
-                <ListItem key={listing.id} disablePadding sx={{ mb: 0.5 }}>
-                  <Box sx={{ px: 2, py: 1, flex: 1, minWidth: 0 }}>
-                    <ListItemText
-                      primary={listing.title || listing.url}
-                      secondary={
-                        <Typography
-                          component="a"
-                          href={listing.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          variant="body2"
-                          color="primary"
-                          sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, textDecoration: "none", "&:hover": { textDecoration: "underline" } }}
-                          noWrap
-                        >
-                          {listing.url}
-                          <OpenInNewIcon sx={{ fontSize: 14 }} />
-                        </Typography>
-                      }
-                      primaryTypographyProps={{ noWrap: true }}
-                    />
-                  </Box>
-                  <Button
-                    size="small"
-                    variant="outlined"
-                    startIcon={applyingJobId === listing.id ? <CircularProgress size={14} /> : <PlayArrowIcon />}
-                    onClick={() => handleApplyToJob(listing.id)}
-                    disabled={applyingJobId !== null || applyingJobs.length > 0}
-                    sx={{ ml: 1, minWidth: 100 }}
-                  >
-                    Apply
-                  </Button>
-                </ListItem>
+                <JobRow
+                  key={listing.id}
+                  listing={listing}
+                  action={{
+                    label: "Apply",
+                    onClick: handleApplyToJob,
+                    disabled: applyingJobId !== null || applyingJobs.length > 0,
+                    isLoading: applyingJobId === listing.id,
+                  }}
+                />
               ))}
             </List>
           </Paper>
 
           {/* Applied Section */}
           {appliedJobs.length > 0 && (
-            <Paper elevation={1} sx={{ p: 2, mb: 3 }}>
-              <Typography variant="h6" sx={{ mb: 2 }}>
-                Applied ({appliedJobs.length})
-              </Typography>
-              <List disablePadding>
-                {appliedJobs.map((listing) => (
-                  <ListItem key={listing.id} disablePadding sx={{ mb: 0.5 }}>
-                    <Box sx={{ px: 2, py: 1, flex: 1, minWidth: 0 }}>
-                      <ListItemText
-                        primary={
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Typography component="span" noWrap>{listing.title || listing.url}</Typography>
-                            {getStatusChip(listing.status)}
-                          </Box>
-                        }
-                        secondary={
-                          <Typography
-                            component="a"
-                            href={listing.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            variant="body2"
-                            color="primary"
-                            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, textDecoration: "none", "&:hover": { textDecoration: "underline" } }}
-                            noWrap
-                          >
-                            {listing.url}
-                            <OpenInNewIcon sx={{ fontSize: 14 }} />
-                          </Typography>
-                        }
-                      />
-                    </Box>
-                  </ListItem>
-                ))}
-              </List>
-            </Paper>
+            <JobSection title="Applied" count={appliedJobs.length}>
+              {appliedJobs.map((listing) => (
+                <JobRow key={listing.id} listing={listing} statusChip={getStatusChip(listing.status)} />
+              ))}
+            </JobSection>
           )}
 
           {/* Closed Section */}
           {closedJobs.length > 0 && (
-            <Paper elevation={1} sx={{ p: 2, mb: 3 }}>
-              <Typography variant="h6" sx={{ mb: 2 }}>
-                Closed ({closedJobs.length})
-              </Typography>
-              <List disablePadding>
-                {closedJobs.map((listing) => (
-                  <ListItem key={listing.id} disablePadding sx={{ mb: 0.5 }}>
-                    <Box sx={{ px: 2, py: 1, flex: 1, minWidth: 0 }}>
-                      <ListItemText
-                        primary={
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Typography component="span" noWrap>{listing.title || listing.url}</Typography>
-                            {getStatusChip(listing.status)}
-                          </Box>
-                        }
-                        secondary={
-                          <Typography
-                            component="a"
-                            href={listing.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            variant="body2"
-                            color="primary"
-                            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, textDecoration: "none", "&:hover": { textDecoration: "underline" } }}
-                            noWrap
-                          >
-                            {listing.url}
-                            <OpenInNewIcon sx={{ fontSize: 14 }} />
-                          </Typography>
-                        }
-                      />
-                    </Box>
-                  </ListItem>
-                ))}
-              </List>
-            </Paper>
+            <JobSection title="Closed" count={closedJobs.length}>
+              {closedJobs.map((listing) => (
+                <JobRow key={listing.id} listing={listing} statusChip={getStatusChip(listing.status)} />
+              ))}
+            </JobSection>
           )}
 
           {/* Error Section */}
           {errorJobs.length > 0 && (
-            <Paper elevation={1} sx={{ p: 2, mb: 3 }}>
-              <Typography variant="h6" sx={{ mb: 2 }}>
-                Errors ({errorJobs.length})
-              </Typography>
-              <List disablePadding>
-                {errorJobs.map((listing) => (
-                  <ListItem key={listing.id} disablePadding sx={{ mb: 0.5 }}>
-                    <Box sx={{ px: 2, py: 1, flex: 1, minWidth: 0 }}>
-                      <ListItemText
-                        primary={
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Typography component="span" noWrap>{listing.title || listing.url}</Typography>
-                            {getStatusChip(listing.status)}
-                          </Box>
-                        }
-                        secondary={
-                          <Typography
-                            component="a"
-                            href={listing.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            variant="body2"
-                            color="primary"
-                            sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, textDecoration: "none", "&:hover": { textDecoration: "underline" } }}
-                            noWrap
-                          >
-                            {listing.url}
-                            <OpenInNewIcon sx={{ fontSize: 14 }} />
-                          </Typography>
-                        }
-                      />
-                    </Box>
-                    <Button
-                      size="small"
-                      variant="outlined"
-                      color="warning"
-                      startIcon={applyingJobId === listing.id ? <CircularProgress size={14} /> : <PlayArrowIcon />}
-                      onClick={() => handleApplyToJob(listing.id)}
-                      disabled={applyingJobId !== null || applyingJobs.length > 0}
-                      sx={{ ml: 1, minWidth: 100 }}
-                    >
-                      Retry
-                    </Button>
-                  </ListItem>
-                ))}
-              </List>
-            </Paper>
+            <JobSection title="Errors" count={errorJobs.length}>
+              {errorJobs.map((listing) => (
+                <JobRow
+                  key={listing.id}
+                  listing={listing}
+                  statusChip={getStatusChip(listing.status)}
+                  action={{
+                    label: "Retry",
+                    color: "warning",
+                    onClick: handleApplyToJob,
+                    disabled: applyingJobId !== null || applyingJobs.length > 0,
+                    isLoading: applyingJobId === listing.id,
+                  }}
+                />
+              ))}
+            </JobSection>
           )}
 
           <Divider sx={{ my: 2 }} />

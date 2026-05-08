@@ -1,15 +1,18 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams, Link as RouterLink } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import {
   Container, Typography, CircularProgress, Alert, Box,
   Paper, Chip, Button, Divider,
 } from "@mui/material";
 import {
-  ArrowBack as ArrowBackIcon,
   PlayArrow as PlayArrowIcon,
   Download as DownloadIcon,
 } from "@mui/icons-material";
 import { getJobListing, fetchJobData, applyToJob, type JobListingResponse } from "../services/jobListingsApi";
+import BackLink from "../components/BackLink";
+import LoadingOrErrorPanel from "../components/LoadingOrErrorPanel";
+import LiveBrowserView from "../components/LiveBrowserView";
+import LabeledField from "../components/LabeledField";
 
 /**
  * Page that displays the full details of a single job listing.
@@ -148,30 +151,14 @@ function JobViewPage() {
   };
 
   const isApplying = jobListing?.status === "applying";
-  const hasLiveUrl = !!jobListing?.live_url;
   const hasJobDetails = !!jobListing?.title;
   const canApply = jobListing?.status === "init" || jobListing?.status === "error_applying";
 
   return (
     <Container maxWidth="md" sx={{ mt: 4, mb: 4 }}>
-      <Button
-        component={RouterLink}
-        to="/jobs"
-        startIcon={<ArrowBackIcon />}
-        sx={{ mb: 2 }}
-      >
-        Back to Jobs List
-      </Button>
+      <BackLink to="/jobs">Back to Jobs List</BackLink>
 
-      {isLoading && (
-        <Box sx={{ display: "flex", justifyContent: "center", mt: 4 }}>
-          <CircularProgress />
-        </Box>
-      )}
-
-      {errorMessage && (
-        <Alert severity="error" sx={{ mb: 2 }}>{errorMessage}</Alert>
-      )}
+      <LoadingOrErrorPanel isLoading={isLoading} errorMessage={errorMessage} />
 
       {actionErrorMessage && (
         <Alert severity="error" sx={{ mb: 2 }} onClose={() => setActionErrorMessage("")}>
@@ -241,32 +228,7 @@ function JobViewPage() {
                 The browser agent is applying to this job. This may take a few minutes.
               </Typography>
 
-              {hasLiveUrl && (
-                <Box
-                  component="iframe"
-                  src={jobListing.live_url!}
-                  title="Browser Use Live View"
-                  sx={{
-                    width: "100%",
-                    height: 500,
-                    border: "1px solid",
-                    borderColor: "divider",
-                    borderRadius: 1,
-                  }}
-                  sandbox="allow-scripts allow-same-origin"
-                />
-              )}
-
-              {!hasLiveUrl && (
-                <Box sx={{ display: "flex", justifyContent: "center", alignItems: "center", height: 300, bgcolor: "grey.100", borderRadius: 1 }}>
-                  <Box sx={{ textAlign: "center" }}>
-                    <CircularProgress size={32} sx={{ mb: 1 }} />
-                    <Typography color="text.secondary">
-                      Waiting for browser session to start...
-                    </Typography>
-                  </Box>
-                </Box>
-              )}
+              <LiveBrowserView liveUrl={jobListing.live_url} />
             </Paper>
           )}
 
@@ -280,29 +242,16 @@ function JobViewPage() {
               <Divider sx={{ mb: 2 }} />
 
               {jobListing.salary && (
-                <>
-                  <Typography variant="subtitle2" color="text.secondary" gutterBottom>
-                    Salary
-                  </Typography>
-                  <Typography sx={{ mb: 2 }}>
-                    {jobListing.salary}
-                  </Typography>
-                </>
+                <LabeledField label="Salary" gutterBottom>{jobListing.salary}</LabeledField>
               )}
 
-              <Typography variant="subtitle2" color="text.secondary" gutterBottom>
-                Post Date
-              </Typography>
-              <Typography sx={{ mb: 2 }}>
+              <LabeledField label="Post Date" gutterBottom>
                 {jobListing.post_date ? new Date(jobListing.post_date).toLocaleDateString() : "Unknown"}
-              </Typography>
+              </LabeledField>
 
-              <Typography variant="subtitle2" color="text.secondary" gutterBottom>
-                Added On
-              </Typography>
-              <Typography sx={{ mb: 2 }}>
+              <LabeledField label="Added On" gutterBottom>
                 {new Date(jobListing.created_date).toLocaleDateString()}
-              </Typography>
+              </LabeledField>
 
               <Divider sx={{ mb: 2 }} />
 

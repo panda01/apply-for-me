@@ -1,6 +1,7 @@
 /**
  * Frontend API service for interacting with the job listings backend.
  */
+import { requestJson } from "./httpClient";
 
 export interface JobListingResponse {
   id: number;
@@ -20,14 +21,11 @@ export interface JobListingResponse {
  * @throws {Error} If the API request fails
  */
 export async function getJobListings(): Promise<JobListingResponse[]> {
-  const response = await fetch("/api/job-listings");
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    throw new Error("Failed to fetch job listings");
-  }
-
-  return response.json() as Promise<JobListingResponse[]>;
+  return requestJson<JobListingResponse[]>(
+    "/api/job-listings",
+    undefined,
+    "Failed to fetch job listings"
+  );
 }
 
 /**
@@ -37,15 +35,11 @@ export async function getJobListings(): Promise<JobListingResponse[]> {
  * @throws {Error} If the API request fails or the listing is not found
  */
 export async function getJobListing(id: number): Promise<JobListingResponse> {
-  const response = await fetch(`/api/job-listings/${id}`);
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to fetch job listing");
-  }
-
-  return response.json() as Promise<JobListingResponse>;
+  return requestJson<JobListingResponse>(
+    `/api/job-listings/${String(id)}`,
+    undefined,
+    "Failed to fetch job listing"
+  );
 }
 
 /**
@@ -55,19 +49,15 @@ export async function getJobListing(id: number): Promise<JobListingResponse> {
  * @throws {Error} If the API request fails
  */
 export async function createJobListing(url: string): Promise<JobListingResponse> {
-  const response = await fetch("/api/job-listings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url }),
-  });
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to create job listing");
-  }
-
-  return response.json() as Promise<JobListingResponse>;
+  return requestJson<JobListingResponse>(
+    "/api/job-listings",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    },
+    "Failed to create job listing"
+  );
 }
 
 /**
@@ -78,17 +68,11 @@ export async function createJobListing(url: string): Promise<JobListingResponse>
  * @throws {Error} If the API request fails
  */
 export async function fetchJobData(id: number): Promise<JobListingResponse> {
-  const response = await fetch(`/api/job-listings/${id}/fetch`, {
-    method: "POST",
-  });
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to fetch job data");
-  }
-
-  return response.json() as Promise<JobListingResponse>;
+  return requestJson<JobListingResponse>(
+    `/api/job-listings/${String(id)}/fetch`,
+    { method: "POST" },
+    "Failed to fetch job data"
+  );
 }
 
 /**
@@ -98,17 +82,11 @@ export async function fetchJobData(id: number): Promise<JobListingResponse> {
  * @throws {Error} If the API request fails
  */
 export async function deleteJobListing(id: number): Promise<JobListingResponse> {
-  const response = await fetch(`/api/job-listings/${id}`, {
-    method: "DELETE",
-  });
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to delete job listing");
-  }
-
-  return response.json() as Promise<JobListingResponse>;
+  return requestJson<JobListingResponse>(
+    `/api/job-listings/${String(id)}`,
+    { method: "DELETE" },
+    "Failed to delete job listing"
+  );
 }
 
 /**
@@ -118,19 +96,15 @@ export async function deleteJobListing(id: number): Promise<JobListingResponse> 
  * @throws {Error} If the API request fails
  */
 export async function bulkCreateJobListings(urls: string[]): Promise<{ count: number; listings: JobListingResponse[] }> {
-  const response = await fetch("/api/job-listings/bulk", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ urls }),
-  });
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to bulk create job listings");
-  }
-
-  return response.json() as Promise<{ count: number; listings: JobListingResponse[] }>;
+  return requestJson<{ count: number; listings: JobListingResponse[] }>(
+    "/api/job-listings/bulk",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ urls }),
+    },
+    "Failed to bulk create job listings"
+  );
 }
 
 /**
@@ -140,17 +114,11 @@ export async function bulkCreateJobListings(urls: string[]): Promise<{ count: nu
  * @throws {Error} If the API request fails
  */
 export async function applyToJob(id: number): Promise<JobListingResponse> {
-  const response = await fetch(`/api/job-listings/${id}/apply`, {
-    method: "POST",
-  });
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to start job application");
-  }
-
-  return response.json() as Promise<JobListingResponse>;
+  return requestJson<JobListingResponse>(
+    `/api/job-listings/${String(id)}/apply`,
+    { method: "POST" },
+    "Failed to start job application"
+  );
 }
 
 /**
@@ -171,17 +139,11 @@ export interface BatchApplyStatusResponse {
  * @throws {Error} If the API request fails
  */
 export async function startBatchApply(): Promise<{ message: string; totalJobs: number }> {
-  const response = await fetch("/api/job-listings/apply-batch", {
-    method: "POST",
-  });
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to start batch application");
-  }
-
-  return response.json() as Promise<{ message: string; totalJobs: number }>;
+  return requestJson<{ message: string; totalJobs: number }>(
+    "/api/job-listings/apply-batch",
+    { method: "POST" },
+    "Failed to start batch application"
+  );
 }
 
 /**
@@ -190,12 +152,9 @@ export async function startBatchApply(): Promise<{ message: string; totalJobs: n
  * @throws {Error} If the API request fails
  */
 export async function getBatchApplyStatus(): Promise<BatchApplyStatusResponse> {
-  const response = await fetch("/api/job-listings/apply-batch/status");
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    throw new Error("Failed to fetch batch apply status");
-  }
-
-  return response.json() as Promise<BatchApplyStatusResponse>;
+  return requestJson<BatchApplyStatusResponse>(
+    "/api/job-listings/apply-batch/status",
+    undefined,
+    "Failed to fetch batch apply status"
+  );
 }

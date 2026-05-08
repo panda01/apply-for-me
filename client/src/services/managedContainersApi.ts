@@ -1,6 +1,7 @@
 /**
  * Frontend API service for the managed Docker containers backend.
  */
+import { requestJson } from "./httpClient";
 
 export interface ManagedContainerResponse {
   id: number;
@@ -22,14 +23,11 @@ export interface ManagedContainerHealthResponse {
  * @throws {Error} If the API request fails
  */
 export async function listManagedContainers(): Promise<ManagedContainerResponse[]> {
-  const response = await fetch("/api/managed-containers");
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    throw new Error("Failed to fetch managed containers");
-  }
-
-  return response.json() as Promise<ManagedContainerResponse[]>;
+  return requestJson<ManagedContainerResponse[]>(
+    "/api/managed-containers",
+    undefined,
+    "Failed to fetch managed containers"
+  );
 }
 
 /**
@@ -39,15 +37,11 @@ export async function listManagedContainers(): Promise<ManagedContainerResponse[
  * @throws {Error} If the API request fails or the record is not found
  */
 export async function getManagedContainer(id: number): Promise<ManagedContainerResponse> {
-  const response = await fetch(`/api/managed-containers/${id}`);
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to fetch managed container");
-  }
-
-  return response.json() as Promise<ManagedContainerResponse>;
+  return requestJson<ManagedContainerResponse>(
+    `/api/managed-containers/${String(id)}`,
+    undefined,
+    "Failed to fetch managed container"
+  );
 }
 
 /**
@@ -56,19 +50,15 @@ export async function getManagedContainer(id: number): Promise<ManagedContainerR
  * @throws {Error} If the API request fails
  */
 export async function createManagedContainer(): Promise<ManagedContainerResponse> {
-  const response = await fetch("/api/managed-containers", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to create managed container");
-  }
-
-  return response.json() as Promise<ManagedContainerResponse>;
+  return requestJson<ManagedContainerResponse>(
+    "/api/managed-containers",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    },
+    "Failed to create managed container"
+  );
 }
 
 /**
@@ -78,17 +68,11 @@ export async function createManagedContainer(): Promise<ManagedContainerResponse
  * @throws {Error} If the API request fails
  */
 export async function deleteManagedContainer(id: number): Promise<ManagedContainerResponse> {
-  const response = await fetch(`/api/managed-containers/${id}`, {
-    method: "DELETE",
-  });
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Failed to delete managed container");
-  }
-
-  return response.json() as Promise<ManagedContainerResponse>;
+  return requestJson<ManagedContainerResponse>(
+    `/api/managed-containers/${String(id)}`,
+    { method: "DELETE" },
+    "Failed to delete managed container"
+  );
 }
 
 /**
@@ -98,13 +82,9 @@ export async function deleteManagedContainer(id: number): Promise<ManagedContain
  * @throws {Error} If the API request fails or the container is unreachable
  */
 export async function pingManagedContainerHealth(id: number): Promise<ManagedContainerHealthResponse> {
-  const response = await fetch(`/api/managed-containers/${id}/health`);
-
-  const isNotOk = !response.ok;
-  if (isNotOk) {
-    const errorBody = await response.json() as { error?: string };
-    throw new Error(errorBody.error ?? "Container health check failed");
-  }
-
-  return response.json() as Promise<ManagedContainerHealthResponse>;
+  return requestJson<ManagedContainerHealthResponse>(
+    `/api/managed-containers/${String(id)}/health`,
+    undefined,
+    "Container health check failed"
+  );
 }
