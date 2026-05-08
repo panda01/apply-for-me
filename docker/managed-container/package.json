@@ -1,0 +1,17 @@
+{
+  "name": "afm-managed-container",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "tsx server.ts"
+  },
+  "dependencies": {
+    "express": "5.2.1",
+    "tsx": "4.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "typescript": "5.9.3"
+  }
+}

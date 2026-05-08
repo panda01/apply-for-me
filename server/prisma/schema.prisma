@@ -56,3 +56,24 @@ model EmailResponses {
 
   @@map("email_responses")
 }
+
+// Tracks lifecycle of a managed Docker container spawned via the API.
+enum ManagedContainerStatus {
+  starting
+  running
+  stopped
+  error
+}
+
+// Records each Docker container spawned through the managed-containers API.
+// dockerId is Docker's full container ID; name is the user-visible name (without the afm- prefix).
+model ManagedContainer {
+  id           Int                    @id @default(autoincrement())
+  name         String                 @unique
+  dockerId     String                 @unique
+  hostPort     Int                    @unique
+  status       ManagedContainerStatus @default(starting)
+  created_date DateTime               @default(now())
+
+  @@map("managed_containers")
+}

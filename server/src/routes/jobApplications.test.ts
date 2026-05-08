@@ -64,6 +64,7 @@ const mockInitJobListing = {
   url: "https://linkedin.com/jobs/view/123",
   description: "Test description",
   salary: null,
+  location: null,
   live_url: null,
   post_date: new Date("2026-03-07T00:00:00.000Z"),
   created_date: new Date("2026-03-07T00:00:00.000Z"),

@@ -4,6 +4,8 @@ import AddJobPage from "./pages/AddJobPage";
 import JobsListPage from "./pages/JobsListPage";
 import JobViewPage from "./pages/JobViewPage";
 import ApplicationDashboardPage from "./pages/ApplicationDashboardPage";
+import ContainersListPage from "./pages/ContainersListPage";
+import ContainerViewPage from "./pages/ContainerViewPage";
 
 /**
  * Root application component that sets up routing and the navigation menu.
@@ -12,6 +14,8 @@ import ApplicationDashboardPage from "./pages/ApplicationDashboardPage";
  *   /jobs — View all job listings
  *   /jobs/:id — View a single job listing
  *   /apply — Application dashboard for applying to jobs
+ *   /containers — List + spawn managed Docker containers (create is inline)
+ *   /containers/:id — View a single managed container with health-check ping
  */
 function App() {
   return (
@@ -22,6 +26,8 @@ function App() {
         <Route path="/jobs" element={<JobsListPage />} />
         <Route path="/jobs/:id" element={<JobViewPage />} />
         <Route path="/apply" element={<ApplicationDashboardPage />} />
+        <Route path="/containers" element={<ContainersListPage />} />
+        <Route path="/containers/:id" element={<ContainerViewPage />} />
       </Routes>
     </BrowserRouter>
   );

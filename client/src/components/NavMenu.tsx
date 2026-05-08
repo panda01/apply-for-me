@@ -12,6 +12,7 @@ function NavMenu() {
     { label: "Add Job", path: "/" },
     { label: "Jobs List", path: "/jobs" },
     { label: "Apply", path: "/apply" },
+    { label: "Containers", path: "/containers" },
   ];
 
   return (

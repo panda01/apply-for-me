@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 import { jobListingsRouter } from "./routes/jobListings.js";
 import { jobApplicationsRouter } from "./routes/jobApplications.js";
+import { managedContainersRouter } from "./routes/managedContainers.js";
 
 const app = express();
 
@@ -12,5 +13,6 @@ app.get("/api/health", (_req: Request, res: Response) => {
 
 app.use("/api/job-listings", jobListingsRouter);
 app.use("/api/job-listings", jobApplicationsRouter);
+app.use("/api/managed-containers", managedContainersRouter);
 
 export { app };
