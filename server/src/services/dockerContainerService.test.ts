@@ -148,6 +148,7 @@ describe("runContainer", () => {
     expect(createArgs.name).toBe("afm-foo");
     expect(createArgs.Env).toContain("CONTAINER_NAME=foo");
     expect(createArgs.Env.some((entry) => entry.startsWith("WG_CONFIG_NAME="))).toBe(true);
+    expect(createArgs.Env.some((entry) => entry.startsWith("ANTHROPIC_API_KEY="))).toBe(true);
     expect(createArgs.HostConfig.PortBindings["3000/tcp"]?.[0]?.HostIp).toBe("127.0.0.1");
     expect(createArgs.HostConfig.CapAdd).toContain("NET_ADMIN");
     expect(createArgs.HostConfig.Devices[0]?.PathOnHost).toBe("/dev/net/tun");

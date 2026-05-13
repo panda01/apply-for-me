@@ -31,7 +31,7 @@ If a command doesn't work or something doesn't go as expected, ask the user what
     - Run the claude command or skill `/review` show the user the output, and fix the must fix and should fix issues. do not mark it as good to go until you can run review with it showing nothing in the must fix and should fix sections.
     - Use the commands `npm run test`, `npm run tsc`, `npm run check:duplication`, `npm run test:coverage` and `npm run lint` always check your changes to make sure they didn't break these commands. If you changed any of the source code, that isn't testing code, start this whole process again to make sure your changes are still working.
 - CRITICAL: Never change config files to make tests or checks pass, unless the user explicitly asks you to.
-- When you need a temporary directory, or a temporary file that you need to place somewhere, always use the working directory for the project, and name the temporary folder claude_temp. never create folders outside of the working directory for this project.
+- When you need a temporary directory, or a temporary file that you need to place somewhere, always use the working directory for the project, and name the temporary folder claude_tmp. never create folders or files outside of the working directory for this project.
 - use express and tsx for the backend
 - When using a database use the prisma ORM
 - Use MUI components were possible instead of elements with classnames.

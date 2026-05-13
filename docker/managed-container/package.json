@@ -7,8 +7,12 @@
     "start": "tsx server.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "0.69.0",
     "express": "5.2.1",
+    "patchright": "1.59.4",
     "playwright": "1.58.2",
+    "playwright-extra": "4.3.6",
+    "puppeteer-extra-plugin-stealth": "2.11.2",
     "tsx": "4.21.0"
   },
   "devDependencies": {

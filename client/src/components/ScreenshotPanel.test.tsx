@@ -40,9 +40,25 @@ describe("ScreenshotPanel", () => {
     await user.click(screen.getByTestId("screenshot-capture-button"));
 
     await waitFor(() => {
-      expect(captureScreenshot).toHaveBeenCalledWith(42, "https://google.com");
+      expect(captureScreenshot).toHaveBeenCalledWith(42, "https://google.com", false);
       const img = screen.getByTestId("screenshot-image") as HTMLImageElement;
       expect(img.src).toContain("blob:mock-url");
+    });
+  });
+
+  it("passes useProxy=true through when the checkbox is ticked", async () => {
+    const blob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" });
+    vi.mocked(captureScreenshot).mockResolvedValue(blob);
+
+    render(<ScreenshotPanel containerId={42} />);
+
+    const user = userEvent.setup();
+    const checkbox = screen.getByTestId("screenshot-use-proxy");
+    await user.click(checkbox);
+    await user.click(screen.getByTestId("screenshot-capture-button"));
+
+    await waitFor(() => {
+      expect(captureScreenshot).toHaveBeenCalledWith(42, "https://google.com", true);
     });
   });
 

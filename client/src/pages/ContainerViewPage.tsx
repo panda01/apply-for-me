@@ -18,6 +18,7 @@ import BackLink from "../components/BackLink";
 import LoadingOrErrorPanel from "../components/LoadingOrErrorPanel";
 import LabeledField from "../components/LabeledField";
 import ScreenshotPanel from "../components/ScreenshotPanel";
+import AnalyzePanel from "../components/AnalyzePanel";
 
 /**
  * Page that displays a single managed container's details and provides:
@@ -158,6 +159,8 @@ function ContainerViewPage() {
           </Paper>
 
           <ScreenshotPanel containerId={container.id} />
+
+          <AnalyzePanel containerId={container.id} />
 
           {pingResult && (
             <Paper elevation={1} sx={{ p: 3, mb: 2 }} data-testid="ping-success">

@@ -406,6 +406,108 @@ describe("POST /api/managed-containers/:id/screenshot", () => {
   });
 });
 
+describe("POST /api/managed-containers/:id/analyze", () => {
+  const fixtureResult = {
+    is_job_description: true,
+    apply_button_present: true,
+    description_signals: ["Responsibilities", "Full-time", "Remote"],
+    reasoning: "Page has an Apply button and matching description sections.",
+    screenshot_b64: "iVBORw0KGgo=",
+  };
+
+  it("returns 400 when id is not a number", async () => {
+    const response = await request(app)
+      .post("/api/managed-containers/abc/analyze")
+      .send({ url: "https://example.com" });
+
+    expect(response.status).toBe(400);
+    expect(prisma.managedContainer.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the record is missing", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
+
+    const response = await request(app)
+      .post("/api/managed-containers/999/analyze")
+      .send({ url: "https://example.com" });
+
+    expect(response.status).toBe(404);
+  });
+
+  it("returns 400 when the request body is missing the url", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/analyze")
+      .send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/url/);
+  });
+
+  it("proxies the analyze response when the upstream agent succeeds", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(fixtureResult), { status: 200, headers: { "Content-Type": "application/json" } })
+    );
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/analyze")
+      .send({ url: "https://example.com/job/1" });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(fixtureResult);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "http://127.0.0.1:41123/analyze",
+      expect.objectContaining({ method: "POST" })
+    );
+    fetchSpy.mockRestore();
+  });
+
+  it("returns 503 when the container reports an agent failure", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ error: "Agent exceeded 8 turns without calling report" }), { status: 500 })
+    );
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/analyze")
+      .send({ url: "https://example.com" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/exceeded 8 turns/);
+    fetchSpy.mockRestore();
+  });
+
+  it("returns 503 with status text when upstream non-OK body is not JSON", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("not json", { status: 502, statusText: "Bad Gateway" })
+    );
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/analyze")
+      .send({ url: "https://example.com" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/502/);
+    fetchSpy.mockRestore();
+  });
+
+  it("returns 503 when the container is unreachable", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/analyze")
+      .send({ url: "https://example.com" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/ECONNREFUSED/);
+    fetchSpy.mockRestore();
+  });
+});
+
 describe("POST error path with non-Error rejection", () => {
   it("includes the stringified non-Error reason when runContainer rejects with a non-Error", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);

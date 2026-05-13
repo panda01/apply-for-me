@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "include": ["server.ts"]
+  "include": ["server.ts", "agent.ts", "popup.ts", "smartproxy.ts"]
 }

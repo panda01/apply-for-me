@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  Paper, Typography, TextField, Button, Box, Alert, CircularProgress,
+  Paper, Typography, TextField, Button, Box, Alert, CircularProgress, FormControlLabel, Checkbox,
 } from "@mui/material";
 import { CameraAlt as CameraIcon } from "@mui/icons-material";
 import { captureScreenshot } from "../services/managedContainersApi";
@@ -21,6 +21,7 @@ interface ScreenshotPanelProps {
  */
 function ScreenshotPanel({ containerId }: ScreenshotPanelProps) {
   const [url, setUrl] = useState("https://google.com");
+  const [useProxy, setUseProxy] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   const [imageObjectUrl, setImageObjectUrl] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
@@ -53,7 +54,7 @@ function ScreenshotPanel({ containerId }: ScreenshotPanelProps) {
     setIsCapturing(true);
     setErrorMessage("");
     try {
-      const blob = await captureScreenshot(containerId, trimmedUrl);
+      const blob = await captureScreenshot(containerId, trimmedUrl, useProxy);
       const newObjectUrl = URL.createObjectURL(blob);
       setImageObjectUrl((previousObjectUrl) => {
         if (previousObjectUrl !== null) {
@@ -75,7 +76,7 @@ function ScreenshotPanel({ containerId }: ScreenshotPanelProps) {
         Screenshot a URL
       </Typography>
 
-      <Box sx={{ display: "flex", gap: 2, mb: 2 }}>
+      <Box sx={{ display: "flex", gap: 2, mb: 1 }}>
         <TextField
           label="URL"
           value={url}
@@ -94,6 +95,20 @@ function ScreenshotPanel({ containerId }: ScreenshotPanelProps) {
           {isCapturing ? "Capturing..." : "Capture"}
         </Button>
       </Box>
+
+      <FormControlLabel
+        sx={{ mb: 1 }}
+        control={
+          <Checkbox
+            checked={useProxy}
+            onChange={(event) => setUseProxy(event.target.checked)}
+            disabled={isCapturing}
+            data-testid="screenshot-use-proxy"
+          />
+        }
+        label="Use residential proxy (Smartproxy) — needed for Cloudflare-blocked sites"
+      />
+
 
       {errorMessage && (
         <Alert

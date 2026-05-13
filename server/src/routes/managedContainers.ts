@@ -24,6 +24,13 @@ const HEALTH_CHECK_TIMEOUT_MS = 3000;
 const SCREENSHOT_TIMEOUT_MS = 60000;
 
 /**
+ * Maximum time (ms) to wait when proxying an /analyze request. The agent loop can
+ * make several Claude calls plus several Playwright actions, so this is generous —
+ * the upstream agent itself caps turns at 8.
+ */
+const ANALYZE_TIMEOUT_MS = 120000;
+
+/**
  * POST /api/managed-containers
  * Creates and starts a new managed Docker container with an auto-generated name,
  * then persists a record. Optionally accepts { name } in the body to override the auto-generated name.
@@ -199,13 +206,15 @@ router.post("/:id/screenshot", async (req: Request, res: Response) => {
     return;
   }
 
-  const rawUrl = (req.body as { url?: unknown } | undefined)?.url;
+  const requestBody = req.body as { url?: unknown; useProxy?: unknown } | undefined;
+  const rawUrl = requestBody?.url;
   const isInvalidUrl = typeof rawUrl !== "string" || rawUrl.length === 0;
   if (isInvalidUrl) {
     res.status(400).json({ error: "Request body must include a non-empty 'url' string" });
     return;
   }
   const targetUrl = rawUrl;
+  const useProxy = requestBody?.useProxy === true;
 
   const abortController = new AbortController();
   const timeoutHandle = setTimeout(() => abortController.abort(), SCREENSHOT_TIMEOUT_MS);
@@ -214,7 +223,7 @@ router.post("/:id/screenshot", async (req: Request, res: Response) => {
     const upstreamResponse = await fetch(`http://127.0.0.1:${String(record.hostPort)}/screenshot`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: targetUrl }),
+      body: JSON.stringify({ url: targetUrl, useProxy }),
       signal: abortController.signal,
     });
 
@@ -231,6 +240,64 @@ router.post("/:id/screenshot", async (req: Request, res: Response) => {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.error(`[managed-containers] Screenshot proxy failed for container ${String(record.id)}: ${errorMessage}`);
+    res.status(503).json({ error: `Container unreachable: ${errorMessage}` });
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+});
+
+/**
+ * POST /api/managed-containers/:id/analyze
+ * Proxies an analyze request to the managed container's /analyze endpoint.
+ * The container runs a Claude tool-calling agent that dismisses popups,
+ * inspects the page, and reports whether the URL is a job description page,
+ * along with a final screenshot (base64). Streams the JSON body back to the caller.
+ * @param {number} req.params.id - The managed container id
+ * @param {string} req.body.url - The URL to analyze
+ * @returns {object} 200 - { is_job_description, apply_button_present, description_signals, reasoning, screenshot_b64 }
+ * @returns {object} 400 - Invalid id or missing/invalid URL
+ * @returns {object} 404 - Managed container not found
+ * @returns {object} 503 - Container unreachable or upstream agent failed
+ */
+router.post("/:id/analyze", async (req: Request, res: Response) => {
+  const record = await loadManagedContainerOrSend404(req, res);
+  if (record === null) {
+    return;
+  }
+
+  const requestBody = req.body as { url?: unknown; useProxy?: unknown } | undefined;
+  const rawUrl = requestBody?.url;
+  const isInvalidUrl = typeof rawUrl !== "string" || rawUrl.length === 0;
+  if (isInvalidUrl) {
+    res.status(400).json({ error: "Request body must include a non-empty 'url' string" });
+    return;
+  }
+  const targetUrl = rawUrl;
+  const useProxy = requestBody?.useProxy === true;
+
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => abortController.abort(), ANALYZE_TIMEOUT_MS);
+
+  try {
+    const upstreamResponse = await fetch(`http://127.0.0.1:${String(record.hostPort)}/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: targetUrl, useProxy }),
+      signal: abortController.signal,
+    });
+
+    const isUpstreamOk = upstreamResponse.ok;
+    if (!isUpstreamOk) {
+      const upstreamErrorMessage = await readUpstreamErrorMessage(upstreamResponse);
+      res.status(503).json({ error: `Container analyze failed: ${upstreamErrorMessage}` });
+      return;
+    }
+
+    const upstreamBody = await upstreamResponse.json();
+    res.json(upstreamBody);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[managed-containers] Analyze proxy failed for container ${String(record.id)}: ${errorMessage}`);
     res.status(503).json({ error: `Container unreachable: ${errorMessage}` });
   } finally {
     clearTimeout(timeoutHandle);

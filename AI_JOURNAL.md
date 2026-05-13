@@ -1,5 +1,98 @@
 # AI Journal
 
+## 2026-05-08 12:30: Fix Apply-button false negative + full-page screenshots with popup dismissal + 10000 px cap
+
+### Intent
+Investigation against the LinkedIn URL the user provided showed our `dismiss_popups` CSS rule `[class*="Modal" i]` was hiding LinkedIn's primary blue Apply button because its class is `sign-up-modal__outlet` — the substring "modal" matched. After hide, `get_page_summary` couldn't see the (now invisible) button (no aria-label, `visibleText` returned ""), so the agent reported `apply_button_present: false` despite a clearly visible Apply CTA. Also, the agent's screenshot tool was capturing only the 1280×720 viewport, and `/screenshot` had no popup dismissal — both fixed in this pass.
+
+### What Changed
+- **`docker/managed-container/popup.ts` (new)** — extracted `DISMISS_HELPER_SCRIPT` and added `captureCleanedScreenshot(page)`, `SCREENSHOT_MAX_HEIGHT_PX = 10000`. Tightened the hide selector list: dropped the bare `[class*="Modal" i]` and `[class*="Overlay" i]` substring rules, replaced with container-specific patterns (`modal-overlay`, `modal-wrapper`, `modal-container`, `modal-backdrop`, `modal-content`, `ModalContainer`, `ModalWrapper`, `ModalOverlay`, `-overlay`, `contextual-sign-in`, `contextual-signin`). Added an apply-button exemption pass: any interactive element whose accessible name matches `/\bapply\b|easy\s*apply|quick\s*apply|submit\s*application/i` has `display: revert !important; visibility: visible !important` set inline on it and every ancestor up to body, beating any stylesheet `!important` hide rules.
+  - `captureCleanedScreenshot` runs dismiss → scrolls page in 1000-px steps up to 10 000 px (with 100 ms pauses) to trigger lazy-loaded content → resets to top → `page.screenshot({ fullPage: true, clip: { x:0, y:0, width: viewport.width, height: min(scrollHeight, 10000) }})`. For pages ≤10 000 px tall, returns the entire page; for taller pages, returns the top 10 000 px (no infinite-scroll runaway).
+- **`docker/managed-container/agent.ts`**
+  - Removed the inline `DISMISS_HELPER_SCRIPT`; imports it from `popup.ts`.
+  - `SUMMARY_HELPER_SCRIPT` now collects buttons with cap 100 (was 30 shipped) and adds a dedicated `applyButtons: { label, href }[]` array via an uncapped sweep. The applyButtons collector matches against aria-label, visible text, AND the original (possibly hidden) text content, so apply CTAs are always surfaced even when they share class names with hidden modal containers.
+  - Agent's `screenshot` tool now calls `captureCleanedScreenshot(page)` instead of inline `page.screenshot({ fullPage: false })`.
+  - `report` tool's fallback (when the agent didn't call screenshot) also uses `captureCleanedScreenshot`.
+  - System prompt's Class A list now mentions the `applyButtons` array explicitly so the LLM knows to consult it.
+- **`docker/managed-container/server.ts`** — `/screenshot` now calls `captureCleanedScreenshot(page)`. JSDoc updated to reflect dismiss-then-capped-fullPage behavior.
+- **`docker/managed-container/Dockerfile`** — `COPY popup.ts ./`
+- **`docker/managed-container/tsconfig.json`** — included `popup.ts` in the program.
+- **`server/src/services/dockerContainerService.ts`** — `popup.ts` added to dockerode build-context src array.
+
+### Files Added
+- `docker/managed-container/popup.ts`
+
+### Files Modified
+- `docker/managed-container/agent.ts` — drop inline DISMISS_HELPER_SCRIPT, import from popup.ts, bump buttons cap, add applyButtons[], swap screenshot tool & report fallback to captureCleanedScreenshot, update system prompt.
+- `docker/managed-container/server.ts` — /screenshot uses captureCleanedScreenshot.
+- `docker/managed-container/Dockerfile` — COPY popup.ts.
+- `docker/managed-container/tsconfig.json` — include popup.ts.
+- `server/src/services/dockerContainerService.ts` — add popup.ts to build src list.
+
+### Investigation
+Ran a one-off Playwright diagnostic inside the container against the LinkedIn URL. Output:
+- Found 4 elements with "apply" text/aria. Critical one was idx 35 (class `sign-up-modal__outlet top-card-layout__cta--primary btn-md btn-primary`). It was **visible before** dismiss_popups but **hidden after** because `[class*="Modal" i]` matched its class. Once hidden, `visibleText` returned "" and the button (with no aria-label) had `label=""`, so it was filtered out of the `buttons` array sent to the LLM. Confirmed root cause; not a buttons-cap issue.
+- A `/screenshot` of the URL **without** popup dismissal also confirmed the Apply button is visibly present on the page (just covered by LinkedIn's contextual-sign-in overlay).
+
+### Verification
+- `npm run lint`: clean
+- `npm run tsc`: clean
+- `npm run test`: 351/351 passing
+- `npm run test:coverage`: 98.41% statements / 91.13% branches (above 90%)
+- `npm run check:duplication`: 3.64%
+- Manual `/analyze` against the LinkedIn URL: `is_job_description: true`, **`apply_button_present: true`** (was false before). Reasoning explicitly cites "two visible 'Apply' buttons (Class A signal confirmed via applyButtons array)". Description signals: salary `$160,000–$250,000/yr`, experience marker (Entry level), employment type (Internship), "About this role" section. Returned a 1280×4438 PNG of the cleared full page. ~10 s total.
+- Manual `/screenshot` against the same URL: 1280×4643 PNG; sign-in modal dismissed; both Apply buttons visible at the top of the page.
+- SIGINT cleanup unaffected — server exits in ~2 s, no container leaks.
+
+## 2026-05-08 11:25: Add Claude tool-calling agent that analyzes URLs for "is this a job description page?"
+
+### Intent
+Per-container `/analyze` endpoint that runs a small Anthropic SDK tool-calling loop in the same Node process as the existing Express server (no Python sidecar, no extra runtime). The agent dismisses popups, summarizes the cleared page, optionally clicks elements, takes a screenshot, then reports a structured verdict. Surfaced on the frontend as a new `AnalyzePanel` on the container detail page with an Analyze button.
+
+### What Changed
+- **`docker/managed-container/agent.ts`** (new): the agent module. Five tools (`dismiss_popups`, `get_page_summary`, `click_by_text`, `screenshot`, `report`); system prompt encodes the Class A (apply affordance) + Class B (description content) detection rule; max 8 turns; ANTHROPIC_API_KEY read from env. `dismiss_popups` runs a Tier-1 deterministic helper (close-button click loop + CSS hide of `[role=dialog]`/`[aria-modal]`/Modal/Cookie/etc. + body scroll-lock removal). `get_page_summary` returns headings, button labels, salary regex matches, employment-type tokens, worksite tokens, experience markers — small JSON the model can reason about without ingesting full DOM.
+- **`docker/managed-container/server.ts`**: new `POST /analyze` endpoint. Each request opens a fresh context+page (reuses the cached chromium browser), runs `runAnalyzeAgent`, returns `{ is_job_description, apply_button_present, description_signals, reasoning, screenshot_b64 }`. 60 s upstream timeout via Express defaults; agent loop has its own per-turn token budget.
+- **`docker/managed-container/package.json`**: added `@anthropic-ai/sdk@0.69.0`.
+- **`docker/managed-container/Dockerfile`**: COPY `agent.ts` into the image alongside `server.ts`.
+- **`docker/managed-container/tsconfig.json`**: included `agent.ts` in the program.
+- **`server/src/services/dockerContainerService.ts`**: forward host `CLAUDE_API_KEY` env → container `ANTHROPIC_API_KEY` env (the SDK's default name); added `agent.ts` to the dockerode build-context src list.
+- **`server/src/routes/managedContainers.ts`**: new `POST /api/managed-containers/:id/analyze` host proxy mirroring `/screenshot`'s pattern; 120 s timeout (agent loop > screenshot single-shot); JSON body in, JSON body out; 503 on container/Anthropic failure with the upstream error string preserved.
+- **`client/src/services/managedContainersApi.ts`**: added `AnalyzeResponse` interface and `analyzeUrl(id, url)` using the existing `requestJson` helper.
+- **`client/src/components/AnalyzePanel.tsx`** (new): URL input pre-populated with the LinkedIn URL the user provided, Analyze button, verdict chip, apply-button chip, signals chips, reasoning text, screenshot rendered inline via `data:image/png;base64,...`. Errors as a dismissable MUI Alert.
+- **`client/src/pages/ContainerViewPage.tsx`**: render `<AnalyzePanel/>` below `<ScreenshotPanel/>`.
+- **Tests**: 6 new container-route tests for `/analyze` (200 happy path, 400/404 input errors, 503 on upstream agent failure / non-JSON / network); 3 new tests for `analyzeUrl` (success, server-error message, generic fallback); 7 new tests for `AnalyzePanel` (positive verdict + signals + screenshot, negative verdict, server error displays, generic-error fallback, empty-URL guard, alert close, pre-populated URL); ContainerViewPage test updated to mock `analyzeUrl`. Total 351/351 passing.
+- **Host devDep**: added `@anthropic-ai/sdk@0.69.0` so the host eslint can resolve types in the container's `agent.ts` (the package isn't used at runtime by the host — only in the container).
+
+### Files Added
+- `docker/managed-container/agent.ts`
+- `client/src/components/AnalyzePanel.tsx`
+- `client/src/components/AnalyzePanel.test.tsx`
+
+### Files Modified
+- `docker/managed-container/Dockerfile` — COPY agent.ts
+- `docker/managed-container/server.ts` — new POST /analyze
+- `docker/managed-container/package.json` — added @anthropic-ai/sdk
+- `docker/managed-container/tsconfig.json` — include agent.ts
+- `server/src/services/dockerContainerService.ts` — forward CLAUDE_API_KEY → ANTHROPIC_API_KEY, add agent.ts to build src
+- `server/src/services/dockerContainerService.test.ts` — assert ANTHROPIC_API_KEY env forwarded
+- `server/src/routes/managedContainers.ts` — POST /:id/analyze proxy + ANALYZE_TIMEOUT_MS
+- `server/src/routes/managedContainers.test.ts` — 6 new tests for the analyze route
+- `client/src/services/managedContainersApi.ts` — analyzeUrl + AnalyzeResponse
+- `client/src/services/managedContainersApi.test.ts` — 3 new tests for analyzeUrl
+- `client/src/pages/ContainerViewPage.tsx` — wire in AnalyzePanel
+- `client/src/pages/ContainerViewPage.test.tsx` — mock analyzeUrl in api stub
+- `package.json` — @anthropic-ai/sdk as host devDep (for eslint type resolution only)
+
+### Verification
+- `npm run lint`: clean
+- `npm run tsc`: clean
+- `npm run test`: 351/351 passing (+24)
+- `npm run test:coverage`: 98.41% statements / 91.13% branches (above 90% threshold)
+- `npm run check:duplication`: 3.75%
+- Manual end-to-end via curl: spawned container → POST `/api/managed-containers/:id/analyze` with the LinkedIn URL the user provided → returned `is_job_description: true`, `apply_button_present: false`, four Class B signals (salary $160K–$250K, employment type, experience marker, "About this role"), reasoning explaining LinkedIn's sign-in wall hides the apply button, plus a 1280x720 PNG of the cleared page rendered inline. 13.3 s end-to-end.
+- Manual UI flow via Playwright script (`claude_temp/manual-analyze-check.mjs`): create container via New Container button → open detail page → click Analyze → verdict chip ("Job description page"), apply chip ("No apply button"), reasoning text, screenshot rendered as `data:image/png;base64,...`. Delete via UI works.
+- SIGINT cleanup confirmed unaffected: server exits in 2 s, `docker ps -a --filter name=afm-` empty, DB rows empty.
+
 ## 2026-05-07 23:45: Simplify container DNS handling + clean up containers on server shutdown
 
 ### Intent

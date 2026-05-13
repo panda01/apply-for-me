@@ -6,6 +6,7 @@ import {
   deleteManagedContainer,
   pingManagedContainerHealth,
   captureScreenshot,
+  analyzeUrl,
 } from "./managedContainersApi";
 
 const mockRecord = {
@@ -176,7 +177,24 @@ describe("captureScreenshot", () => {
       expect.objectContaining({
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: "https://google.com" }),
+        body: JSON.stringify({ url: "https://google.com", useProxy: false }),
+      })
+    );
+  });
+
+  it("forwards useProxy=true in the body when explicitly enabled", async () => {
+    const blob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      blob: () => Promise.resolve(blob),
+    }));
+
+    await captureScreenshot(1, "https://indeed.com/jobs", true);
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/managed-containers/1/screenshot",
+      expect.objectContaining({
+        body: JSON.stringify({ url: "https://indeed.com/jobs", useProxy: true }),
       })
     );
   });
@@ -206,5 +224,68 @@ describe("captureScreenshot", () => {
     }));
 
     await expect(captureScreenshot(1, "https://google.com")).rejects.toThrow("Failed to capture screenshot");
+  });
+});
+
+describe("analyzeUrl", () => {
+  const fixture = {
+    is_job_description: true,
+    apply_button_present: true,
+    description_signals: ["Responsibilities", "Full-time"],
+    reasoning: "OK",
+    screenshot_b64: "iVBORw0KGgo=",
+  };
+
+  it("posts to the analyze endpoint and returns the parsed verdict", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(fixture),
+    }));
+
+    const result = await analyzeUrl(1, "https://example.com/job/1");
+
+    expect(result).toEqual(fixture);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/managed-containers/1/analyze",
+      expect.objectContaining({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: "https://example.com/job/1", useProxy: false }),
+      })
+    );
+  });
+
+  it("forwards useProxy=true in the body when explicitly enabled", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(fixture),
+    }));
+
+    await analyzeUrl(1, "https://indeed.com/jobs", true);
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/managed-containers/1/analyze",
+      expect.objectContaining({
+        body: JSON.stringify({ url: "https://indeed.com/jobs", useProxy: true }),
+      })
+    );
+  });
+
+  it("throws with the server's error message on non-OK responses", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "Container analyze failed: Agent exceeded 8 turns" }),
+    }));
+
+    await expect(analyzeUrl(1, "https://example.com")).rejects.toThrow(/exceeded 8 turns/);
+  });
+
+  it("throws a generic message when the error body lacks an error field", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({}),
+    }));
+
+    await expect(analyzeUrl(1, "https://example.com")).rejects.toThrow("Failed to analyze URL");
   });
 });

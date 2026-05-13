@@ -9,6 +9,7 @@ vi.mock("../services/managedContainersApi", () => ({
   deleteManagedContainer: vi.fn(),
   pingManagedContainerHealth: vi.fn(),
   captureScreenshot: vi.fn(),
+  analyzeUrl: vi.fn(),
 }));
 
 import {

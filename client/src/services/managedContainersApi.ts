@@ -90,22 +90,55 @@ export async function pingManagedContainerHealth(id: number): Promise<ManagedCon
   );
 }
 
+export interface AnalyzeResponse {
+  is_job_description: boolean;
+  apply_button_present: boolean;
+  description_signals: string[];
+  reasoning: string;
+  screenshot_b64: string;
+}
+
+/**
+ * Asks the managed container to analyze a URL with the Claude tool-calling agent.
+ * Returns a structured verdict + base64 screenshot. On failure, throws an Error
+ * whose message is the server's error string when available so the UI can render it verbatim.
+ * @param {number} id - The id of the managed container that should perform the analysis
+ * @param {string} url - The URL to analyze
+ * @param {boolean} [useProxy] - When true, route the request through Smartproxy residential exits instead of the default WireGuard egress (needed for Cloudflare-blocked sites like Indeed)
+ * @returns {Promise<AnalyzeResponse>} The agent's verdict, signals, reasoning, and screenshot
+ * @throws {Error} If the response is not ok, with the server's error message or a fallback
+ */
+export async function analyzeUrl(id: number, url: string, useProxy = false): Promise<AnalyzeResponse> {
+  return requestJson<AnalyzeResponse>(
+    `/api/managed-containers/${String(id)}/analyze`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, useProxy }),
+    },
+    "Failed to analyze URL"
+  );
+}
+
 /**
  * Captures a full-page screenshot of the given URL by proxying through the managed
- * container, which performs the navigation through its WireGuard tunnel. Returns the
- * raw image bytes as a Blob so callers can render them via URL.createObjectURL.
- * On failure, throws an Error whose message is the server-provided error string when
- * available (e.g. the Playwright failure reason), so the UI can show it verbatim.
+ * container. Returns the raw image bytes as a Blob so callers can render them via
+ * URL.createObjectURL. By default the container fetches the page through its
+ * WireGuard tunnel; pass `useProxy: true` to route through Smartproxy residential
+ * exits (necessary for Cloudflare-blocked sites). On failure, throws an Error
+ * whose message is the server-provided error string when available (e.g. the
+ * Playwright failure reason), so the UI can show it verbatim.
  * @param {number} id - The id of the managed container that should perform the capture
  * @param {string} url - The URL to render and screenshot
+ * @param {boolean} [useProxy] - When true, route the request through Smartproxy
  * @returns {Promise<Blob>} A Blob containing the image/png response bytes
  * @throws {Error} If the response is not ok, with the server's error message or a fallback
  */
-export async function captureScreenshot(id: number, url: string): Promise<Blob> {
+export async function captureScreenshot(id: number, url: string, useProxy = false): Promise<Blob> {
   const response = await fetch(`/api/managed-containers/${String(id)}/screenshot`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, useProxy }),
   });
 
   const isNotOk = !response.ok;

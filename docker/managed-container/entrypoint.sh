@@ -49,4 +49,13 @@ iptables -t mangle -A PREROUTING -p tcp -j CONNMARK --restore-mark
 iptables -t mangle -A OUTPUT -p tcp -j CONNMARK --restore-mark
 ip rule add fwmark 0xeeee table main priority 100
 
+# Xvfb provides a virtual display for headed Chromium. We run on display :99
+# at 1920x1080x24, then set DISPLAY so chromium picks it up automatically.
+# Started in the background; the kernel reaps it when the container exits.
+echo "[entrypoint] Starting Xvfb on :99 for headed Chromium"
+Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >/var/log/xvfb.log 2>&1 &
+export DISPLAY=:99
+# Brief wait so Xvfb is listening before chromium probes it.
+sleep 0.3
+
 exec "$@"

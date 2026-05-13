@@ -149,6 +149,9 @@ export async function ensureImageBuilt(): Promise<void> {
         src: [
           "Dockerfile",
           "server.ts",
+          "agent.ts",
+          "popup.ts",
+          "smartproxy.ts",
           "package.json",
           "tsconfig.json",
           "entrypoint.sh",
@@ -194,10 +197,34 @@ export async function runContainer(name: string): Promise<RunContainerResult> {
   const dockerName = toDockerName(name);
   const wgConfigName = pickRandomWireGuardConfig();
 
+  // The container's /analyze endpoint needs an Anthropic API key to talk to
+  // Claude. The host stores it as CLAUDE_API_KEY in .env; the container reads
+  // it as ANTHROPIC_API_KEY (the Anthropic SDK's default env var name). If
+  // it's missing we forward an empty string and let the /analyze route
+  // surface a clear 500 — spawning containers without the key still works
+  // for screenshot-only flows.
+  const claudeApiKey = process.env["CLAUDE_API_KEY"] ?? "";
+
+  // Smartproxy creds for the optional residential-proxy egress path. When
+  // /screenshot or /analyze is called with useProxy=true, the container
+  // reads these env vars to build the Playwright proxy config. Forwarding
+  // empty strings is fine — the container code returns null and the route
+  // returns a clear 500 ("useProxy=true but creds not set").
+  const smartproxyUsername = process.env["SMARTPROXY_USERNAME"] ?? "";
+  const smartproxyPassword = process.env["SMARTPROXY_PASSWORD"] ?? "";
+  const smartproxyEndpoint = process.env["SMARTPROXY_ENDPOINT"] ?? "";
+
   const container = await docker.createContainer({
     Image: IMAGE_TAG,
     name: dockerName,
-    Env: [`CONTAINER_NAME=${name}`, `WG_CONFIG_NAME=${wgConfigName}`],
+    Env: [
+      `CONTAINER_NAME=${name}`,
+      `WG_CONFIG_NAME=${wgConfigName}`,
+      `ANTHROPIC_API_KEY=${claudeApiKey}`,
+      `SMARTPROXY_USERNAME=${smartproxyUsername}`,
+      `SMARTPROXY_PASSWORD=${smartproxyPassword}`,
+      `SMARTPROXY_ENDPOINT=${smartproxyEndpoint}`,
+    ],
     ExposedPorts: { [CONTAINER_INTERNAL_PORT]: {} },
     HostConfig: {
       PortBindings: {
