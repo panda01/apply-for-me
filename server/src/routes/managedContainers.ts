@@ -150,13 +150,18 @@ router.get("/:id", async (req: Request, res: Response) => {
 
 /**
  * GET /api/managed-containers/:id/health
- * Proxies a health check to the managed container, hitting its mapped host port.
- * Returns the container's response on success, or 503 on unreachable.
+ * Proxies a health check to the managed container, hitting its mapped host port,
+ * and persists the resulting verdict to the managed_containers row so the list/view
+ * UI reflects the latest probe outcome:
+ *   - upstream 2xx        → status = "running"
+ *   - upstream non-2xx    → status = "error"
+ *   - fetch threw (timeout/network) → status = "stopped"
+ * The DB write is awaited before responding so callers see a consistent status after the request returns.
  * @param {number} req.params.id - The managed container id
  * @returns {object} 200 - { status: "ok", name } from the container
  * @returns {object} 400 - Invalid id error
  * @returns {object} 404 - Managed container not found
- * @returns {object} 503 - Container unreachable
+ * @returns {object} 503 - Container unreachable or reported non-ok
  */
 router.get("/:id/health", async (req: Request, res: Response) => {
   const record = await loadManagedContainerOrSend404(req, res);
@@ -164,27 +169,95 @@ router.get("/:id/health", async (req: Request, res: Response) => {
     return;
   }
 
+  const probeResult = await proxyContainerHealthCheck(record.hostPort);
+  const persistedStatus = healthOutcomeToStatus(probeResult.outcome);
+  await persistHealthStatus(record.id, persistedStatus);
+
+  if (probeResult.outcome === "healthy") {
+    res.json(probeResult.body);
+    return;
+  }
+  if (probeResult.outcome === "non_ok") {
+    res.status(503).json({ error: "Container reported non-ok status" });
+    return;
+  }
+  res.status(503).json({ error: `Container unreachable: ${probeResult.errorMessage}` });
+});
+
+/**
+ * Classified outcome of a single outbound health probe to a managed container.
+ * Distinguishing "non_ok" (we reached the container, it answered with 5xx) from
+ * "unreachable" (fetch itself threw — DNS, ECONNREFUSED, timeout/abort) is what
+ * lets the route persist `error` vs `stopped` to the DB.
+ */
+type HealthProbeOutcome =
+  | { outcome: "healthy"; body: { status?: string; name?: string } }
+  | { outcome: "non_ok" }
+  | { outcome: "unreachable"; errorMessage: string };
+
+/**
+ * Performs a single GET /health against the container at the given host port, aborting
+ * after HEALTH_CHECK_TIMEOUT_MS. Classifies the result into healthy / non_ok / unreachable
+ * so the caller can map each case to a distinct persisted status.
+ * @param {number} hostPort - The localhost port mapped to the container's HTTP server
+ * @returns {Promise<HealthProbeOutcome>} The classified probe result
+ */
+async function proxyContainerHealthCheck(hostPort: number): Promise<HealthProbeOutcome> {
   const abortController = new AbortController();
   const timeoutHandle = setTimeout(() => abortController.abort(), HEALTH_CHECK_TIMEOUT_MS);
 
   try {
-    const upstreamResponse = await fetch(`http://127.0.0.1:${record.hostPort}/health`, {
+    const upstreamResponse = await fetch(`http://127.0.0.1:${String(hostPort)}/health`, {
       signal: abortController.signal,
     });
     const isUpstreamOk = upstreamResponse.ok;
     if (!isUpstreamOk) {
-      res.status(503).json({ error: "Container reported non-ok status" });
-      return;
+      return { outcome: "non_ok" };
     }
     const upstreamBody = await upstreamResponse.json() as { status?: string; name?: string };
-    res.json(upstreamBody);
+    return { outcome: "healthy", body: upstreamBody };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    res.status(503).json({ error: `Container unreachable: ${errorMessage}` });
+    return { outcome: "unreachable", errorMessage };
   } finally {
     clearTimeout(timeoutHandle);
   }
-});
+}
+
+/**
+ * The subset of ManagedContainerStatus that a /health probe can write back.
+ * `starting` is only used by the create flow; this route never transitions a record back into it.
+ */
+type PersistableHealthStatus = "running" | "error" | "stopped";
+
+/**
+ * Maps a probe outcome to the status that should be persisted to managed_containers.
+ * @param {HealthProbeOutcome["outcome"]} outcome - The classified probe outcome
+ * @returns {PersistableHealthStatus} The status string to write to the DB
+ */
+function healthOutcomeToStatus(outcome: HealthProbeOutcome["outcome"]): PersistableHealthStatus {
+  if (outcome === "healthy") return "running";
+  if (outcome === "non_ok") return "error";
+  return "stopped";
+}
+
+/**
+ * Writes the latest health-check verdict back to the managed_containers row. Best-effort:
+ * any DB error is logged via console.error and swallowed, because the user-facing response
+ * is driven by the probe itself — a flaky DB shouldn't make a working container's Ping
+ * button appear to fail.
+ * @param {number} id - The managed container id
+ * @param {PersistableHealthStatus} status - The status to persist
+ * @returns {Promise<void>}
+ */
+async function persistHealthStatus(id: number, status: PersistableHealthStatus): Promise<void> {
+  try {
+    await prisma.managedContainer.update({ where: { id }, data: { status } });
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[managed-containers] Failed to persist health status for ${String(id)}: ${errorMessage}`);
+  }
+}
 
 /**
  * POST /api/managed-containers/:id/screenshot

@@ -9,6 +9,7 @@ vi.mock("../prismaClient.js", () => {
         create: vi.fn(),
         findMany: vi.fn(),
         findUnique: vi.fn(),
+        update: vi.fn(),
         delete: vi.fn(),
       },
     },
@@ -163,6 +164,22 @@ describe("POST /api/managed-containers", () => {
     expect(response.status).toBe(500);
     expect(stopAndRemove).toHaveBeenCalledWith("docker-id-Z");
   });
+
+  it("stringifies a non-Error rollback failure in the orphan-cleanup log line", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
+    vi.mocked(runContainer).mockResolvedValue({ dockerId: "docker-id-W", hostPort: 41205, wgConfigName: "us-nyc-wg-301" });
+    vi.mocked(prisma.managedContainer.create).mockRejectedValue(new Error("db down"));
+    vi.mocked(stopAndRemove).mockRejectedValue("non-error-cleanup");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await request(app).post("/api/managed-containers").send({});
+
+    expect(response.status).toBe(500);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/Failed to clean up orphaned container docker-id-W: non-error-cleanup/)
+    );
+    consoleErrorSpy.mockRestore();
+  });
 });
 
 describe("GET /api/managed-containers", () => {
@@ -210,8 +227,9 @@ describe("GET /api/managed-containers/:id/health", () => {
     expect(prisma.managedContainer.findUnique).not.toHaveBeenCalled();
   });
 
-  it("proxies the health check and returns the upstream body on success", async () => {
+  it("proxies the health check, returns the upstream body, and persists status=running on success", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    vi.mocked(prisma.managedContainer.update).mockResolvedValue({ ...baseRecord, status: "running" });
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(JSON.stringify({ status: "ok", name: "abc123def456" }), { status: 200 }));
@@ -224,22 +242,32 @@ describe("GET /api/managed-containers/:id/health", () => {
       "http://127.0.0.1:41123/health",
       expect.objectContaining({ signal: expect.anything() })
     );
+    expect(prisma.managedContainer.update).toHaveBeenCalledWith({
+      where: { id: 1 },
+      data: { status: "running" },
+    });
     fetchSpy.mockRestore();
   });
 
-  it("returns 503 when the container is unreachable", async () => {
+  it("returns 503 and persists status=stopped when the container is unreachable", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    vi.mocked(prisma.managedContainer.update).mockResolvedValue({ ...baseRecord, status: "stopped" });
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
 
     const response = await request(app).get("/api/managed-containers/1/health");
 
     expect(response.status).toBe(503);
     expect(response.body.error).toMatch(/ECONNREFUSED/);
+    expect(prisma.managedContainer.update).toHaveBeenCalledWith({
+      where: { id: 1 },
+      data: { status: "stopped" },
+    });
     fetchSpy.mockRestore();
   });
 
-  it("returns 503 when the upstream container reports a non-ok status", async () => {
+  it("returns 503 and persists status=error when the upstream container reports a non-ok status", async () => {
     vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    vi.mocked(prisma.managedContainer.update).mockResolvedValue({ ...baseRecord, status: "error" });
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response("err", { status: 500 }));
@@ -247,7 +275,48 @@ describe("GET /api/managed-containers/:id/health", () => {
     const response = await request(app).get("/api/managed-containers/1/health");
 
     expect(response.status).toBe(503);
+    expect(prisma.managedContainer.update).toHaveBeenCalledWith({
+      where: { id: 1 },
+      data: { status: "error" },
+    });
     fetchSpy.mockRestore();
+  });
+
+  it("still returns the probe result when the DB status write fails", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    vi.mocked(prisma.managedContainer.update).mockRejectedValue(new Error("db down"));
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ status: "ok", name: "abc123def456" }), { status: 200 }));
+
+    const response = await request(app).get("/api/managed-containers/1/health");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ status: "ok", name: "abc123def456" });
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/Failed to persist health status for 1: db down/)
+    );
+    fetchSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("logs a stringified non-Error when the DB status write rejects with a non-Error", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    vi.mocked(prisma.managedContainer.update).mockRejectedValue("string-db-error");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ status: "ok", name: "abc123def456" }), { status: 200 }));
+
+    const response = await request(app).get("/api/managed-containers/1/health");
+
+    expect(response.status).toBe(200);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/Failed to persist health status for 1: string-db-error/)
+    );
+    fetchSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
   });
 
   it("returns 404 when the record is missing", async () => {
@@ -256,6 +325,18 @@ describe("GET /api/managed-containers/:id/health", () => {
     const response = await request(app).get("/api/managed-containers/999/health");
 
     expect(response.status).toBe(404);
+  });
+
+  it("stringifies a non-Error fetch rejection into the unreachable response", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    vi.mocked(prisma.managedContainer.update).mockResolvedValue({ ...baseRecord, status: "stopped" });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue("non-error-reject");
+
+    const response = await request(app).get("/api/managed-containers/1/health");
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/Container unreachable: non-error-reject/);
+    fetchSpy.mockRestore();
   });
 });
 
@@ -404,6 +485,21 @@ describe("POST /api/managed-containers/:id/screenshot", () => {
     expect(response.body.error).toMatch(/ECONNREFUSED/);
     fetchSpy.mockRestore();
   });
+
+  it("stringifies a non-Error fetch rejection in the screenshot unreachable response", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue("screenshot-non-error");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/screenshot")
+      .send({ url: "https://google.com" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/Container unreachable: screenshot-non-error/);
+    fetchSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+  });
 });
 
 describe("POST /api/managed-containers/:id/analyze", () => {
@@ -505,6 +601,132 @@ describe("POST /api/managed-containers/:id/analyze", () => {
     expect(response.status).toBe(503);
     expect(response.body.error).toMatch(/ECONNREFUSED/);
     fetchSpy.mockRestore();
+  });
+
+  it("stringifies a non-Error fetch rejection in the analyze unreachable response", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue("analyze-non-error");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await request(app)
+      .post("/api/managed-containers/1/analyze")
+      .send({ url: "https://example.com" });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toMatch(/Container unreachable: analyze-non-error/);
+    fetchSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+  });
+});
+
+describe("managed-containers timeout abort callbacks", () => {
+  /**
+   * Each of the three proxied endpoints (health, screenshot, analyze) schedules a
+   * `setTimeout(() => abortController.abort(), …)` to bound the upstream call. We
+   * cover those abort callbacks by replacing global setTimeout with a stub that
+   * schedules the timer's callback on the next microtask — that fires AFTER the route
+   * has called fetch (so the AbortSignal is the one passed to fetch) but BEFORE the
+   * fetch mock's signal listener has had a chance to be exercised by anything else.
+   * Fetch itself is mocked to never resolve unless its AbortSignal aborts.
+   */
+
+  /**
+   * Returns a fetch mock that resolves only when the AbortSignal fires, rejecting with
+   * an AbortError. Lets the abort-callback path drive the route's catch block.
+   * @returns {ReturnType<typeof vi.fn>} A fetch mock honoring AbortSignal
+   */
+  function makeAbortableFetchMock(): typeof fetch {
+    const mock = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal === null || signal === undefined) {
+          return;
+        }
+        signal.addEventListener("abort", () => {
+          const abortError = new Error("aborted");
+          abortError.name = "AbortError";
+          reject(abortError);
+        });
+      });
+    });
+    return mock as unknown as typeof fetch;
+  }
+
+  /**
+   * Replaces globalThis.setTimeout with a stub that fires its callback on the next microtask.
+   * Returns a function that restores the original setTimeout.
+   * @returns {() => void} Restore function
+   */
+  function fireSetTimeoutsImmediately(): () => void {
+    const originalSetTimeout = globalThis.setTimeout;
+    (globalThis as { setTimeout: typeof setTimeout }).setTimeout = ((fn: () => void) => {
+      Promise.resolve().then(() => fn());
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout;
+    return () => {
+      (globalThis as { setTimeout: typeof setTimeout }).setTimeout = originalSetTimeout;
+    };
+  }
+
+  it("aborts the health probe when the timeout fires and persists stopped", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    vi.mocked(prisma.managedContainer.update).mockResolvedValue({ ...baseRecord, status: "stopped" });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(makeAbortableFetchMock());
+    const restoreSetTimeout = fireSetTimeoutsImmediately();
+
+    try {
+      const response = await request(app).get("/api/managed-containers/1/health");
+
+      expect(response.status).toBe(503);
+      expect(response.body.error).toMatch(/Container unreachable/);
+      expect(prisma.managedContainer.update).toHaveBeenCalledWith({
+        where: { id: 1 },
+        data: { status: "stopped" },
+      });
+    } finally {
+      restoreSetTimeout();
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("aborts the screenshot proxy when the timeout fires", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(makeAbortableFetchMock());
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const restoreSetTimeout = fireSetTimeoutsImmediately();
+
+    try {
+      const response = await request(app)
+        .post("/api/managed-containers/1/screenshot")
+        .send({ url: "https://google.com" });
+
+      expect(response.status).toBe(503);
+      expect(response.body.error).toMatch(/Container unreachable/);
+    } finally {
+      restoreSetTimeout();
+      fetchSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
+    }
+  });
+
+  it("aborts the analyze proxy when the timeout fires", async () => {
+    vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(baseRecord);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(makeAbortableFetchMock());
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const restoreSetTimeout = fireSetTimeoutsImmediately();
+
+    try {
+      const response = await request(app)
+        .post("/api/managed-containers/1/analyze")
+        .send({ url: "https://example.com" });
+
+      expect(response.status).toBe(503);
+      expect(response.body.error).toMatch(/Container unreachable/);
+    } finally {
+      restoreSetTimeout();
+      fetchSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
+    }
   });
 });
 

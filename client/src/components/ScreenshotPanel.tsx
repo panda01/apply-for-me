@@ -21,7 +21,7 @@ interface ScreenshotPanelProps {
  */
 function ScreenshotPanel({ containerId }: ScreenshotPanelProps) {
   const [url, setUrl] = useState("https://google.com");
-  const [useProxy, setUseProxy] = useState(false);
+  const [useProxy, setUseProxy] = useState(true);
   const [isCapturing, setIsCapturing] = useState(false);
   const [imageObjectUrl, setImageObjectUrl] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState("");

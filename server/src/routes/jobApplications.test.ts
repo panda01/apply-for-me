@@ -169,6 +169,51 @@ describe("POST /api/job-listings/:id/apply", () => {
     expect(response.body.error).toContain("ENOENT");
   });
 
+  it("should stringify a non-Error rejection from readFile in the 400 body", async () => {
+    mockReadFile.mockRejectedValue("non-error-config-failure");
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await request(app).post("/api/job-listings/1/apply");
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("non-error-config-failure");
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("should stringify a non-Error rejection from applyToJob in the failure log line", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockRejectedValue("non-error-apply-failure");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await request(app).post("/api/job-listings/1/apply");
+
+    await vi.waitFor(() => {
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Application failed for job 1: non-error-apply-failure")
+      );
+    });
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("should stringify a non-Error rejection from prisma.applicationAttemptLogs.create", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
+    vi.mocked(prisma.applicationAttemptLogs.create).mockRejectedValue("non-error-attempt-log");
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await request(app).post("/api/job-listings/1/apply");
+
+    await vi.waitFor(() => {
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to save attempt log for job 1: non-error-attempt-log")
+      );
+    });
+    consoleErrorSpy.mockRestore();
+  });
+
   it("should update status to applied after successful application", async () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
@@ -335,6 +380,42 @@ describe("POST /api/job-listings/:id/apply", () => {
         data: { status: "closed", live_url: null },
       });
     });
+  });
+
+  it("should not attach LinkedIn credentials path when the URL host is not a LinkedIn host", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.mocked(prisma.jobListing.findUnique)
+      .mockResolvedValueOnce({ ...mockInitJobListing, url: "https://example.com/jobs/view/123" })
+      .mockResolvedValueOnce({ ...mockInitJobListing, title: "", url: "https://example.com/jobs/view/123" });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
+
+    await request(app).post("/api/job-listings/1/apply");
+
+    await vi.waitFor(() => {
+      const logCalls = logSpy.mock.calls.map((c) => c[0] as string);
+      const hasEnrichLog = logCalls.some((msg) => msg.includes("Enriching job"));
+      expect(hasEnrichLog).toBe(true);
+    });
+    logSpy.mockRestore();
+  });
+
+  it("should stringify a non-Error rejection during enrichment", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(prisma.jobListing.findUnique)
+      .mockResolvedValueOnce(mockInitJobListing)
+      .mockRejectedValueOnce("non-error-enrichment");
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
+
+    await request(app).post("/api/job-listings/1/apply");
+
+    await vi.waitFor(() => {
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to enrich job 1 details: non-error-enrichment")
+      );
+    });
+    errorSpy.mockRestore();
   });
 
   it("should handle enrichment failure gracefully", async () => {

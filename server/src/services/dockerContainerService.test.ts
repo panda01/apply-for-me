@@ -82,6 +82,29 @@ describe("findFreeHostPort", () => {
     expect(port).toBeGreaterThanOrEqual(41000);
     expect(port).toBeLessThanOrEqual(41999);
   });
+
+  it("skips a port that is already in use and falls through to the next one", async () => {
+    // Force the random starting offset to 0 so the first candidate is exactly 41000.
+    // Pre-bind 41000 so isPortAvailable's "error" event listener fires and returns false;
+    // findFreeHostPort then advances to 41001 and returns it.
+    const { createServer } = await import("node:net");
+    const blockedPort = 41000;
+    const blockingServer = createServer();
+    blockingServer.unref();
+    await new Promise<void>((resolveBound, rejectBound) => {
+      blockingServer.once("error", rejectBound);
+      blockingServer.listen(blockedPort, "127.0.0.1", () => resolveBound());
+    });
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
+
+    try {
+      const port = await findFreeHostPort();
+      expect(port).toBe(41001);
+    } finally {
+      randomSpy.mockRestore();
+      await new Promise<void>((resolveClosed) => blockingServer.close(() => resolveClosed()));
+    }
+  });
 });
 
 describe("pickRandomWireGuardConfig", () => {
@@ -92,6 +115,7 @@ describe("pickRandomWireGuardConfig", () => {
     expect(chosen).not.toMatch(/\.conf$/);
     expect(chosen.length).toBeGreaterThan(0);
   });
+
 });
 
 describe("ensureImageBuilt", () => {
@@ -178,6 +202,53 @@ describe("runContainer", () => {
     expect((result as Error).message).toMatch(/did not become ready/);
     expect(stopMock).toHaveBeenCalled();
     expect(removeMock).toHaveBeenCalled();
+    fetchSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("keeps polling when the container's /health responds with a non-2xx status before eventually 200", async () => {
+    // Covers the response.ok FALSE branch inside waitForContainerReady: the first fetch
+    // returns 503 (loop continues), the second returns 200 (loop exits successfully).
+    vi.useFakeTimers();
+    mockBuildImage.mockResolvedValue({ on: vi.fn() });
+    mockFollowProgress.mockImplementation((_stream: unknown, cb: (err: Error | null) => void) => cb(null));
+    const startMock = vi.fn().mockResolvedValue(undefined);
+    mockCreateContainer.mockResolvedValue({ id: "docker-id-poll", start: startMock });
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("", { status: 503 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+
+    const promise = runContainer("foo");
+    await vi.advanceTimersByTimeAsync(500);
+    const result = await promise;
+
+    expect(result.dockerId).toBe("docker-id-poll");
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    fetchSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("swallows cleanup failure when readiness fails AND stopAndRemove also fails", async () => {
+    // Triggers the .catch(() => { /* swallow */ }) on the cleanup path inside runContainer.
+    // Readiness probe fails, then stop() throws a non-tolerated error, then .catch swallows it
+    // so the original readiness error is still what the caller sees.
+    vi.useFakeTimers();
+    mockBuildImage.mockResolvedValue({ on: vi.fn() });
+    mockFollowProgress.mockImplementation((_stream: unknown, cb: (err: Error | null) => void) => cb(null));
+    const startMock = vi.fn().mockResolvedValue(undefined);
+    const stopMock = vi.fn().mockRejectedValue(Object.assign(new Error("docker dead"), { statusCode: 500 }));
+    mockCreateContainer.mockResolvedValue({ id: "docker-id-fb", start: startMock });
+    mockGetContainer.mockReturnValue({ stop: stopMock, remove: vi.fn() });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
+
+    const promise = runContainer("foo").catch((err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(50000);
+    const result = await promise;
+
+    expect(result).toBeInstanceOf(Error);
+    expect((result as Error).message).toMatch(/did not become ready/);
+    expect(stopMock).toHaveBeenCalled();
     fetchSpy.mockRestore();
     vi.useRealTimers();
   });

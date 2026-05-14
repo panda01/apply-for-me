@@ -7,7 +7,7 @@ If a command doesn't work or something doesn't go as expected, ask the user what
 - make sure that after you run a task you don't leave any dev servers running and be sure to end any you started, make sure to only clear the ports that are being used by this project.
 - After changes are made to the database structure be sure to run `npx prisma db push` and `npx prisma generate`
 - When you are adding, modifying, or removing a feature always make sure you check the code coverage by running `npm run test:coverage` and ensure the code meets the global thresholds.
-- After every prompt is written, be sure to write an entry including date and time the intention of the code changes to the file AI_JOURNAL.md. Always add new the newest entry to the top or beginning of the file. Always add the list of files that were changed, and what functions and variables were added removed or changed in the files. 
+- CRITICAL: After any changes to the code have been made, be sure to write an entry including date, time, and the intention of the code changes to the file AI_JOURNAL.md. Always add the newest entry to the top or beginning of the file. Always add the list of files that were changed, and what functions or variables were added, removed, or changed in the files. 
 
 # Code Style
 - CRITICAL - Always use typescript, even when creating module files make them mts files.

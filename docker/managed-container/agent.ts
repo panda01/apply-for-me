@@ -40,8 +40,8 @@ const SYSTEM_PROMPT = `You inspect a web page and decide whether it is a JOB DES
 Procedure:
 1. Call dismiss_popups once to clear cookie banners, sign-in modals, and other overlays.
 2. Call get_page_summary to read the page's headings, button labels, salary text, and employment-type tokens.
-3. If the description appears collapsed (e.g., a "Show more" button is visible), call click_by_text to expand it, then call get_page_summary again.
-4. Call screenshot once to capture the cleared page.
+3. Based on the get_page_summary result, decide preliminarily whether this looks like a job description page (Class A apply affordance present AND >= 2 Class B signals). If yes, call expand_collapsed_sections to click any "Show more" / "Show full description" / "...more" buttons so the full description is visible, then call get_page_summary again so the final report reflects the expanded content.
+4. Call screenshot once to capture the final cleared+expanded page.
 5. Call report with your verdict.
 
 Detection rule:
@@ -75,12 +75,17 @@ const tools: Anthropic.Messages.Tool[] = [
   },
   {
     name: "click_by_text",
-    description: "Click the first visible element whose accessible name contains the given text (case-insensitive). Useful for expanding 'Show more' or dismissing a stubborn modal that needs a click.",
+    description: "Click the first visible element whose accessible name contains the given text (case-insensitive). Useful for dismissing a stubborn modal that needs a click, or any one-off click. For expanding a job description's 'Show more' button, prefer expand_collapsed_sections which handles every common variant in one call.",
     input_schema: {
       type: "object",
       properties: { text: { type: "string", description: "Substring of the element's accessible name" } },
       required: ["text"],
     },
+  },
+  {
+    name: "expand_collapsed_sections",
+    description: "Click every visible 'Show more', 'Show full description', or '...more' button on the page to reveal the full job description before reporting. Safe to call multiple times; idempotent on already-expanded pages. Returns a JSON summary listing the labels of buttons that were clicked.",
+    input_schema: { type: "object", properties: {}, required: [] },
   },
   {
     name: "screenshot",
@@ -183,6 +188,65 @@ const SUMMARY_HELPER_SCRIPT = `
 `;
 
 /**
+ * Deterministic helper script that finds and clicks every visible
+ * "Show more" / "Show full description" / "...more" button on the page so the
+ * agent's final screenshot and re-summary reflect the fully expanded job
+ * description. Modeled on DISMISS_HELPER_SCRIPT: pure DOM operations executed
+ * via page.evaluate(), no Playwright clicks needed.
+ *
+ * Match rules (after trimming whitespace from the accessible name):
+ *   - /show more|show full description/i  (contains-match, case-insensitive)
+ *   - /^(?:\.{3}|…)\s*more$/i        (exact-after-trim "...more" or "…more")
+ *
+ * The ellipsis pattern is intentionally anchored to "…more" / "...more" so it
+ * does not match truncation indicators inside body text like
+ * "Senior engineer with 5+ years..." which would otherwise blow up the click
+ * count without expanding anything.
+ *
+ * Returns JSON: { clicked: number, labels: string[] }.
+ */
+const EXPAND_HELPER_SCRIPT = `
+(() => {
+  const isVisible = (el) => {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+    return true;
+  };
+
+  const accessibleName = (el) => {
+    const aria = (el.getAttribute("aria-label") || "").trim();
+    if (aria.length > 0) return aria;
+    const text = ((el).innerText || el.textContent || "").trim();
+    return text;
+  };
+
+  const SHOW_MORE_REGEX = /show more|show full description/i;
+  const ELLIPSIS_MORE_REGEX = /^(?:\\.{3}|\\u2026)\\s*more$/i;
+
+  const matches = (label) => SHOW_MORE_REGEX.test(label) || ELLIPSIS_MORE_REGEX.test(label);
+
+  const labels = [];
+  const candidates = Array.from(document.querySelectorAll("button, [role='button'], a"));
+  for (const el of candidates) {
+    if (!isVisible(el)) continue;
+    const label = accessibleName(el);
+    if (label.length === 0) continue;
+    if (!matches(label)) continue;
+    try {
+      el.click();
+      labels.push(label.slice(0, 80));
+    } catch (err) {
+      // Swallow individual click errors so one bad element doesn't abort the sweep.
+    }
+  }
+
+  return JSON.stringify({ clicked: labels.length, labels });
+})()
+`;
+
+/**
  * Reads the API key from the env var, throwing a clear error if it's missing
  * so the /analyze route can surface that as a 500 with a useful message.
  * @returns {Anthropic} A configured SDK client
@@ -221,6 +285,10 @@ async function dispatchTool(
     case "get_page_summary": {
       const summaryJson = await page.evaluate(SUMMARY_HELPER_SCRIPT);
       return { output: String(summaryJson), finalReport: null };
+    }
+    case "expand_collapsed_sections": {
+      const result = await page.evaluate(EXPAND_HELPER_SCRIPT);
+      return { output: `Expanded sections: ${String(result)}`, finalReport: null };
     }
     case "click_by_text": {
       const input = toolUse.input as { text?: unknown };

@@ -1,5 +1,82 @@
 # AI Journal
 
+## 2026-05-14: Expand collapsed job descriptions before reporting in analyze agent
+
+### Intent
+When the analyze agent determines a page is a job description, the captured screenshot and `description_signals` should reflect the FULL job description — not the LinkedIn-style truncated preview. Previously the agent's system prompt only suggested clicking "Show more" via the generic `click_by_text` tool when the description "appeared collapsed", and the agent often skipped this step. The fix introduces a dedicated deterministic tool the agent must call before its final screenshot+report whenever signals suggest a job page.
+
+### Files changed
+- **`docker/managed-container/agent.ts`**
+  - Added `EXPAND_HELPER_SCRIPT` constant — a JS helper executed via `page.evaluate()` that walks `button, [role='button'], a` elements, filters to visible elements whose trimmed accessible name (`aria-label` or `innerText`) matches one of:
+    - `/show more|show full description/i` (contains-match, case-insensitive)
+    - `/^(?:\.{3}|…)\s*more$/i` (exact-after-trim "...more" or "…more")
+    - Clicks each match, swallows individual click errors so one bad element doesn't abort the sweep, and returns JSON `{ clicked: number, labels: string[] }`.
+  - Added new tool `expand_collapsed_sections` to the `tools` array (no input arguments).
+  - Added `case "expand_collapsed_sections":` to `dispatchTool`'s switch — runs the helper script and returns its result string.
+  - Tweaked `click_by_text` tool description to redirect callers to `expand_collapsed_sections` for "Show more" expansion.
+  - Updated `SYSTEM_PROMPT` step 3 from a soft "if the description appears collapsed" suggestion to an explicit "if preliminary signals suggest a job description page, call expand_collapsed_sections, then re-call get_page_summary so the final report reflects the expanded content." Renumbered steps 4–5 accordingly.
+
+### Verification
+Reproduced and fixed against `https://www.linkedin.com/jobs/view/software-engineer-new-grads-at-giga-4374834620/`. Before-fix screenshot shows the "About the job" section with a "Show more" button truncating the description; after-fix screenshot shows the full description (About Giga, The Role, What You'd Like to Do, You Might Be a Fit If…, Perks & Benefits) with the "Show less" affordance at the bottom of the expanded section.
+
+## 2026-05-14: Default residential-proxy checkbox to checked in container panels
+
+### Intent
+Make the residential proxy (Smartproxy) the default for outbound screenshot and analyze requests so users no longer have to manually opt in for Cloudflare-protected sites. The checkbox remains visible and can still be unchecked to fall back to the WireGuard-only egress when desired.
+
+### Files changed
+- **`client/src/components/ScreenshotPanel.tsx`** — flipped initial `useProxy` state from `false` to `true` on line 24. Checkbox now renders checked on mount, so the first POST to `/api/managed-containers/:id/screenshot` carries `useProxy: true` unless the user unchecks it.
+- **`client/src/components/AnalyzePanel.tsx`** — same change on line 28 for the analyze panel; first POST to `/api/managed-containers/:id/analyze` now carries `useProxy: true` by default.
+
+No server-side, API service, or container-side behavior was modified — only the initial UI state. Callers that explicitly send `useProxy: false` (e.g. tests) continue to bypass the proxy.
+
+## 2026-05-13: Persist health-check verdict to managed_containers DB row
+
+### Intent
+When the user clicks "Ping health" on the container view page, the existing `GET /api/managed-containers/:id/health` route only proxies the upstream probe and never writes the outcome back. The `status` column therefore stayed at whatever it was set to on create (`starting`/`running`) regardless of the container's actual state. Updated the route to map each probe outcome to a persistable status, await the prisma write, then respond — so a subsequent list/view fetch reflects the most recent probe.
+
+### Outcome → status mapping
+- upstream 2xx → `running`
+- upstream non-2xx → `error`
+- fetch threw (timeout / ECONNREFUSED / abort) → `stopped`
+
+DB write is best-effort: a failed `prisma.update` is logged via `console.error` and swallowed so a flaky DB does not make a healthy container's Ping button appear broken.
+
+### Files Modified
+- `server/src/routes/managedContainers.ts`
+  - Refactored `GET /:id/health` handler. Now calls `proxyContainerHealthCheck(record.hostPort)`, maps the outcome via `healthOutcomeToStatus`, awaits `persistHealthStatus(record.id, …)`, then sends the response.
+  - Added `proxyContainerHealthCheck(hostPort: number): Promise<HealthProbeOutcome>` — the only place that distinguishes a non-OK upstream reply from a thrown fetch (so the caller can persist `error` vs `stopped` separately).
+  - Added `HealthProbeOutcome` discriminated union: `{ outcome: "healthy"; body } | { outcome: "non_ok" } | { outcome: "unreachable"; errorMessage }`.
+  - Added `healthOutcomeToStatus(outcome)` — pure mapping helper.
+  - Added `PersistableHealthStatus = "running" | "error" | "stopped"` type alias.
+  - Added `persistHealthStatus(id, status)` — wraps `prisma.managedContainer.update` in try/catch; logs and returns on failure.
+  - Updated the route's JSDoc to document the side effect and the outcome→status mapping.
+- `server/src/routes/managedContainers.test.ts`
+  - Added `update: vi.fn()` to the prisma mock.
+  - Rewrote the success test to also assert `prisma.managedContainer.update` is called with `{ status: "running" }`.
+  - Rewrote the unreachable test to assert `{ status: "stopped" }`.
+  - Rewrote the non-OK upstream test to assert `{ status: "error" }`.
+  - Added a test that a `prisma.update` rejection (Error) still returns 200 + the probe body and logs to `console.error`.
+  - Added a test that a `prisma.update` rejection with a non-Error (string) is stringified in the log line.
+- `tests/playwright/managedContainers.spec.ts`
+  - After the Ping health step, navigate back to `/containers` via the Back link and assert the row matching the container name contains the text `running`. Then re-open the container view to perform the existing delete step.
+
+### Coverage work (same task)
+The user had bumped `vitest.config.ts` thresholds from 90% → 98% on all four metrics during a prior session. Running coverage after the feature work failed at 91.55% branches / 95.91% functions. Per user direction ("meet it"), added tests across multiple files to lift coverage rather than reverting the bump:
+- **`server/src/routes/managedContainers.test.ts`** — added 5 new health-status tests (success persists `running`, non-OK persists `error`, unreachable persists `stopped`, DB write failure still returns probe result, non-Error DB rejection stringified). Added one non-Error fetch rejection test each for health/screenshot/analyze unreachable paths. Added one non-Error rollback stringification test. Added 3 setTimeout-abort tests using a `fireSetTimeoutsImmediately()` shim that schedules timer callbacks on the next microtask (real fake timers conflicted with supertest's HTTP I/O). Total: 13 new tests, file now at 47 passing.
+- **`server/src/services/dockerContainerService.test.ts`** — added a `findFreeHostPort` test that pre-binds port 41000 and forces `Math.random` to 0 so the in-use branch of `isPortAvailable`'s `server.once("error", …)` is hit. Added a readiness-polling test that returns 503 then 200 to cover `response.ok` FALSE branch. Added a `runContainer` cleanup-failure test where stopAndRemove rejects after readiness fails — covers the swallow `.catch` arrow on the cleanup path.
+- **`server/src/services/jobListingScraperService.test.ts`** — added a non-Error scraper rejection test that asserts the error message stringification in the catch-log line.
+- **`server/src/routes/jobApplications.test.ts`** — added 4 tests for non-Error rejections in `loadConfigOrSend400`, `applyToSingleJob`, `enrichJobListingDetails`, `saveAttemptLog` catch blocks. Added a non-LinkedIn URL test to cover the false branch of the `hostname === "linkedin.com" || hostname.endsWith(".linkedin.com")` OR-expression in `enrichJobListingDetails`.
+
+Result: stmts 98.45 → 98.77, branches 91.55 → 93.5, functions 95.91 → 98.46, lines 99.16 → 99.16. Functions/statements/lines now meet 98%. User explicitly authorized lowering the branches threshold to 93% in `vitest.config.ts` rather than chasing the remaining ~36 branches in UI page error-state renderings + ternaries — so branches threshold is now 93 in the config.
+
+### Verification
+- `npm run lint`: clean (no output, exit 0)
+- `npm run tsc`: clean (after widening `makeAbortableFetchMock`'s param type to `string | URL | Request, RequestInit` to match the global `fetch` signature)
+- `npm run test:coverage`: 393/393 passing; stmts 98.77 / branches 93.5 / functions 98.46 / lines 99.16 — all meet thresholds
+- `npm run check:duplication`: 3.51% total (17 pre-existing clones in `docker/managed-container/server.ts`, none introduced by this work)
+- Manual UI verification: pending — flow is documented in the playwright spec but the e2e itself requires Docker running locally
+
 ## 2026-05-08 12:30: Fix Apply-button false negative + full-page screenshots with popup dismissal + 10000 px cap
 
 ### Intent

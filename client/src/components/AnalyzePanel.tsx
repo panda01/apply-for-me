@@ -25,7 +25,7 @@ interface AnalyzePanelProps {
  */
 function AnalyzePanel({ containerId }: AnalyzePanelProps) {
   const [url, setUrl] = useState("https://www.linkedin.com/jobs/view/software-engineer-new-grads-at-giga-4374834620");
-  const [useProxy, setUseProxy] = useState(false);
+  const [useProxy, setUseProxy] = useState(true);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [errorMessage, setErrorMessage] = useState("");

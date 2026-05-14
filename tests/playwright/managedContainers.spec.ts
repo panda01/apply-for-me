@@ -72,7 +72,17 @@ test.describe("Managed Containers Flow", () => {
     await expect(page.getByTestId("ping-status")).toHaveText("ok", { timeout: 30000 });
     await expect(page.getByTestId("ping-name")).toHaveText(uiContainerName);
 
-    // 7) Delete the container, expect to be redirected back to /containers
+    // 6a) Navigate back to /containers and assert the row's persisted Status reflects the health probe
+    await test.step("status column reflects the persisted health verdict", async () => {
+      await page.getByRole("link", { name: /Back to Containers/i }).click();
+      await expect(page).toHaveURL(/\/containers$/);
+      const containerRow = page.getByRole("row").filter({ hasText: uiContainerName });
+      await expect(containerRow).toContainText("running", { timeout: 10000 });
+    });
+
+    // 7) Re-open the container view and delete, expect to be redirected back to /containers
+    await page.getByRole("link", { name: uiContainerName }).click();
+    await expect(page).toHaveURL(/\/containers\/\d+/);
     await page.getByRole("button", { name: /^Delete$/ }).click();
     await expect(page).toHaveURL(/\/containers$/, { timeout: 30000 });
 

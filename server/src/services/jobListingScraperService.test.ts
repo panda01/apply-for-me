@@ -175,6 +175,26 @@ describe("fetchJobListingFromUrl", () => {
     expect(mockSessionsStop).not.toHaveBeenCalled();
   });
 
+  it("should stringify a non-Error rejection from run in the scraping-failed log line", async () => {
+    process.env["BROWSER_USE_API"] = "test-key";
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    mockRun.mockReturnValue({
+      sessionId: null,
+      then(onFulfilled: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) {
+        return Promise.reject("non-error-scraper-failure").then(onFulfilled, onRejected);
+      },
+    });
+
+    await expect(fetchJobListingFromUrl("https://example.com/jobs/1", null))
+      .rejects.toBe("non-error-scraper-failure");
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Scraping failed for https://example.com/jobs/1: non-error-scraper-failure")
+    );
+    errorSpy.mockRestore();
+  });
+
   it("should stop the session after successful extraction", async () => {
     process.env["BROWSER_USE_API"] = "test-key";
 
