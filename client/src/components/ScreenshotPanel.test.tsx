@@ -40,13 +40,13 @@ describe("ScreenshotPanel", () => {
     await user.click(screen.getByTestId("screenshot-capture-button"));
 
     await waitFor(() => {
-      expect(captureScreenshot).toHaveBeenCalledWith(42, "https://google.com", false);
+      expect(captureScreenshot).toHaveBeenCalledWith(42, "https://google.com", true);
       const img = screen.getByTestId("screenshot-image") as HTMLImageElement;
       expect(img.src).toContain("blob:mock-url");
     });
   });
 
-  it("passes useProxy=true through when the checkbox is ticked", async () => {
+  it("passes useProxy=false through when the checkbox is unticked", async () => {
     const blob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" });
     vi.mocked(captureScreenshot).mockResolvedValue(blob);
 
@@ -58,7 +58,7 @@ describe("ScreenshotPanel", () => {
     await user.click(screen.getByTestId("screenshot-capture-button"));
 
     await waitFor(() => {
-      expect(captureScreenshot).toHaveBeenCalledWith(42, "https://google.com", true);
+      expect(captureScreenshot).toHaveBeenCalledWith(42, "https://google.com", false);
     });
   });
 

@@ -17,6 +17,7 @@ coverage/
 
 .claude/settings.local.json
 claude_temp/
+claude_tmp/
 
 /server/prisma/generated/
 /server/prisma/dev.db

@@ -45,7 +45,7 @@ describe("AnalyzePanel", () => {
     await user.click(screen.getByTestId("analyze-button"));
 
     await waitFor(() => {
-      expect(analyzeUrl).toHaveBeenCalledWith(42, expect.stringContaining("linkedin.com"), false);
+      expect(analyzeUrl).toHaveBeenCalledWith(42, expect.stringContaining("linkedin.com"), true);
       expect(screen.getByTestId("analyze-verdict-chip").textContent).toMatch(/Job description page/);
       expect(screen.getByTestId("analyze-apply-chip").textContent).toMatch(/Apply button found/);
       expect(screen.getByTestId("analyze-reasoning").textContent).toMatch(/Apply button/);
@@ -57,7 +57,7 @@ describe("AnalyzePanel", () => {
     });
   });
 
-  it("passes useProxy=true through when the checkbox is ticked", async () => {
+  it("passes useProxy=false through when the checkbox is unticked", async () => {
     vi.mocked(analyzeUrl).mockResolvedValue(positiveResult);
 
     render(<AnalyzePanel containerId={42} />);
@@ -66,7 +66,7 @@ describe("AnalyzePanel", () => {
     await user.click(screen.getByTestId("analyze-button"));
 
     await waitFor(() => {
-      expect(analyzeUrl).toHaveBeenCalledWith(42, expect.any(String), true);
+      expect(analyzeUrl).toHaveBeenCalledWith(42, expect.any(String), false);
     });
   });
 
