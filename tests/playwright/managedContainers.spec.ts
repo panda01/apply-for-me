@@ -67,6 +67,10 @@ test.describe("Managed Containers Flow", () => {
     await expect(page).toHaveURL(/\/containers\/\d+/);
     await expect(page.getByTestId("container-name")).toHaveText(uiContainerName);
 
+    // 5a) Auto-ping on page load — the status Chip should reflect the live
+    // health probe (green "ok") without the user clicking anything.
+    await expect(page.getByTestId("container-status-chip")).toHaveText("ok", { timeout: 30000 });
+
     // 6) Click Ping Health and assert the displayed status and name
     await page.getByRole("button", { name: /Ping health/i }).click();
     await expect(page.getByTestId("ping-status")).toHaveText("ok", { timeout: 30000 });

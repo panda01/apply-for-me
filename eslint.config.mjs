@@ -42,6 +42,15 @@ export default tseslint.config(
     }
   },
   {
-    ignores: ["dist/", "node_modules/", "coverage/", "eslint.config.mjs", "prisma.config.ts", "vitest.config.ts"],
+    ignores: [
+      "dist/",
+      "node_modules/",
+      "coverage/",
+      "claude_temp/",
+      "claude_tmp/",
+      "eslint.config.mjs",
+      "prisma.config.ts",
+      "vitest.config.ts"
+    ],
   }
 );

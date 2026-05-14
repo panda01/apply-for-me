@@ -208,4 +208,93 @@ describe("ContainerViewPage", () => {
 
     expect(screen.queryByTestId("ping-error")).toBeNull();
   });
+
+  it("auto-pings on mount and updates the status chip to the success result without a manual click", async () => {
+    vi.mocked(getManagedContainer).mockResolvedValue(mockContainer);
+    vi.mocked(pingManagedContainerHealth).mockResolvedValue({ status: "ok", name: "abc123def456" });
+
+    renderPage();
+
+    await waitFor(() => {
+      const chip = screen.getByTestId("container-status-chip");
+      expect(chip.textContent).toBe("ok");
+      expect(chip.className).toMatch(/colorSuccess/);
+    });
+    // The auto-ping happened without the user clicking the button.
+    expect(pingManagedContainerHealth).toHaveBeenCalledWith(1);
+  });
+
+  it("renders the auto-ping failure as a red 'unhealthy' chip and does NOT show the error Alert", async () => {
+    vi.mocked(getManagedContainer).mockResolvedValue(mockContainer);
+    vi.mocked(pingManagedContainerHealth).mockRejectedValue(new Error("Container unreachable: ECONNREFUSED"));
+
+    renderPage();
+
+    await waitFor(() => {
+      const chip = screen.getByTestId("container-status-chip");
+      expect(chip.textContent).toBe("unhealthy");
+      expect(chip.className).toMatch(/colorError/);
+    });
+    // Auto-ping failures stay silent in the Alert area to avoid implying the
+    // container is broken before the user explicitly retried.
+    expect(screen.queryByTestId("ping-error")).toBeNull();
+  });
+
+  it("shows the spinner + 'Checking...' loading state in the chip while a manual ping is in flight", async () => {
+    vi.mocked(getManagedContainer).mockResolvedValue(mockContainer);
+    // First call: auto-ping. Resolves immediately so we can settle into idle state.
+    // Second call: manual ping. Held open by a deferred promise so we can observe the loading state.
+    vi.mocked(pingManagedContainerHealth)
+      .mockResolvedValueOnce({ status: "ok", name: "abc123def456" });
+    let resolveManualPing: ((value: { status: string; name: string }) => void) | undefined;
+    const pendingManualPingPromise = new Promise<{ status: string; name: string }>((resolveFn) => {
+      resolveManualPing = resolveFn;
+    });
+    vi.mocked(pingManagedContainerHealth).mockReturnValueOnce(pendingManualPingPromise);
+
+    renderPage();
+    // Wait for auto-ping to settle into "ok" so we know the loading state we see next is from the click, not the auto-ping.
+    await waitFor(() => {
+      expect(screen.getByTestId("container-status-chip").textContent).toBe("ok");
+    });
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /ping health/i }));
+
+    await waitFor(() => {
+      const chip = screen.getByTestId("container-status-chip");
+      expect(chip.textContent).toBe("Checking...");
+      expect(screen.getByTestId("container-status-spinner")).toBeDefined();
+    });
+
+    // Resolve the pending ping so the test cleans up.
+    expect(resolveManualPing).toBeDefined();
+    resolveManualPing!({ status: "ok", name: "abc123def456" });
+    await waitFor(() => {
+      expect(screen.getByTestId("container-status-chip").textContent).toBe("ok");
+    });
+  });
+
+  it("shows BOTH the error Alert and a red 'unhealthy' chip when a manual ping fails", async () => {
+    vi.mocked(getManagedContainer).mockResolvedValue(mockContainer);
+    vi.mocked(pingManagedContainerHealth).mockRejectedValue(new Error("Container unreachable: ECONNREFUSED"));
+
+    renderPage();
+    // Wait for the auto-ping failure to render the red chip silently.
+    await waitFor(() => {
+      expect(screen.getByTestId("container-status-chip").textContent).toBe("unhealthy");
+    });
+    // Before any manual click, the Alert is NOT shown.
+    expect(screen.queryByTestId("ping-error")).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /ping health/i }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ping-error").textContent).toMatch(/ECONNREFUSED/);
+      const chip = screen.getByTestId("container-status-chip");
+      expect(chip.textContent).toBe("unhealthy");
+      expect(chip.className).toMatch(/colorError/);
+    });
+  });
 });

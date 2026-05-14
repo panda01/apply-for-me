@@ -281,6 +281,28 @@ async function waitForContainerReady(hostPort: number): Promise<void> {
 }
 
 /**
+ * Lists the Docker IDs of every container (running OR stopped) whose ancestor
+ * image is the managed-container image. Used by the shutdown cleanup path to
+ * sweep up containers that the database does not know about — e.g. ones
+ * spawned by `docker run` directly, ones whose DB rows were deleted out of
+ * band, or ones that survived a previous unclean exit.
+ *
+ * `all: true` includes containers in any state (created, running, exited),
+ * which is what we want at shutdown so nothing slips through. Returns an
+ * empty array when the image has never been built or no containers exist;
+ * propagates daemon errors to the caller so they can log and continue.
+ *
+ * @returns {Promise<string[]>} Docker IDs of every container built from IMAGE_TAG
+ */
+export async function listContainerIdsForAfmImage(): Promise<string[]> {
+  const containerInfos = await docker.listContainers({
+    all: true,
+    filters: { ancestor: [IMAGE_TAG] },
+  });
+  return containerInfos.map((containerInfo) => containerInfo.Id);
+}
+
+/**
  * Stops and removes a Docker container by its full Docker ID.
  * Tolerates already-stopped or already-removed containers (treats those as success).
  * @param {string} dockerId - The full Docker container ID

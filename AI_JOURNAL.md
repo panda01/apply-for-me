@@ -1,5 +1,65 @@
 # AI Journal
 
+## 2026-05-14 10:14 EDT: Auto-ping container health on mount and reflect live state in the status Chip
+
+### Intent
+On the single-container view page (`/containers/:id`), the green status `Chip` was hardcoded to the persisted DB `status` field and never reflected the container's actual liveness without the user clicking "Ping health". Now the page automatically fires a health ping after the container record loads, the Chip shows a loading state ("Checking..." with a small spinner) while a ping is in flight, turns green with the live status string on success, and turns red "unhealthy" on failure. Auto-ping failures stay silent in the Alert area (red chip only) so the page doesn't shout an error before the user has had a chance to interact; user-triggered ping failures additionally render the existing error Alert as before.
+
+### Files changed
+- **`client/src/pages/ContainerViewPage.tsx`**
+  - Added `StatusChipProps` interface and `deriveStatusChipProps` pure selector with precedence: `isPinging` → loading; `pingError` → red "unhealthy"; `pingResult` → green with `pingResult.status`; otherwise fall back to `container.status`.
+  - Added `hasUserPingedManually` state (default false) to gate the error Alert. Set to `true` only when the manual `handlePingHealth` runs.
+  - Extracted the actual ping work into `runHealthPing(containerId, triggeredByUser)` via `useCallback` — shared by the auto-ping effect and the manual click.
+  - Added a `useEffect` keyed on `[container, runHealthPing]` that fires `runHealthPing(container.id, false)` once the record loads. Re-runs if the loaded container's id changes (e.g. SPA-navigating between containers).
+  - Reworked the `handlePingHealth` click handler to delegate to `runHealthPing` with `triggeredByUser=true`.
+  - Replaced the static `<Chip color="success" label={container.status} />` with a dynamic `<Chip>` whose `color`, `label`, and `icon` come from `statusChipProps`. Added `data-testid="container-status-chip"` and `data-testid="container-status-spinner"` for testability.
+  - Replaced `{pingError && <Alert ...>}` with `{shouldShowPingErrorAlert && <Alert ...>}` so auto-ping failures don't render the Alert.
+- **`client/src/pages/ContainerViewPage.test.tsx`**
+  - Added 4 tests: auto-ping happy path updates chip to "ok" with `colorSuccess`; auto-ping failure renders "unhealthy" with `colorError` and no Alert; manual ping loading shows spinner + "Checking..." (via a deferred Promise so the loading state is observable); manual ping failure shows BOTH the Alert and a red chip.
+- **`tests/playwright/managedContainers.spec.ts`**
+  - Added an assertion after navigating to the view page that `container-status-chip` shows "ok" within 30s, proving the auto-ping fires and updates the Chip without a click.
+
+### Verification
+- `npm run test`: 394 / 394 pass (22 files, 16 in `ContainerViewPage.test.tsx`).
+- `npm run tsc`: clean.
+- `npm run lint`: clean.
+- `npm run test:coverage`: 98.83 stmt / 93.81 branch / 98.53 func / 99.2 line — clear of the project thresholds (98 / 93 / 98 / 98).
+- `npm run check:duplication`: 21 pre-existing clones (all in `claude_tmp/`), no new clones.
+- `/review`: no must-fix or should-fix items.
+- Live browser verification: deferred — to be run by the user against a real managed container or by the `manual-verifier` agent.
+
+## 2026-05-14 10:11 EDT: Shutdown cleanup sweeps every afm-image container, not just DB-tracked rows
+
+### Intent
+On SIGINT/SIGTERM the server previously only stopped + removed containers tracked in the `managed_containers` Prisma table, so a container spawned by `docker run` directly, one whose DB row was deleted out of band, or one that survived a previous unclean exit would outlive the server process. Expanded the cleanup to also stop+remove every container (running OR stopped) whose ancestor image is `afm-managed-container:latest`, deduped against the DB sweep. DB and Docker failures degrade independently so neither blocks the other.
+
+### Files changed
+- **`server/src/services/dockerContainerService.ts`**
+  - Added `listContainerIdsForAfmImage()` — calls `docker.listContainers({ all: true, filters: { ancestor: [IMAGE_TAG] } })` and returns the `Id` field of every result. Returns `[]` when the image hasn't been built or no containers exist; propagates daemon errors to the caller.
+- **`server/src/services/managedContainerCleanup.ts`** (substantial refactor)
+  - Added type alias `ManagedContainerRow` derived via `NonNullable<Awaited<ReturnType<typeof prisma.managedContainer.findUnique>>>` so the row shape stays in sync with the schema without depending on generated-client paths.
+  - Added type alias `ShutdownWorkSet = Map<string, ManagedContainerRow | null>`.
+  - Added exported pure helper `buildShutdownWorkSet(dbRecords, imageContainerIds)` — seeds the map from image IDs with `null` values, then overrides entries with DB records so DB metadata always wins on collision.
+  - Refactored `cleanupAllManagedContainers()` to run `prisma.managedContainer.findMany()` and `listContainerIdsForAfmImage()` in `Promise.allSettled`, merge results via `buildShutdownWorkSet`, log the count broken down by `DB-tracked` vs `image-only orphan(s)`, and dispatch per-container cleanup in parallel.
+  - Added helpers `extractDbRecords`, `extractImageContainerIds`, `countDatabaseTrackedEntries`, `stopRemoveAndForgetSingleContainer` — the last one stops+removes a container and conditionally deletes its DB row only when the row existed and the stop/remove succeeded.
+- **`server/src/services/dockerContainerService.test.ts`**
+  - Added `mockListContainers` to the dockerode mock via `vi.hoisted`.
+  - Added `describe("listContainerIdsForAfmImage")` block with 4 tests: returns `Id` field, passes `{ all: true, filters: { ancestor: ["afm-managed-container:latest"] } }`, returns `[]` for empty input, propagates daemon errors.
+- **`server/src/services/managedContainerCleanup.test.ts`**
+  - Mock now also returns `listContainerIdsForAfmImage`, defaulted to `[]` in `beforeEach` so legacy tests retain DB-only behavior.
+  - Added `describe("buildShutdownWorkSet")` block with 5 tests covering empty inputs, DB-only, image-only, dedup with DB precedence, and merged disjoint set.
+  - Added 8 new tests on `cleanupAllManagedContainers`: image-only orphan happy path, dedup (stop called once, row deleted), mixed set, daemon-down fallback, db-down fallback, image-only orphan stop failure, db-string rejection logging, docker-string rejection logging.
+- **`eslint.config.mjs`** (user-edited mid-task) — added `claude_tmp` to the ignore list so pre-existing temp-script lint errors don't block the gauntlet.
+
+### Verification
+- `npm run test`: 390 / 390 pass (22 files, including 48 in the two service test files).
+- `npm run tsc`: clean.
+- `npm run lint`: clean (after user added `claude_tmp` to ignore list).
+- `npm run test:coverage`: 98.81 stmt / 93.65 branch / 98.51 func / 99.19 line — clear of the project thresholds (98 / 93 / 98 / 98). `managedContainerCleanup.ts` itself reports 100 / 100 / 100 / 100.
+- `npm run check:duplication`: zero new clones; existing 21 clones (all in `claude_tmp/`) unchanged.
+- `/review`: no must-fix or should-fix items.
+- Manual live-Docker verification (scenarios A–D from the planner's plan) deferred — to be run by the user or the `manual-verifier` agent against a real Docker daemon and signal-handled server process.
+
 ## 2026-05-14: Expand collapsed job descriptions before reporting in analyze agent
 
 ### Intent

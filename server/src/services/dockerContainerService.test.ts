@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockBuildImage, mockCreateContainer, mockGetContainer, mockFollowProgress } = vi.hoisted(() => ({
+const { mockBuildImage, mockCreateContainer, mockGetContainer, mockFollowProgress, mockListContainers } = vi.hoisted(() => ({
   mockBuildImage: vi.fn(),
   mockCreateContainer: vi.fn(),
   mockGetContainer: vi.fn(),
   mockFollowProgress: vi.fn(),
+  mockListContainers: vi.fn(),
 }));
 
 vi.mock("dockerode", () => {
@@ -14,6 +15,7 @@ vi.mock("dockerode", () => {
       buildImage = mockBuildImage;
       createContainer = mockCreateContainer;
       getContainer = mockGetContainer;
+      listContainers = mockListContainers;
     },
   };
 });
@@ -28,6 +30,7 @@ import {
   stopAndRemove,
   pickRandomWireGuardConfig,
   resetImageBuildCacheForTesting,
+  listContainerIdsForAfmImage,
 } from "./dockerContainerService.js";
 
 beforeEach(() => {
@@ -311,5 +314,43 @@ describe("stopAndRemove", () => {
     mockGetContainer.mockReturnValue({ stop: stopMock, remove: removeMock });
 
     await expect(stopAndRemove("docker-id-xyz")).rejects.toBe("string-error");
+  });
+});
+
+describe("listContainerIdsForAfmImage", () => {
+  it("returns the Id field of every container in the listing", async () => {
+    mockListContainers.mockResolvedValue([
+      { Id: "docker-id-a", Names: ["/afm-foo"] },
+      { Id: "docker-id-b", Names: ["/afm-bar"] },
+    ]);
+
+    const ids = await listContainerIdsForAfmImage();
+
+    expect(ids).toEqual(["docker-id-a", "docker-id-b"]);
+  });
+
+  it("passes all:true and the ancestor filter so stopped containers are included", async () => {
+    mockListContainers.mockResolvedValue([]);
+
+    await listContainerIdsForAfmImage();
+
+    expect(mockListContainers).toHaveBeenCalledWith({
+      all: true,
+      filters: { ancestor: ["afm-managed-container:latest"] },
+    });
+  });
+
+  it("returns an empty array when no afm-image containers exist (image never built or no instances)", async () => {
+    mockListContainers.mockResolvedValue([]);
+
+    const ids = await listContainerIdsForAfmImage();
+
+    expect(ids).toEqual([]);
+  });
+
+  it("propagates daemon errors so the caller can log and continue without this sweep", async () => {
+    mockListContainers.mockRejectedValue(new Error("Cannot connect to the Docker daemon"));
+
+    await expect(listContainerIdsForAfmImage()).rejects.toThrow("Cannot connect to the Docker daemon");
   });
 });
