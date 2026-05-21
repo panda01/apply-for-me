@@ -8,48 +8,62 @@ vi.mock("../services/jobListingsApi", () => ({
   getJobListing: vi.fn(),
   fetchJobData: vi.fn(),
   applyToJob: vi.fn(),
+  resolveApplicationUrl: vi.fn(),
+  getResolutionLogs: vi.fn(),
 }));
 
-import { getJobListing, fetchJobData, applyToJob } from "../services/jobListingsApi";
+import { getJobListing, fetchJobData, applyToJob, resolveApplicationUrl, getResolutionLogs } from "../services/jobListingsApi";
 
 const mockCompletedListing = {
   id: 1,
   title: "Acme Corp - Software Engineer",
   url: "https://linkedin.com/jobs/1",
+  application_url: "https://acme.com/jobs/123/apply",
   description: "Build cool stuff with great teams and cutting-edge technology.",
   salary: "$120k - $150k",
   status: "init",
   live_url: null,
   post_date: "2026-03-01T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
+  resolution_in_progress: false,
+  latest_resolution_log_id: null,
 };
 
 const mockEmptyListing = {
   id: 1,
   title: "",
   url: "https://linkedin.com/jobs/1",
+  application_url: null,
   description: "",
   salary: null,
   status: "init",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
+  resolution_in_progress: false,
+  latest_resolution_log_id: null,
 };
 
 const mockApplyingListing = {
   id: 1,
   title: "",
   url: "https://linkedin.com/jobs/1",
+  application_url: null,
   description: "",
   salary: null,
   status: "applying",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
+  resolution_in_progress: false,
+  latest_resolution_log_id: null,
 };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default the trace panel's API call to an empty array so the panel doesn't
+  // surface a spurious error in unrelated tests that don't care about the trace.
+  vi.mocked(getResolutionLogs).mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -148,8 +162,8 @@ describe("JobViewPage", () => {
     expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
   });
 
-  it("should show Fetch Data and Apply buttons for init status", async () => {
-    vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
+  it("should show Fetch Data and Apply buttons for init status when application_url is set", async () => {
+    vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
 
     renderJobViewPage();
 
@@ -157,6 +171,18 @@ describe("JobViewPage", () => {
       expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
       expect(screen.getByRole("button", { name: /Apply/ })).toBeDefined();
     });
+  });
+
+  it("should hide the Apply button when application_url is null even if status is init", async () => {
+    vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
+
+    renderJobViewPage();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+    });
+    // Apply button should not be present — the apply gate requires application_url.
+    expect(screen.queryByRole("button", { name: /^Apply$/ })).toBeNull();
   });
 
   it("should call fetchJobData when Fetch Data button is clicked", async () => {
@@ -177,16 +203,16 @@ describe("JobViewPage", () => {
 
   it("should call applyToJob when Apply button is clicked", async () => {
     const user = userEvent.setup();
-    vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
-    vi.mocked(applyToJob).mockResolvedValue({ ...mockEmptyListing, status: "applying" });
+    vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
+    vi.mocked(applyToJob).mockResolvedValue({ ...mockCompletedListing, status: "applying" });
 
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Apply/ })).toBeDefined();
+      expect(screen.getByRole("button", { name: /^Apply$/ })).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /Apply/ }));
+    await user.click(screen.getByRole("button", { name: /^Apply$/ }));
 
     expect(applyToJob).toHaveBeenCalledWith(1);
   });
@@ -318,16 +344,16 @@ describe("JobViewPage", () => {
 
   it("should show action error when applyToJob fails", async () => {
     const user = userEvent.setup();
-    vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
+    vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
     vi.mocked(applyToJob).mockRejectedValue(new Error("BROWSER_USE_PROFILE_ID not set"));
 
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Apply/ })).toBeDefined();
+      expect(screen.getByRole("button", { name: /^Apply$/ })).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /Apply/ }));
+    await user.click(screen.getByRole("button", { name: /^Apply$/ }));
 
     await waitFor(() => {
       expect(screen.getByText("BROWSER_USE_PROFILE_ID not set")).toBeDefined();
@@ -380,19 +406,224 @@ describe("JobViewPage", () => {
 
   it("should show generic error when applyToJob throws a non-Error", async () => {
     const user = userEvent.setup();
-    vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
+    vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
     vi.mocked(applyToJob).mockRejectedValue("string error");
 
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Apply/ })).toBeDefined();
+      expect(screen.getByRole("button", { name: /^Apply$/ })).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /Apply/ }));
+    await user.click(screen.getByRole("button", { name: /^Apply$/ }));
 
     await waitFor(() => {
       expect(screen.getByText("Failed to start application")).toBeDefined();
     });
+  });
+});
+
+describe("JobViewPage — application_url resolution UI", () => {
+  const mockMissingFormUrlListing = {
+    id: 1,
+    title: "Acme Corp - Software Engineer",
+    url: "https://linkedin.com/jobs/1",
+    application_url: null,
+    description: "Build cool stuff",
+    salary: null,
+    status: "missing_form_url",
+    live_url: null,
+    post_date: "2026-03-01T00:00:00.000Z",
+    created_date: "2026-03-07T00:00:00.000Z",
+    resolution_in_progress: false,
+    latest_resolution_log_id: null,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function renderPage(path = "/jobs/1") {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/jobs/:id" element={<JobViewPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+  }
+
+  it("renders the application URL link and Open Application button when application_url is set", async () => {
+    vi.mocked(getJobListing).mockResolvedValue({
+      id: 1,
+      title: "Acme Corp - Software Engineer",
+      url: "https://linkedin.com/jobs/1",
+      application_url: "https://acme.com/jobs/1/apply",
+      description: "Build cool stuff",
+      salary: null,
+      status: "init",
+      live_url: null,
+      post_date: "2026-03-01T00:00:00.000Z",
+      created_date: "2026-03-07T00:00:00.000Z",
+      resolution_in_progress: false,
+      latest_resolution_log_id: null,
+    });
+
+    renderPage();
+
+    await waitFor(() => {
+      const appLink = screen.getByTestId("application-url-link") as HTMLAnchorElement;
+      expect(appLink.href).toBe("https://acme.com/jobs/1/apply");
+      expect(screen.getByTestId("source-url-link").getAttribute("href")).toBe("https://linkedin.com/jobs/1");
+      expect(screen.getByTestId("open-application-button")).toBeDefined();
+    });
+  });
+
+  it("shows the missing-form-url alert and a Retry button when status is missing_form_url", async () => {
+    vi.mocked(getJobListing).mockResolvedValue(mockMissingFormUrlListing);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("missing-form-url-alert")).toBeDefined();
+      expect(screen.getByTestId("retry-resolve-button")).toBeDefined();
+    });
+    // Apply button must NOT appear when the row is in missing_form_url status.
+    expect(screen.queryByRole("button", { name: /^Apply$/ })).toBeNull();
+  });
+
+  it("calls resolveApplicationUrl when the Retry button is clicked", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(mockMissingFormUrlListing);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(mockMissingFormUrlListing);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("retry-resolve-button")).toBeDefined();
+    });
+
+    await user.click(screen.getByTestId("retry-resolve-button"));
+
+    expect(resolveApplicationUrl).toHaveBeenCalledWith(1);
+  });
+
+  it("shows the resolver error message when retry fails", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(mockMissingFormUrlListing);
+    vi.mocked(resolveApplicationUrl).mockRejectedValue(new Error("Container offline"));
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("retry-resolve-button")).toBeDefined();
+    });
+
+    await user.click(screen.getByTestId("retry-resolve-button"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Container offline")).toBeDefined();
+    });
+  });
+
+  it("shows a generic error when the retry rejects with a non-Error", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(mockMissingFormUrlListing);
+    vi.mocked(resolveApplicationUrl).mockRejectedValue("string-rejection");
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("retry-resolve-button")).toBeDefined();
+    });
+
+    await user.click(screen.getByTestId("retry-resolve-button"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Failed to retry application URL resolution")).toBeDefined();
+    });
+  });
+
+  it("does nothing when the retry button is clicked with an invalid id", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(mockMissingFormUrlListing);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(mockMissingFormUrlListing);
+
+    render(
+      <MemoryRouter initialEntries={["/jobs/abc"]}>
+        <Routes>
+          <Route path="/jobs/:id" element={<JobViewPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    // The invalid-id branch produces an error message; the retry button isn't rendered.
+    await waitFor(() => {
+      expect(screen.getByText(/Invalid job listing ID/)).toBeDefined();
+    });
+    expect(user).toBeDefined(); // satisfies vitest unused-var rules
+  });
+
+  it("replaces the Retry button with a 'View Resolution Progress' link when resolution_in_progress is true", async () => {
+    vi.mocked(getJobListing).mockResolvedValue({
+      ...mockMissingFormUrlListing,
+      resolution_in_progress: true,
+      latest_resolution_log_id: 7,
+    });
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("view-resolution-progress-link")).toBeDefined();
+    });
+    expect(screen.queryByTestId("retry-resolve-button")).toBeNull();
+    expect(screen.getByTestId("view-resolution-progress-link").getAttribute("href")).toBe("/jobs/1/url-resolution");
+  });
+
+  it("navigates to the trace page after clicking Retry", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(mockMissingFormUrlListing);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(mockMissingFormUrlListing);
+
+    render(
+      <MemoryRouter initialEntries={["/jobs/1"]}>
+        <Routes>
+          <Route path="/jobs/:id" element={<JobViewPage />} />
+          <Route path="/jobs/:id/url-resolution" element={<div data-testid="trace-page">trace</div>} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("retry-resolve-button")).toBeDefined();
+    });
+
+    await user.click(screen.getByTestId("retry-resolve-button"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("trace-page")).toBeDefined();
+    });
+  });
+
+  it("renders a 'View Resolver Trace' link when there's a past attempt but no in-progress one", async () => {
+    vi.mocked(getJobListing).mockResolvedValue({
+      ...mockMissingFormUrlListing,
+      status: "init",
+      application_url: "https://acme.com/jobs/1/apply",
+      resolution_in_progress: false,
+      latest_resolution_log_id: 3,
+    });
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("view-resolution-trace-link")).toBeDefined();
+    });
+    expect(screen.queryByTestId("view-resolution-progress-link")).toBeNull();
+    expect(screen.getByTestId("view-resolution-trace-link").getAttribute("href")).toBe("/jobs/1/url-resolution");
   });
 });

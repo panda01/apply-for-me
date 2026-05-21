@@ -7,10 +7,19 @@ vi.mock("../services/jobListingsApi", () => ({
   createJobListing: vi.fn(),
 }));
 
+vi.mock("../services/managedContainersApi", () => ({
+  listManagedContainers: vi.fn(),
+}));
+
 import { createJobListing } from "../services/jobListingsApi";
+import { listManagedContainers } from "../services/managedContainersApi";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default: pretend a running container exists so the warning is hidden in legacy tests.
+  vi.mocked(listManagedContainers).mockResolvedValue([
+    { id: 1, name: "test", dockerId: "abc", hostPort: 41000, wgConfigName: null, status: "running", created_date: "2026-03-07T00:00:00.000Z" },
+  ]);
 });
 
 describe("AddJobForm", () => {
@@ -34,7 +43,8 @@ describe("AddJobForm", () => {
     const onJobAdded = vi.fn();
     vi.mocked(createJobListing).mockResolvedValue({
       id: 42, title: "", url: "https://linkedin.com/jobs/1",
-      description: "", salary: null, post_date: "", created_date: "", status: "init", live_url: null,
+      description: "", application_url: null, salary: null, post_date: "", created_date: "", status: "init", live_url: null,
+      resolution_in_progress: false, latest_resolution_log_id: null,
     });
 
     render(<AddJobForm onJobAdded={onJobAdded} />);
@@ -82,7 +92,8 @@ describe("AddJobForm", () => {
     const user = userEvent.setup();
     vi.mocked(createJobListing).mockResolvedValue({
       id: 1, title: "", url: "https://linkedin.com/jobs/1",
-      description: "", salary: null, post_date: "", created_date: "", status: "init", live_url: null,
+      description: "", application_url: null, salary: null, post_date: "", created_date: "", status: "init", live_url: null,
+      resolution_in_progress: false, latest_resolution_log_id: null,
     });
 
     render(<AddJobForm onJobAdded={vi.fn()} />);
@@ -94,5 +105,48 @@ describe("AddJobForm", () => {
     await waitFor(() => {
       expect(input.value).toBe("");
     });
+  });
+
+  it("shows a warning when no managed container is running", async () => {
+    vi.mocked(listManagedContainers).mockResolvedValue([]);
+
+    render(<AddJobForm onJobAdded={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("no-container-warning")).toBeDefined();
+    });
+  });
+
+  it("shows a warning when all managed containers are non-running", async () => {
+    vi.mocked(listManagedContainers).mockResolvedValue([
+      { id: 1, name: "stopped-one", dockerId: "abc", hostPort: 41000, wgConfigName: null, status: "stopped", created_date: "2026-03-07T00:00:00.000Z" },
+    ]);
+
+    render(<AddJobForm onJobAdded={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("no-container-warning")).toBeDefined();
+    });
+  });
+
+  it("does not show the warning when at least one container is running", async () => {
+    render(<AddJobForm onJobAdded={vi.fn()} />);
+
+    // Wait one tick for the effect to settle, then assert the warning isn't there.
+    await waitFor(() => {
+      expect(screen.getByLabelText(/Job Listing URL/)).toBeDefined();
+    });
+    expect(screen.queryByTestId("no-container-warning")).toBeNull();
+  });
+
+  it("silently tolerates a listManagedContainers failure (no warning shown)", async () => {
+    vi.mocked(listManagedContainers).mockRejectedValue(new Error("API down"));
+
+    render(<AddJobForm onJobAdded={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText(/Job Listing URL/)).toBeDefined();
+    });
+    expect(screen.queryByTestId("no-container-warning")).toBeNull();
   });
 });

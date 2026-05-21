@@ -34,6 +34,8 @@ COPY server.ts ./
 COPY agent.ts ./
 COPY popup.ts ./
 COPY smartproxy.ts ./
+COPY resolutionProgressStore.ts ./
+COPY resolutionTypes.ts ./
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

@@ -15,6 +15,12 @@ const positiveResult = {
   description_signals: ["Responsibilities", "Full-time", "Remote"],
   reasoning: "Page has an Apply button and matching description sections.",
   screenshot_b64: "iVBORw0KGgo=",
+  title: "Software Engineer",
+  company: "Acme Corp",
+  description: "We are hiring a Software Engineer to build things.",
+  salary: "$120,000-$150,000/yr",
+  post_date: "2 hours ago",
+  apply_button_url: "https://acme.com/jobs/123/apply",
 };
 
 const negativeResult = {
@@ -23,6 +29,12 @@ const negativeResult = {
   description_signals: [],
   reasoning: "No apply affordance and no description sections were found.",
   screenshot_b64: "iVBORw0KGgo=",
+  title: "",
+  company: "",
+  description: "",
+  salary: null,
+  post_date: null,
+  apply_button_url: null,
 };
 
 beforeEach(() => {

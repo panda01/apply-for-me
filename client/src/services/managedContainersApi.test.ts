@@ -234,6 +234,12 @@ describe("analyzeUrl", () => {
     description_signals: ["Responsibilities", "Full-time"],
     reasoning: "OK",
     screenshot_b64: "iVBORw0KGgo=",
+    title: "Software Engineer",
+    company: "Acme Corp",
+    description: "Description text.",
+    salary: "$100k",
+    post_date: "3 days ago",
+    apply_button_url: "https://acme.com/apply",
   };
 
   it("posts to the analyze endpoint and returns the parsed verdict", async () => {

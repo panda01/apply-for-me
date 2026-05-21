@@ -8,6 +8,8 @@
     "dev:client": "vite --config client/vite.config.ts",
     "dev:server": "tsx watch server/src/index.ts",
     "dev:claude": "bash dev-claude.sh",
+    "docker:build": "docker build --no-cache -t afm-managed-container:latest ./docker/managed-container",
+    "playwright:test": "npx playwright test -c tests/playwright.config.ts",
     "build": "vite build --config client/vite.config.ts && tsc -p server/tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run",

@@ -2,18 +2,22 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   getJobListings, getJobListing, createJobListing, fetchJobData, deleteJobListing,
   bulkCreateJobListings, applyToJob, startBatchApply, getBatchApplyStatus,
+  resolveApplicationUrl, getResolutionLogs, getLiveUrlResolution,
 } from "./jobListingsApi";
 
 const mockListing = {
   id: 1,
   title: "Acme Corp - Software Engineer",
   url: "https://linkedin.com/jobs/1",
+  application_url: null,
   description: "Build cool stuff",
   salary: null,
   status: "init",
   live_url: null,
   post_date: "2026-03-01T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
+  resolution_in_progress: false,
+  latest_resolution_log_id: null,
 };
 
 beforeEach(() => {
@@ -303,5 +307,125 @@ describe("getBatchApplyStatus", () => {
     }));
 
     await expect(getBatchApplyStatus()).rejects.toThrow("Failed to fetch batch apply status");
+  });
+});
+
+describe("resolveApplicationUrl", () => {
+  it("POSTs to the resolve endpoint and returns the parsed body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(mockListing),
+    }));
+
+    const result = await resolveApplicationUrl(42);
+
+    expect(result).toEqual(mockListing);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/job-listings/42/resolve-application-url",
+      expect.objectContaining({ method: "POST" })
+    );
+  });
+
+  it("throws the server error string when the response is not ok", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "Container offline" }),
+    }));
+
+    await expect(resolveApplicationUrl(1)).rejects.toThrow("Container offline");
+  });
+
+  it("throws the default message when the response body has no error", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({}),
+    }));
+
+    await expect(resolveApplicationUrl(1)).rejects.toThrow("Failed to retry application URL resolution");
+  });
+});
+
+describe("getResolutionLogs", () => {
+  const mockLog = {
+    id: 1,
+    job_listing_id: 1,
+    outcome: "direct",
+    search_query: null,
+    brave_results: [],
+    inspected_candidates: [],
+    final_application_url: "https://acme.com/careers/1",
+    reason: null,
+    created_date: "2026-05-16T13:00:00.000Z",
+  };
+
+  it("fetches the resolution-logs endpoint and returns the array", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([mockLog]),
+    }));
+
+    const result = await getResolutionLogs(42);
+
+    expect(result).toEqual([mockLog]);
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings/42/resolution-logs");
+  });
+
+  it("throws on failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, json: () => Promise.resolve({}) }));
+
+    await expect(getResolutionLogs(1)).rejects.toThrow("Failed to fetch resolution logs");
+  });
+});
+
+
+describe("getLiveUrlResolution", () => {
+  const mockLiveProgress = {
+    logId: 1,
+    jobListingId: 42,
+    isFinished: false,
+    startedAt: "2026-05-18T00:00:00.000Z",
+    finishedAt: null,
+    steps: [],
+    finalOutcome: null,
+    finalApplicationUrl: null,
+    reason: null,
+  };
+
+  it("fetches the live endpoint and returns the snapshot", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(mockLiveProgress),
+    }));
+
+    const result = await getLiveUrlResolution(42);
+
+    expect(result).toEqual(mockLiveProgress);
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings/42/url-resolution/live");
+  });
+
+  it("returns null when the server reports no resolution attempts (404 body)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "No resolution attempts found for this job" }),
+    }));
+
+    const result = await getLiveUrlResolution(42);
+
+    expect(result).toBeNull();
+  });
+
+  it("rethrows non-404 errors with their messages", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "Internal server error" }),
+    }));
+
+    await expect(getLiveUrlResolution(42)).rejects.toThrow("Internal server error");
+  });
+
+  it("rethrows when fetch itself rejects with a non-Error", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue("nope"));
+
+    await expect(getLiveUrlResolution(42)).rejects.toBe("nope");
   });
 });

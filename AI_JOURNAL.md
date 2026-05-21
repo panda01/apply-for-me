@@ -1,6 +1,243 @@
 # AI Journal
 
-## 2026-05-14 10:14 EDT: Auto-ping container health on mount and reflect live state in the status Chip
+## 2026-05-21 (later): Ship `resolutionProgressStore.ts` + `resolutionTypes.ts` into the managed-container image
+
+### Intent
+Reproduced the playwright test failures (`managedContainers.spec.ts`, `screenshotContainer.spec.ts`, all three `jobBoardBypass.spec.ts` cases) by spawning a container in a real Playwright-driven browser session. The host API returned 500 / readiness-timed-out at the spawn step; running the same image manually with `docker run` showed the real cause in the container's stdout: `Error: Cannot find module './resolutionProgressStore.js'` from `/app/server.ts`. The two new TypeScript files added in the live-admin-trace work (`resolutionProgressStore.ts`, `resolutionTypes.ts`) were referenced by `server.ts` and `resolutionProgressStore.ts` but were not being copied into the image, so the container's `npm start` crashed before Express could bind port 3000, the host's readiness poll timed out after 45 s, and `runContainer` rolled the container back. Fixed by copying both files in the Dockerfile and adding them to the dockerode build context's `src` array so `ensureImageBuilt` ships them on first call too.
+
+### Files Modified
+- **`docker/managed-container/Dockerfile`** — Added `COPY resolutionProgressStore.ts ./` and `COPY resolutionTypes.ts ./` between the existing `COPY smartproxy.ts ./` line and the `COPY entrypoint.sh /usr/local/bin/entrypoint.sh` line, so both modules land in `/app` alongside `server.ts` and `agent.ts`. No image stage / base / install change — only the COPY surface widened.
+- **`server/src/services/dockerContainerService.ts`** — In `ensureImageBuilt`, added `"resolutionProgressStore.ts"` and `"resolutionTypes.ts"` to the `src: [...]` array passed to `docker.buildImage`. Without this, dockerode would tar up only the previous file list when building the image in-process from a fresh `npm run dev` boot (matching the Dockerfile is necessary but not sufficient — the dockerode call has its own explicit allowlist). No build-context path or image tag change.
+
+### Verification
+- Manual Playwright browser session: `/containers` → "New Container" → spawn now succeeds in <40 s, table shows the running container with a host port assigned, delete button removes it cleanly.
+- `npm run docker:build` from a clean state: image builds with the two new files included (visible in the build output as `[14/17] COPY resolutionProgressStore.ts ./` and `[15/17] COPY resolutionTypes.ts ./`).
+- `npm run playwright:test` end-to-end: the 5 previously-failing infrastructure tests (`managedContainers`, `screenshotContainer`, all 3 `jobBoardBypass`) now pass. 9 of 10 tests pass overall. The 1 remaining failure (`addAndViewJob.spec.ts:43` — "should show job in the jobs list after adding") is unrelated test-data accumulation: the test inserts the same URL `https://example.com/jobs/list-test` into the dev SQLite each run and `getByText` later trips strict-mode once the URL is present multiple times. Pre-existing flake, not caused by this change.
+
+---
+
+## 2026-05-21: Point `playwright:test` npm script at its config file
+
+### Intent
+The `playwright:test` script in `package.json` invoked `npx playwright test` from the repo root with no `-c` flag. The Playwright config lives at `tests/playwright.config.ts`, not at the project root, so Playwright silently ignored it, defaulted to scanning the cwd, and tried to execute every vitest `.test.tsx` file as a Playwright test. Those files import from `vitest`, which is ESM-only, so Playwright's CommonJS loader crashed with "Vitest cannot be imported in a CommonJS module using require()". Fixed by passing `-c tests/playwright.config.ts` to the command so Playwright loads the correct config and only runs files under `tests/playwright/`.
+
+### Files Changed
+- `package.json` — updated the `playwright:test` script from `npx playwright test` to `npx playwright test -c tests/playwright.config.ts`.
+
+## 2026-05-21: npm scripts for rebuilding the managed-container Docker image
+
+### Intent
+Give the user a one-shot way to rebuild the managed-container Docker image from the host shell so that the next `npm run dev` (which internally calls `ensureImageBuilt` in `server/src/services/dockerContainerService.ts`) picks up the fresh image. Two scripts: a normal build that respects Docker's layer cache (fast, common case after editing one file) and a `--no-cache` rebuild (slow, used when something outside the COPY list — e.g. apt or `npx patchright install` — needs to be re-run).
+
+### Files Modified
+- **`package.json`** — Added two scripts under `"scripts"`: `"docker:build": "docker build -t afm-managed-container:latest ./docker/managed-container"` and `"docker:rebuild": "docker build --no-cache -t afm-managed-container:latest ./docker/managed-container"`. Image tag and build-context path match the constants `IMAGE_TAG` and `IMAGE_BUILD_CONTEXT` in `server/src/services/dockerContainerService.ts` so the resulting image is what dockerode will use when the dev server spawns a managed container.
+
+## 2026-05-18: Live admin trace page for the application-URL resolver
+
+### Intent
+Today the resolver runs fire-and-forget in the server, persists a single `ApplicationUrlResolutionLog` row at the end, and the UI infers completion only by polling `application_url` / `status`. There is no live surface for an admin to watch the multi-step process (direct-host check → apply-button scrape → Brave search → per-candidate scrape + match → finalize). This change adds an admin-facing page at `/jobs/:id/url-resolution` that shows every step as it happens, with raw payloads expandable per row. The container hosts the live progress map (the server pushes step events to it as each phase runs); the durable post-mortem still lives in `application_url_resolution_logs`. The "Retry Find Application URL" button on `JobViewPage` now navigates to the trace page after triggering the resolver, and is replaced by a "View Resolution Progress" link whenever an in-progress attempt is detected (via a new `resolution_in_progress` field on `GET /:id`).
+
+### Files Added
+- **`docker/managed-container/resolutionTypes.ts`** — TS enums mirrored from the server's source-of-truth: `ResolutionPhase`, `StepStatus`, `ApplicationUrlResolutionOutcome`. Three guards (`isResolutionPhase`, `isStepStatus`, `isApplicationUrlResolutionOutcome`) HTTP handlers use to validate inbound wire values.
+- **`docker/managed-container/resolutionProgressStore.ts`** — In-memory progress map keyed by `logId`. Exports `begin(logId, jobListingId)`, `recordStep(logId, step)`, `finalize(logId, outcome, applicationUrl, reason)`, `get(logId)`, `clear(logId)`, `clearAll()`. Schedules a 10-minute eviction timer on `finalize`. Every call emits a structured `[resolver:step ...]` / `[resolver:attempt ...]` stdout line so admins can follow along via `docker logs`.
+- **`docker/managed-container/resolutionProgressStore.test.ts`** — 13 vitest cases: begin/replace, recordStep insert+overwrite, placeholder synthesis on missing begin, finalize state + TTL eviction (fake timers), unknown-logId warn, re-begin clears the eviction timer, clear/clearAll behavior.
+- **`client/src/pages/UrlResolutionTracePage.tsx`** — New admin trace page at `/jobs/:id/url-resolution`. Polls `GET /api/job-listings/:id/url-resolution/live` every 1 s while `isFinished === false`. Renders a header card (status chip, log id, elapsed, step count, resolved URL or reason), then a steps timeline rendered as MUI `Accordion` rows that expand to a `<pre>` JSON dump of the step payload. Includes helpers `colorForStepStatus`, `colorForFinalOutcome`, `formatElapsed`, `StepRow`.
+- **`client/src/pages/UrlResolutionTracePage.test.tsx`** — 20 vitest cases: empty state, in-progress header, step rendering, accordion expand reveals payload, polling stops on terminal, reason banner, error paths (Error + non-Error), elapsed formatting for ms / s / unparseable, every status-chip variant, invalid id, JobListing fetch failure silently tolerated, empty-payload row.
+
+### Files Modified
+- **`server/prisma/schema.prisma`** — `ApplicationUrlResolutionLog`: `outcome` becomes nullable (null while running); new `managed_container_id Int?` + `managed_container ManagedContainer? @relation` with `onDelete: SetNull`; existing loose `job_listing_id` upgraded to a real `@relation` with `onDelete: Cascade`. Added reverse `resolution_logs ApplicationUrlResolutionLog[]` collections on `JobListing` and `ManagedContainer`. Ran `npx prisma db push && npx prisma generate`.
+- **`server/src/services/applicationUrlResolverService.ts`** — Added exported enums `ResolutionPhase` and `StepStatus` (string-valued, JSON-safe). Added optional `progressReporter: ResolverProgressReporter` to `ResolverInput`; the interface exposes `startStep / endStep / finalize`. The resolver body now wraps every phase in a `safeStartStep` / `safeEndStep` pair (helpers that catch+log reporter errors so a flaky sink can't abort the resolution), and ends every code path with a `safeFinalize` call. Added new helper `createContainerProgressReporter(hostPort, logId)` that maps each reporter call into an HTTP POST against `/resolution-progress/:logId/*`, with a local monotonic stepIndex and per-step timing/payload merge. Existing returning shape is unchanged so callers that don't pass a reporter behave exactly as before.
+- **`server/src/services/applicationUrlResolverService.test.ts`** — Added 17 new tests in two new describe blocks: `resolveApplicationUrl with progressReporter` (asserts the expected sequence of `startStep/endStep/finalize` for every outcome path — direct, redirect, search-hit, not-found, malformed URL, no-container, apply-button-scrape failure, build_query failure, brave-search failure, candidate-scrape failure, and progressReporter throw-suppression), and `createContainerProgressReporter` (asserts POST URLs, body shapes, durationMs, payload merge, fallback message, unknown-stepIndex defaults, network-error suppression). New `makeStubReporter()` helper. Added `afterEach` import.
+- **`server/src/routes/jobListings.ts`** — 
+  - Replaced `persistResolutionLog` with two new helpers: `beginResolutionLog(jobListingId, container)` (INSERTs the log row with `managed_container_id` and `outcome: null` up-front, then best-effort POSTs `/resolution-progress/:logId/begin` to the container) and `finalizeResolutionLog(logId, outcome, trace)` (UPDATEs the existing row with the terminal fields).
+  - `scrapeAndUpdateJobListing` now takes the full container object (`{id, hostPort}`) instead of just `hostPort`, threads the chosen container into the new log lifecycle, and passes a `createContainerProgressReporter`-built reporter into the resolver.
+  - `runResolverForExistingListing` now takes both the container and a pre-allocated `logId` parameter (so the retry route can INSERT the row synchronously before returning 202, avoiding a race where the frontend's first poll lands before the resolver starts).
+  - `POST /:id/resolve-application-url` no longer mutates `JobListing.status` to "init" — in-progress state is now signaled by the freshly-inserted log row's `outcome=null`. Returns 202 with `{ ...jobListing, latest_resolution_log_id: logId }`.
+  - `GET /:id` now augments the response with `resolution_in_progress: boolean` and `latest_resolution_log_id: number | null`, both derived from a `findFirst` on the log table for this listing.
+  - New endpoint **`GET /api/job-listings/:id/url-resolution/live`** that returns a `LiveProgress` JSON. While the latest log row has `outcome=null`, it proxies the container's `GET /resolution-progress/:logId`. On terminal log rows, it returns a synthesized `LiveProgress` built from the durable fields via new helper `buildTerminalLiveProgressFromLog`. On a missing container, unreachable container, 404 from container, or non-2xx from container, it returns a "crashed" payload built via new helper `buildCrashedLiveProgressPayload` so the trace page can exit its polling loop cleanly.
+  - `ParsedResolutionLog` interface extended with `managed_container_id: number | null`; `outcome` widened to `string | null`. `parseResolutionLogRow` updated to surface the new column.
+- **`server/src/routes/jobListings.test.ts`** — Added `applicationUrlResolutionLog.update` / `findFirst` and `managedContainer.findUnique` to the Prisma mock factory. Added `createContainerProgressReporter` to the resolver-service mock (stubbed to no-op). New `beforeEach` defaults populate sensible return values for the new mocks and stub global `fetch`. Updated the existing log-persist tests to match the new INSERT-first / UPDATE-on-finalize flow (5 cases). Added 4 new cases under `POST /:id/resolve-application-url` (placeholder INSERT, non-Error spawn rejection, container `/begin` POST failure). Added 3 new cases under `GET /:id` for the `resolution_in_progress` field. New `GET /:id/url-resolution/live` describe block with 11 cases covering the in-progress proxy path, terminal synthesis, 404 paths, container-unreachable / 404 / 500 fallback variants, missing-container, malformed JSON tolerance, non-array JSON tolerance, candidate-defaulting, and the finalize-step message fallback for null `reason`.
+- **`docker/managed-container/server.ts`** — Added four endpoints under `/resolution-progress/:logId/*`: `POST /begin` (calls `begin(logId, jobListingId)`), `POST /step` (calls `recordStep(logId, ...)` with full enum validation on `phase` and `status`), `POST /finalize` (calls `finalize(logId, ...)` with enum validation on `finalOutcome`), and `GET /` (returns the LiveProgress JSON or 404). New `parseLogIdParam(req, res)` helper centralizes the integer/positivity guard. New imports from `resolutionTypes.js` and `resolutionProgressStore.js`.
+- **`docker/managed-container/tsconfig.json`** — Added `resolutionProgressStore.ts`, `resolutionTypes.ts`, and `*.test.ts` to `include`; set `types: ["vitest/globals"]` so the lint config's projectService can resolve vitest symbols.
+- **`client/src/services/jobListingsApi.ts`** — Extended `JobListingResponse` with `resolution_in_progress: boolean` and `latest_resolution_log_id: number | null`. Added mirrored enums `ResolutionPhase`, `StepStatus`, `ApplicationUrlResolutionOutcome`. Added types `LiveStep`, `LiveProgress`. Added method `getLiveUrlResolution(id)` that returns the LiveProgress JSON or `null` when the server reports no resolution attempts (404 body recognized by message text).
+- **`client/src/services/jobListingsApi.test.ts`** — Added `resolution_in_progress` and `latest_resolution_log_id` to the `mockListing` fixture so it matches the extended interface. Added a new `getLiveUrlResolution` describe block with 4 cases (happy path, 404→null mapping, non-404 error rethrow, non-Error rejection rethrow).
+- **`client/src/App.tsx`** — Added `<Route path="/jobs/:id/url-resolution" element={<UrlResolutionTracePage />} />` and imported the new page.
+- **`client/src/pages/JobViewPage.tsx`** — Imported `useNavigate` + `Link as RouterLink` from react-router-dom and the MUI `Timeline` icon. Added `isResolutionInProgress` derived from `jobListing.resolution_in_progress`. When true, renders a `<Button component={RouterLink}>` ("View Resolution Progress") in place of the Retry button. When false and a past attempt exists (`latest_resolution_log_id !== null`), renders an additional "View Resolver Trace" link button. `handleRetryResolveApplicationUrl` now `navigate(...)`s to `/jobs/:id/url-resolution` after the resolver POST succeeds.
+- **`client/src/pages/JobViewPage.test.tsx`** — Added `resolution_in_progress: false` and `latest_resolution_log_id: null` to every fixture (replace_all). 3 new cases in `JobViewPage — application_url resolution UI`: link replaces retry when in-progress, retry click navigates to the trace page (mounted in a second route), and "View Resolver Trace" link renders when a past attempt exists.
+- **`client/src/components/JobList.test.tsx`**, **`client/src/pages/JobsListPage.test.tsx`**, **`client/src/components/AddJobForm.test.tsx`**, **`client/src/pages/AddJobPage.test.tsx`** — Added the two new fields to every JobListingResponse fixture so TypeScript compiles cleanly.
+- **`tests/playwright/applicationUrlResolution.spec.ts`** — Added a third test: navigate to the trace page on a fresh job, assert the empty-state copy and the "Back to Job View" link are visible.
+
+### Behavioral notes
+- The container is the source of truth for live progress for as long as the attempt is running (and 10 minutes after it finishes). After the eviction TTL or a container restart, the trace page falls back to a synthesized LiveProgress built from the durable log row's `brave_results` and `inspected_candidates` columns — so the page still renders meaningfully even after the in-memory entry is gone. If the latest log row has `outcome=null` but the container can't be reached / 404s / 500s, the server returns a synthesized terminal "crashed" payload (`finalOutcome: null`, descriptive `reason`) so the polling client exits its loop cleanly rather than spinning forever.
+- Step events are pushed best-effort from the server to the container: any failure (timeout, container down, 500) is caught and logged with a `[resolver:reporter] ...` warning but never aborts the resolution. This is important because the resolver's HTTP delegation goes through the *same* container for both scrapes and progress; a transient blip on one shouldn't kill the other.
+- The `safeStartStep` / `safeEndStep` / `safeFinalize` wrappers around the optional reporter mean that omitting the reporter entirely (the unit-test path and any direct programmatic caller) yields identical behavior to today, while flaky reporters never disrupt the resolution. `safeStartStep` returns `-1` as a sentinel when the reporter is missing or threw; subsequent `safeEndStep` calls with that sentinel are no-ops.
+- The two new schema relations (`job_listing` and `managed_container`) tighten referential integrity. `onDelete: Cascade` on `job_listing` matches the semantics of the other per-job tables (when a job is deleted, its history should go with it). `onDelete: SetNull` on `managed_container` preserves the resolver history even if the operator deletes the container that ran the attempt — the log row sticks around for audit purposes.
+
+### Coverage
+After all changes: 590 tests across 29 files, all passing. `npm run test:coverage` shows statements 98.62, branches 93.24, functions 98.20, lines 99.03 — all above the configured thresholds (98 / 93 / 98 / 98). No threshold lowered. `npm run lint` clean.
+
+---
+
+## 2026-05-17 (later): Auto-spawn a managed container when one isn't running on Fetch Data / Retry
+
+### Intent
+The fetch and resolve-application-url routes previously returned `503` when no managed container was running, forcing the user to go to the Containers page first and click "New Container" manually. That's friction: Fetch Data needs a container as an implementation detail, not as a user-visible concept. Now both routes auto-spawn a container synchronously if none exists, so clicking Fetch Data Just Works™.
+
+### Files Added
+- **`server/src/services/managedContainerService.ts`** — New service module that consolidates the high-level container lifecycle.
+  - `spawnAndRegisterContainer(name?)` — extracted from the body of `POST /api/managed-containers`. Generates a name (or uses the provided one), validates, checks DB uniqueness, calls `runContainer`, persists the row, rolls back the docker container on DB-insert failure. Returns the full `ManagedContainer` Prisma row.
+  - `findOrSpawnRunningContainer()` — the convenience wrapper the fetch + resolve routes use. Returns the first running container's `{id, hostPort}` if any exist, otherwise calls `spawnAndRegisterContainer()` and returns the new row.
+  - `SpawnContainerError` class with a `kind` discriminator (`"invalid_name" | "name_taken" | "docker_failed" | "db_failed"`) so route handlers can map structured failures to the right HTTP status without parsing error strings.
+  - `isPrismaUniqueViolation(err)` — exported helper (was previously private to the route).
+- **`server/src/services/managedContainerService.test.ts`** — 17 tests covering `isPrismaUniqueViolation`, the `SpawnContainerError` shape, every spawn-failure mode (invalid name, name taken, docker reject, P2002 race, generic DB failure, rollback success, rollback failure), and `findOrSpawnRunningContainer`'s find-vs-spawn branches.
+
+### Files Modified
+- **`server/src/routes/managedContainers.ts`** — `POST /api/managed-containers` is now a thin wrapper over `spawnAndRegisterContainer`. Translates `SpawnContainerError.kind` → HTTP status via a new `spawnErrorToHttpStatus(kind)` helper. Imports trimmed: no longer pulls `generateContainerName / isValidContainerName / runContainer` directly. The old in-route `isPrismaUniqueViolation` private function is removed (now lives in the service).
+- **`server/src/routes/jobListings.ts`** — `POST /:id/fetch` and `POST /:id/resolve-application-url` both call `findOrSpawnRunningContainer()` instead of `findFirstRunningContainer()`. On `SpawnContainerError` or any other rejection, return `503` with the underlying message. JSDoc updated to document the new auto-spawn behavior.
+- **`server/src/routes/jobListings.test.ts`** — swapped mock module to `../services/managedContainerService.js` (with a class-in-mock-factory declaration of `SpawnContainerError` so `instanceof` checks resolve consistently). All `findFirstRunningContainer` mock setups replaced with `findOrSpawnRunningContainer`. Old "503 when no running container exists" tests replaced with three new tests: auto-spawn happy path, spawn-failure with `SpawnContainerError`, spawn-failure with a non-Error reason. Same pattern applied to the resolve-application-url route tests.
+- **`client/src/components/AddJobForm.tsx`** — The "no managed container is running" alert was severity `warning` with copy implying the user had to spawn one manually. Flipped to severity `info` with friendlier copy: "Fetch Data will spin one up automatically the first time it runs (this may add ~30s on the first request)." Data-testid unchanged so existing tests still find it.
+
+### Behavioral notes
+- The auto-spawn is synchronous within the route handler — the 202 response is held until the container is registered and ready (per `runContainer`'s readiness poll, ~10s warm / ~30s+ cold). This is deliberate: returning 202 first and spawning async would mean the user sees "Fetch started" then later sees the row never updates, which is confusing.
+- Race condition between two simultaneous fetches both seeing no container: each spawns one. The second spawn won by `name_taken` would actually fail because `generateContainerName()` uses 6 random bytes (collision astronomically unlikely). Worst case: one extra container the user can clean up manually. Not worth a lock yet.
+- The resolver service still calls `findFirstRunningContainer` internally as a defensive check; with the route-level auto-spawn that branch should never fire in practice but provides belt-and-suspenders for direct service usage.
+
+### Verification
+- `npm run tsc`: clean (client + server)
+- `npm run lint`: clean
+- `npm run test`: **513 passing** (was 492; +17 new service tests, +4 route tests, -3 stale "503 no container" tests replaced with new spawn-failure tests)
+- `npm run test:coverage`: **98.69 stmt / 93.52 branch / 98.38 func / 99.19 line** — clears 98/93/98/98
+
+## 2026-05-17: Don't bail to not_found on apply-button re-scrape failure — fall through to web search
+
+### Intent
+The resolver was returning `not_found` with `"Failed to inspect apply button on the original page: fetch failed"` whenever the smart-proxy re-scrape of the original URL threw — observed against a real Indeed listing. The re-scrape failure is a soft signal (we lose the off-platform-redirect hint), not a hard one: the caller-supplied title + description are enough to run the Brave search step, which is what the user would do manually anyway. Bailing was hiding a recoverable failure mode.
+
+### Files Modified
+- **`server/src/services/applicationUrlResolverService.ts`** — In the apply-button re-scrape branch of `resolveApplicationUrl`, the `catch` block now logs a WARN (`[resolver] apply-button re-scrape failed; continuing to search: ...`), sets `applyButtonUrlForDecision = null`, and falls through to the existing search step. The function no longer early-returns `not_found` on this failure. Updated the surrounding comment to document the intentional non-fatal behavior.
+- **`server/src/services/applicationUrlResolverService.test.ts`** — Removed the prior `"returns 'not_found' when the re-scrape of the original URL throws"` assertion (the behavior it locked in is now wrong). Replaced with two new tests:
+  1. `"falls through to web search when the re-scrape of the original URL throws (does not bail)"` — mocks `scrapeJobViaContainer` to reject on the first call (the re-scrape) and resolve on the second (the candidate inspection), asserts the outcome is `resolved_via_search` and that `trace.applyButtonUrlConsidered` is null.
+  2. `"still produces a not_found outcome when re-scrape fails AND search yields no match"` — covers the combined-failure case, asserts the reason now reflects the search step (`/Inspected/`) rather than the re-scrape failure.
+
+### Verification
+- `npm run tsc`: clean
+- `npm run lint`: clean
+- `npm run test`: **492 passing** (was 491; one assertion replaced by two new ones)
+- `npm run test:coverage`: **98.74 stmt / 94.22 branch / 98.35 func / 99.24 line** — unchanged, still clears the 98/93/98/98 thresholds
+
+## 2026-05-16 12:20 EDT: Persist application-URL resolution traces; surface Brave results + per-candidate verdicts in the UI
+
+### Intent
+The first end-to-end run of the resolver against a real LinkedIn URL surfaced the limitation that we only inspect the static `href` attribute on the apply button — and that LinkedIn/Indeed wrap their apply CTAs in same-domain redirects, so the `resolved_via_redirect` branch is effectively dead for those platforms. When a job falls through to `resolved_via_search` (or worse, `not_found`), there was no way to inspect what the resolver actually saw: which Brave results came back, which candidates were inspected, and why each was accepted/rejected. This change adds a persistent per-attempt trace and a UI panel to render it.
+
+### Schema (`server/prisma/schema.prisma`)
+- New enum `ApplicationUrlResolutionOutcome { direct, resolved_via_redirect, resolved_via_search, not_found }` — mirrors the discriminated `ResolverOutcome` so queries are type-safe.
+- New model `ApplicationUrlResolutionLog` with columns: `id`, `job_listing_id`, `outcome`, `search_query` (nullable when resolver short-circuited before search), `brave_results` (TEXT, JSON-encoded `BraveSearchResult[]`), `inspected_candidates` (TEXT, JSON-encoded `InspectedCandidate[]`), `final_application_url` (nullable), `reason` (free-text, populated on not_found), `created_date`. Indexed on `(job_listing_id, created_date)` for fast latest-log lookups.
+- JSON-as-TEXT (rather than Prisma's `Json`) matches the existing `ApplicationAttemptLogs.logs` convention; route layer parses to structured arrays before responding to clients.
+- Ran `npx prisma db push` + `npx prisma generate`.
+
+### Resolver (`server/src/services/applicationUrlResolverService.ts`) — substantial rewrite
+- New interfaces `InspectedCandidate { url, scrapedTitle, matched, rejectionReason }`, `ResolutionTrace { applyButtonUrlConsidered, searchQuery, braveResults, inspectedCandidates }`, `ResolveApplicationUrlResult { outcome, trace }`.
+- `resolveApplicationUrl` return type changed from `ResolverOutcome` → `ResolveApplicationUrlResult`. Builds the trace progressively as it executes each step. The early-exit paths (malformed URL, no container available, missing search query) all return a fully-populated shape with empty trace collections.
+- Per-step `console.log` at INFO level (per CLAUDE.md "name what you're checking" style): `[resolver] outcome=direct host=acme.com`, `[resolver] applyButtonUrl=...`, `[resolver] searching brave query="..."`, `[resolver] brave returned=N result(s)`, `[resolver] candidate=URL scrapedTitle="..." verdict=accept|reject reason="..."`, `[resolver] outcome=not_found inspected=N candidate(s) without a match`. Watching the dev server now lets you follow the resolver step-by-step.
+- Candidate-scrape failures are now recorded in the trace as a candidate with `matched: false` and `rejectionReason: "scrape failed: ..."` rather than silently skipped — visible in the UI.
+- Now imports `evaluateJobMatch` (new — see `jobMatchService.ts` below) instead of `isSameJob` so per-candidate rejection reasons can be persisted verbatim.
+
+### Match service (`server/src/services/jobMatchService.ts`)
+- Added `evaluateJobMatch(input)` returning `{ matched, reason }`. The `reason` field surfaces:
+  - `"original title is empty after normalization"`
+  - `"candidate title is empty after normalization"`
+  - `"title mismatch (original=\"X\", candidate=\"Y\")"`
+  - `"description token overlap 23% below 40% threshold"`
+  - `"title matched and description overlap 60% >= 40%"` (success case)
+- `isSameJob` is now a one-line boolean wrapper around `evaluateJobMatch().matched` for backwards-compat call sites that don't need the reason. No external behavior change.
+
+### Route (`server/src/routes/jobListings.ts`)
+- New helper `persistResolutionLog(jobListingId, outcome, trace)` — inserts one row into `application_url_resolution_logs`, JSON-stringifying the two array columns. Best-effort: a persist failure is logged and swallowed so it doesn't block the actual `JobListing.application_url` update.
+- Both call sites (initial-fetch `scrapeAndUpdateJobListing` and retry `runResolverForExistingListing`) now destructure `{ outcome, trace }` from the resolver result and persist the log before applying the outcome to the row.
+- New `GET /api/job-listings/:id/resolution-logs` route — returns every attempt for the job, newest first. Parses the two JSON columns server-side via the new `parseResolutionLogRow` helper, which tolerates malformed historical rows by falling back to `[]` (one corrupt row never breaks the whole list).
+
+### Frontend
+- `client/src/services/jobListingsApi.ts` — new `ResolutionLog`, `ResolutionLogBraveResult`, `ResolutionLogInspectedCandidate` interfaces; new `getResolutionLogs(id)` function calling the new endpoint.
+- New component `client/src/components/ResolutionTracePanel.tsx`. Always rendered on `JobViewPage`, collapsed by default. Expanded view shows: outcome chip + timestamp; the search query (or "Search was skipped" for the direct path); the adopted URL (when present); the not_found reason; the full Brave results list as clickable links; the inspected candidates list with per-candidate verdict chip ("matched" / "rejected") + scraped title + rejection reason. Earlier attempts collapse to a single-line summary beneath the latest.
+- `JobViewPage` — new `traceRefreshToken` state. Two `useEffect`s bump the token when:
+  - the resolver retry finishes (`application_url` filled OR status flipped to `missing_form_url`)
+  - the initial Fetch Data resolver finishes (title becomes non-empty after the fetch flag clears)
+  
+  The token prop on `ResolutionTracePanel` triggers a re-fetch so the panel reflects the new attempt without a manual reload.
+
+### Test plan + verification
+- Rewrote `applicationUrlResolverService.test.ts` for the new return shape (24 → 24 tests, all `result.outcome.outcome` now). New tests verify the trace contents on each outcome path (matched candidate recorded, gated candidates skipped but counted in brave_results, scrape-failure rejection reason, candidate cap).
+- Added 6 new tests to `jobMatchService.test.ts` for `evaluateJobMatch` covering each rejection-reason branch + the success case.
+- Added 3 test blocks to `jobListings.test.ts`: persistResolutionLog success (verifies the create-call shape including JSON-stringified columns), not_found persistence, log-persist failure swallow (Error + non-Error), GET resolution-logs route (200/404/400/empty array), and `parseResolutionLogRow` (valid JSON, malformed JSON, non-array JSON).
+- New component test file `client/src/components/ResolutionTracePanel.test.tsx` — 9 tests covering: collapsed default state, expansion shows query/results/candidates, not_found reason renders, "Search was skipped" message on direct path, earlier-attempts list, empty state, fetch-error Error/non-Error paths, refreshToken triggers re-fetch.
+- Added `getResolutionLogs` tests to `jobListingsApi.test.ts`.
+
+### Final gauntlet
+- `npm run tsc`: clean (client + server)
+- `npm run lint`: clean
+- `npm run test`: **491 passing** (was 463 before this change)
+- `npm run test:coverage`: **98.74 stmt / 94.22 branch / 98.35 func / 99.24 line** — clears thresholds (98 / 93 / 98 / 98)
+- Manual end-to-end verification: deferred (the previous-day run against the Giga LinkedIn URL exercised the same resolver code path; the trace persistence is additive and will be visible on the next live run)
+
+## 2026-05-16 08:30 EDT: Resolve off-platform application_url for Indeed/LinkedIn jobs; replace Browser-Use scraper with smart-proxy
+
+### Intent
+Indeed and LinkedIn job postings frequently route the user through a login wall or a host-specific apply flow, blocking the auto-apply pipeline. Added a resolver that finds the real off-platform application form for each job and stores it on a new `application_url` column. The resolver inspects the apply button on the original page; if that points off-platform, adopt it; otherwise web-search for the company+role and inspect each non-gated candidate via the smart-proxy `/analyze` until one matches the original title + description. When nothing matches, the JobListing status flips to a new `missing_form_url` value, which surfaces a warning callout and a Retry button on the view page and blocks the apply pipeline until resolved.
+
+In the same pass, the smart-proxy `/analyze` agent replaces the Browser-Use SDK scraper end-to-end — the agent's `report` tool now returns structured `title / company / description / salary / post_date / apply_button_url` alongside the existing verdict fields. Browser-Use is still used for the actual application flow (filling out forms) but is no longer used for the description scrape.
+
+### Algorithm (server/src/services/applicationUrlResolverService.ts)
+1. If `originalUrl`'s host is not linkedin.com / indeed.com → `direct`, `application_url = originalUrl`.
+2. Inspect the apply button URL from the smart-proxy scrape. If it points off-platform → `resolved_via_redirect`.
+3. Otherwise web-search `"{company} {title}"` via Brave Search API; for each non-gated candidate URL (capped at 5), run `/analyze` and call `isSameJob` (exact title match + ≥40% description token overlap with stop-word filter). First match → `resolved_via_search`.
+4. No match → `not_found`; caller flips `JobListing.status` to `missing_form_url`.
+
+### Files Added
+- **`server/src/services/braveSearchService.ts`** — `searchWeb(query, limit)`. Reads `BRAVE_SEARCH_API_KEY` env, uses `AbortSignal.timeout(8000)`. Filters malformed/non-http(s) results.
+- **`server/src/services/braveSearchService.test.ts`** — 11 tests: missing/empty key, empty query, happy path, filtered results, missing description default, missing `web.results`, non-2xx, fetch-thrown-Error, fetch-thrown-non-Error, count param.
+- **`server/src/services/jobMatchService.ts`** — `normalizeForMatch`, `tokenizeDescription` (stop-word filter, drops <3-char tokens), `computeOverlapRatio` (asymmetric — denominator is the original set), `isSameJob`. Constant `MIN_DESCRIPTION_TOKEN_OVERLAP_RATIO = 0.40`.
+- **`server/src/services/jobMatchService.test.ts`** — 17 tests covering normalize/tokenize/overlap/isSameJob edge cases.
+- **`server/src/services/smartProxyScraperService.ts`** — `findFirstRunningContainer()` (Prisma query, ordered by id), `scrapeJobViaContainer(hostPort, url, useProxy=true)` (POSTs to `http://127.0.0.1:{hostPort}/analyze`, uses `AbortSignal.timeout(120000)`).
+- **`server/src/services/smartProxyScraperService.test.ts`** — 6 tests: findFirst happy/null, POST shape, useProxy override, non-2xx with JSON error, non-2xx without JSON body.
+- **`server/src/services/applicationUrlResolverService.ts`** — exports `resolveApplicationUrl`, `isGatedHost`, `tryGetHostname`, `buildSearchQuery`. Accepts an optional pre-scraped `originalApplyButtonUrl` so the initial-fetch path avoids a redundant scrape; the retry path omits it and forces a re-scrape.
+- **`server/src/services/applicationUrlResolverService.test.ts`** — 17 tests covering all four outcomes + edge cases (malformed URLs, gated apply-button hint, missing container, search failure with Error and non-Error, candidate cap, candidate-scrape failure recovery, empty-query short-circuit).
+- **`tests/playwright/applicationUrlResolution.spec.ts`** — 2 tests: apply button hidden on fresh add (the gate), source-url link present with `target="_blank"`.
+
+### Files Modified
+- **`server/prisma/schema.prisma`** — Added `application_url String?` to `JobListing` and `missing_form_url` to the `JobStatus` enum. Ran `npx prisma db push` + `npx prisma generate`.
+- **`docker/managed-container/agent.ts`** — Extended `AnalyzeResult` with `title / company / description / salary / post_date / apply_button_url`. Extended the `report` tool's `input_schema` to require LLM-extracted `title / company / salary / post_date` (the description comes from container-side `mainText`; `apply_button_url` comes from container-side parsing of `applyButtons[0].href` — the LLM doesn't do URL math). Added `PageSnapshot` type + `parsePageSnapshot` helper; `runAnalyzeAgent` now stashes the latest snapshot after each `get_page_summary` and merges it into the final report. `SUMMARY_HELPER_SCRIPT` now resolves applyButton hrefs to absolute via `new URL(rawHref, location.href)` and bumps `mainText` cap from 600 to 10000 chars to fit a full description. System prompt updated with extraction guidance.
+- **`docker/managed-container/server.ts`** — Updated `/analyze` JSDoc to reflect the new response shape.
+- **`server/src/routes/managedContainers.ts`** — Updated `/api/managed-containers/:id/analyze` JSDoc.
+- **`client/src/services/managedContainersApi.ts`** — Extended `AnalyzeResponse` interface with the 6 new fields.
+- **`server/src/routes/jobListings.ts`** (substantial rewrite) — `scrapeAndUpdateJobListing` now uses `scrapeJobViaContainer` (no more Browser-Use SDK call, no LinkedIn credentials path); after scrape, calls `resolveApplicationUrl` and persists the outcome via new `applyResolverOutcomeToListing` helper. `POST /:id/fetch` validates a running container exists (returns 503 with actionable error if not) before kicking off async work. New `POST /:id/resolve-application-url` retry endpoint resets status to `init` and re-runs the resolver against the persisted title+description. New `splitFormattedTitle` helper splits stored `"Company - Title"` strings for the retry path.
+- **`server/src/routes/jobApplications.ts`** — Apply gate: 400 when `application_url` is null/empty. `applyToJob` now drives the application against `application_url` (off-platform form), not the original posting. Batch flow's findMany filters on `application_url: { not: null }` and similarly uses `application_url` to drive each apply. Removed the dead `enrichJobListingDetails` helper (apply now requires the row to be scraped first, so post-apply enrichment was unreachable).
+- **`server/src/routes/jobListings.test.ts`** (rewritten) — Mocks the new services; new tests for the 503 no-container path, 202 happy path, resolver-direct/redirect/not_found persistence, parsePostDate-null fallback, retry endpoint (400/404/503/202), scrape-failure swallow with Error and non-Error.
+- **`server/src/routes/jobApplications.test.ts`** — Updated fixtures with `application_url`. New tests for the apply gate (null + empty-string + missing_form_url status). Updated batch tests to include `application_url` in job shape. Removed obsolete enrichment tests.
+- **`client/src/services/jobListingsApi.ts`** — Added `application_url: string | null` to `JobListingResponse`; new `resolveApplicationUrl(id)` helper for the Retry button.
+- **`client/src/components/JobList.tsx`** — Added `missing_form_url` to the chip config (`{ color: "warning", label: "No form URL" }`).
+- **`client/src/pages/JobViewPage.tsx`** — New status chip config for `missing_form_url`. New "Application URL" link + Open Application button when `application_url` is set. Source URL link always shown (relabeled to "Source (job-details page)" when application_url exists). Warning Alert + Retry button when status is `missing_form_url`. New `handleRetryResolveApplicationUrl` handler + `isRetryingResolve` state; the poll effect now extends to keep polling while the retry is in flight; an effect clears `isRetryingResolve` once the row settles (either `application_url` populated or status returns to `missing_form_url`). Apply button is hidden unless `application_url` is set AND status is `init`/`error_applying`.
+- **`client/src/components/AddJobForm.tsx`** — Probes `listManagedContainers()` on mount; renders an inline warning (`data-testid="no-container-warning"`) when none are running. Submission is still allowed — the warning is informational.
+- **Several client test files** (JobList.test, JobsListPage.test, JobViewPage.test, AddJobPage.test, AddJobForm.test, ApplicationDashboardPage.test, jobListingsApi.test) — Added `application_url: null` to mock fixtures. JobViewPage tests rewritten where the old behavior assumed Apply was always visible; new tests assert the gate. New tests cover the Retry handler, missing-form-url alert, application/source link rendering, container-warning visibility.
+- **`tests/playwright/addAndViewJob.spec.ts`** — Apply-button visibility assertion flipped to `toHaveCount(0)` to reflect the gate.
+
+### Files Deleted
+- **`server/src/services/jobListingScraperService.ts`** (Browser-Use scrape; replaced by smart-proxy)
+- **`server/src/services/jobListingScraperService.test.ts`**
+- **`server/src/scripts/fetchJobListing.ts`** (CLI script for the deleted service)
+- **`server/src/scripts/linkedin_credentials.json`** (smart-proxy doesn't authenticate)
+- **`server/src/scripts/linkedin_cookie.txt`**
+
+The `browser-use-sdk` npm dependency stays — `jobApplicationService.ts` (the actual form-filling agent) still uses it.
+
+### Verification
+- `npm run tsc`: clean (client + server)
+- `npm run lint`: clean
+- `npm run test`: 449 passing → 480 passing after adding service + UI tests
+- `npm run test:coverage`: **98.73 stmt / 93.99 branch / 98.21 func / 99.2 line** — clears thresholds (98 / 93 / 98 / 98)
+- Manual end-to-end with a running container + Brave key: pending — needs a `BRAVE_SEARCH_API_KEY` set in `.env` and a spawned managed container. The Playwright spec exercises only the UI surfaces reachable without a container (apply gate + source link); the deeper flow (resolver outcome → DB → poll → UI) is for the manual-verifier agent against a live environment.
+
+
 
 ### Intent
 On the single-container view page (`/containers/:id`), the green status `Chip` was hardcoded to the persisted DB `status` field and never reflected the container's actual liveness without the user clicking "Ping health". Now the page automatically fires a health ping after the container record loads, the Chip shows a loading state ("Checking..." with a small spinner) while a ping is in flight, turns green with the live status string on success, and turns red "unhealthy" on failure. Auto-ping failures stay silent in the Alert area (red chip only) so the page doesn't shout an error before the user has had a chance to interact; user-triggered ping failures additionally render the existing error Alert as before.

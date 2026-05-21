@@ -1,18 +1,22 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useNavigate, Link as RouterLink } from "react-router-dom";
 import {
   Container, Typography, CircularProgress, Alert, Box,
-  Paper, Chip, Button, Divider,
+  Paper, Chip, Button, Divider, Link as MuiLink,
 } from "@mui/material";
 import {
   PlayArrow as PlayArrowIcon,
   Download as DownloadIcon,
+  OpenInNew as OpenInNewIcon,
+  Refresh as RefreshIcon,
+  Timeline as TimelineIcon,
 } from "@mui/icons-material";
-import { getJobListing, fetchJobData, applyToJob, type JobListingResponse } from "../services/jobListingsApi";
+import { getJobListing, fetchJobData, applyToJob, resolveApplicationUrl, type JobListingResponse } from "../services/jobListingsApi";
 import BackLink from "../components/BackLink";
 import LoadingOrErrorPanel from "../components/LoadingOrErrorPanel";
 import LiveBrowserView from "../components/LiveBrowserView";
 import LabeledField from "../components/LabeledField";
+import ResolutionTracePanel from "../components/ResolutionTracePanel";
 
 /**
  * Page that displays the full details of a single job listing.
@@ -22,12 +26,15 @@ import LabeledField from "../components/LabeledField";
  */
 function JobViewPage() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [jobListing, setJobListing] = useState<JobListingResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
   const [isFetchingData, setIsFetchingData] = useState(false);
   const [isStartingApply, setIsStartingApply] = useState(false);
+  const [isRetryingResolve, setIsRetryingResolve] = useState(false);
   const [actionErrorMessage, setActionErrorMessage] = useState("");
+  const [traceRefreshToken, setTraceRefreshToken] = useState(0);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   /**
@@ -58,10 +65,10 @@ function JobViewPage() {
     fetchJobListing();
   }, [fetchJobListing]);
 
-  /** Poll every 3 seconds while the job is applying or while data is being fetched */
+  /** Poll every 3 seconds while the job is applying, while data is being fetched, or while the resolver retry is in flight. */
   useEffect(() => {
     const isApplying = jobListing?.status === "applying";
-    const shouldPoll = isApplying || isFetchingData;
+    const shouldPoll = isApplying || isFetchingData || isRetryingResolve;
 
     if (shouldPoll) {
       const hasNoExistingPoll = !pollIntervalRef.current;
@@ -91,6 +98,28 @@ function JobViewPage() {
     }
   }, [jobListing?.title, isFetchingData]);
 
+  /** Stop the retry-resolve polling once the row settles (application_url filled in or status flipped back to missing_form_url) */
+  useEffect(() => {
+    const isResolverDone =
+      jobListing?.application_url !== null && jobListing?.application_url !== undefined ||
+      jobListing?.status === "missing_form_url";
+    if (isResolverDone && isRetryingResolve) {
+      setIsRetryingResolve(false);
+      // Bumping the token re-fetches the resolution-log panel so it reflects the latest attempt.
+      setTraceRefreshToken((token) => token + 1);
+    }
+  }, [jobListing?.application_url, jobListing?.status, isRetryingResolve]);
+
+  /** Refresh the trace panel after the initial Fetch Data resolver completes (detected by title flipping non-empty). */
+  useEffect(() => {
+    const hasTitle = !!jobListing?.title;
+    if (hasTitle && isFetchingData === false) {
+      // The fetch flow runs scrape + resolver back-to-back; once the title
+      // shows up the trace panel should pick up the freshly persisted log.
+      setTraceRefreshToken((token) => token + 1);
+    }
+  }, [jobListing?.title, isFetchingData]);
+
   /**
    * Triggers background scraping for this job listing.
    * Starts polling to show updated data once scraping completes.
@@ -108,6 +137,30 @@ function JobViewPage() {
       const errorText = err instanceof Error ? err.message : "Failed to fetch job data";
       setActionErrorMessage(errorText);
       setIsFetchingData(false);
+    }
+  };
+
+  /**
+   * Re-runs the application-URL resolver against the already-scraped fields
+   * for this listing and navigates to the admin live-trace page so the user
+   * can watch the steps as they happen. Used when the initial fetch resulted
+   * in missing_form_url and the user wants another attempt without
+   * re-scraping.
+   */
+  const handleRetryResolveApplicationUrl = async () => {
+    const parsedId = parseInt(id ?? "", 10);
+    const isInvalidId = isNaN(parsedId);
+    if (isInvalidId) return;
+
+    setIsRetryingResolve(true);
+    setActionErrorMessage("");
+    try {
+      await resolveApplicationUrl(parsedId);
+      navigate(`/jobs/${String(parsedId)}/url-resolution`);
+    } catch (err) {
+      const errorText = err instanceof Error ? err.message : "Failed to retry application URL resolution";
+      setActionErrorMessage(errorText);
+      setIsRetryingResolve(false);
     }
   };
 
@@ -145,14 +198,21 @@ function JobViewPage() {
       applied: { color: "success", label: "Applied" },
       error_applying: { color: "error", label: "Error" },
       closed: { color: "default", label: "Closed" },
+      missing_form_url: { color: "warning", label: "No form URL" },
     };
     const config = statusConfig[status] ?? { color: "warning" as const, label: status };
     return <Chip color={config.color} label={config.label} />;
   };
 
   const isApplying = jobListing?.status === "applying";
+  const isMissingFormUrl = jobListing?.status === "missing_form_url";
+  const isResolutionInProgress = jobListing?.resolution_in_progress === true;
   const hasJobDetails = !!jobListing?.title;
-  const canApply = jobListing?.status === "init" || jobListing?.status === "error_applying";
+  const hasApplicationUrl = !!jobListing?.application_url;
+  // Auto-apply requires a resolved application_url (the off-platform form). When
+  // the row is in missing_form_url state, or application_url is still null
+  // (e.g. fetch hasn't run yet), the Apply button is hidden.
+  const canApply = (jobListing?.status === "init" || jobListing?.status === "error_applying") && hasApplicationUrl;
 
   return (
     <Container maxWidth="md" sx={{ mt: 4, mb: 4 }}>
@@ -177,8 +237,28 @@ function JobViewPage() {
               {getStatusChip(jobListing.status)}
             </Box>
 
+            {/* Application URL — the off-platform form CTA. Shown when the resolver succeeded. */}
+            {hasApplicationUrl && (
+              <>
+                <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                  Application URL
+                </Typography>
+                <Typography
+                  component="a"
+                  href={jobListing.application_url!}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  sx={{ display: "block", mb: 2, wordBreak: "break-all" }}
+                  data-testid="application-url-link"
+                >
+                  {jobListing.application_url!}
+                </Typography>
+              </>
+            )}
+
+            {/* Source URL — always shown so the user can cross-check the original posting. */}
             <Typography variant="subtitle2" color="text.secondary" gutterBottom>
-              URL
+              {hasApplicationUrl ? "Source (job-details page)" : "URL"}
             </Typography>
             <Typography
               component="a"
@@ -186,12 +266,20 @@ function JobViewPage() {
               target="_blank"
               rel="noopener noreferrer"
               sx={{ display: "block", mb: 2, wordBreak: "break-all" }}
+              data-testid="source-url-link"
             >
               {jobListing.url}
             </Typography>
 
+            {/* Missing-form-url callout + retry */}
+            {isMissingFormUrl && (
+              <Alert severity="warning" sx={{ mb: 2 }} data-testid="missing-form-url-alert">
+                Could not find an off-platform application form for this job. The auto-apply flow is blocked. You can either click Retry to attempt resolution again, or open the source URL above to apply manually on LinkedIn / Indeed.
+              </Alert>
+            )}
+
             {/* Action buttons */}
-            <Box sx={{ display: "flex", gap: 2, mt: 2 }}>
+            <Box sx={{ display: "flex", gap: 2, mt: 2, flexWrap: "wrap" }}>
               <Button
                 variant="outlined"
                 startIcon={isFetchingData ? <CircularProgress size={16} /> : <DownloadIcon />}
@@ -200,6 +288,58 @@ function JobViewPage() {
               >
                 {isFetchingData ? "Fetching Data..." : "Fetch Data"}
               </Button>
+
+              {isResolutionInProgress ? (
+                <Button
+                  variant="outlined"
+                  color="info"
+                  component={RouterLink}
+                  to={`/jobs/${String(jobListing.id)}/url-resolution`}
+                  startIcon={<CircularProgress size={16} />}
+                  data-testid="view-resolution-progress-link"
+                >
+                  View Resolution Progress
+                </Button>
+              ) : (
+                isMissingFormUrl && (
+                  <Button
+                    variant="outlined"
+                    color="warning"
+                    startIcon={isRetryingResolve ? <CircularProgress size={16} /> : <RefreshIcon />}
+                    onClick={handleRetryResolveApplicationUrl}
+                    disabled={isRetryingResolve}
+                    data-testid="retry-resolve-button"
+                  >
+                    {isRetryingResolve ? "Retrying..." : "Retry Find Application URL"}
+                  </Button>
+                )
+              )}
+
+              {!isResolutionInProgress && jobListing.latest_resolution_log_id !== null && (
+                <Button
+                  variant="text"
+                  component={RouterLink}
+                  to={`/jobs/${String(jobListing.id)}/url-resolution`}
+                  startIcon={<TimelineIcon />}
+                  data-testid="view-resolution-trace-link"
+                >
+                  View Resolver Trace
+                </Button>
+              )}
+
+              {hasApplicationUrl && (
+                <Button
+                  variant="outlined"
+                  startIcon={<OpenInNewIcon />}
+                  component={MuiLink}
+                  href={jobListing.application_url!}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-testid="open-application-button"
+                >
+                  Open Application
+                </Button>
+              )}
 
               {canApply && (
                 <Button
@@ -272,6 +412,9 @@ function JobViewPage() {
               </Typography>
             </Paper>
           )}
+
+          {/* Resolver trace — always available, collapsed by default. */}
+          <ResolutionTracePanel jobListingId={jobListing.id} refreshToken={traceRefreshToken} />
         </>
       )}
     </Container>

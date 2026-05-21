@@ -4,7 +4,6 @@ import { resolve } from "node:path";
 import prisma from "../prismaClient.js";
 import { applyToJob } from "../services/jobApplicationService.js";
 import type { UserInfo, StepLog } from "../services/jobApplicationService.js";
-import { scrapeAndUpdateJobListing } from "./jobListings.js";
 import { findJobListingOrSend404 } from "./_helpers.js";
 
 const router = Router();
@@ -98,12 +97,22 @@ router.post("/:id/apply", async (req: Request, res: Response) => {
     return;
   }
 
+  // Application URL gate: the auto-apply flow drives Browser-Use against the
+  // application_url (the off-platform form), not the original Indeed/LinkedIn
+  // job-details page. If the resolver never found a usable application URL
+  // there is no form to fill out, so refuse early with an actionable error.
+  const hasNoApplicationUrl = jobListing.application_url === null || jobListing.application_url.length === 0;
+  if (hasNoApplicationUrl) {
+    res.status(400).json({ error: "Job listing has no application_url. Run POST /:id/fetch to resolve it, or use the Retry button if resolution previously failed." });
+    return;
+  }
+
   const config = await loadConfigOrSend400(res, "applicator:route");
   if (config === null) {
     return;
   }
 
-  console.log(`[applicator:route] Starting application for job ${String(jobListing.id)}: ${jobListing.url}`);
+  console.log(`[applicator:route] Starting application for job ${String(jobListing.id)}: ${jobListing.application_url}`);
 
   const updatedListing = await prisma.jobListing.update({
     where: { id: jobListing.id },
@@ -112,7 +121,8 @@ router.post("/:id/apply", async (req: Request, res: Response) => {
 
   res.status(202).json(updatedListing);
 
-  applyToSingleJob(jobListing.id, jobListing.url, config.userInfo, config.profileId).catch(() => {
+  // Narrowing — the hasNoApplicationUrl gate above guarantees non-null at this point.
+  applyToSingleJob(jobListing.id, jobListing.application_url!, config.userInfo, config.profileId).catch(() => {
     /* error already handled inside */
   });
 });
@@ -156,11 +166,6 @@ async function applyToSingleJob(
     });
 
     await saveAttemptLog(jobId, result);
-
-    // Enrich the job listing with title/description if not already filled
-    if (result.success) {
-      await enrichJobListingDetails(jobId, jobUrl);
-    }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.error(`[applicator:route] Application failed for job ${jobId}: ${errorMessage}`);
@@ -170,38 +175,6 @@ async function applyToSingleJob(
     });
 
     await saveAttemptLog(jobId, { message: errorMessage });
-  }
-}
-
-/**
- * Enriches a job listing with title, description, and post date by scraping the URL.
- * Only scrapes if the job listing currently has no title (empty string).
- * Runs in the background — failures are logged but do not affect application status.
- * @param {number} jobId - The job listing ID
- * @param {string} jobUrl - The job listing URL to scrape
- */
-async function enrichJobListingDetails(jobId: number, jobUrl: string): Promise<void> {
-  try {
-    const jobListing = await prisma.jobListing.findUnique({ where: { id: jobId } });
-    const alreadyHasTitle = !!jobListing?.title;
-    if (alreadyHasTitle) {
-      console.log(`[applicator:route] Job ${jobId} already has title, skipping enrichment`);
-      return;
-    }
-
-    console.log(`[applicator:route] Enriching job ${jobId} details via scraping: ${jobUrl}`);
-
-    const parsedUrl = new URL(jobUrl);
-    const isLinkedInUrl = parsedUrl.hostname === "linkedin.com" || parsedUrl.hostname.endsWith(".linkedin.com");
-    const credentialsPath = isLinkedInUrl
-      ? resolve(__dirname, "../scripts/linkedin_credentials.json")
-      : null;
-
-    await scrapeAndUpdateJobListing(jobId, jobUrl, credentialsPath);
-    console.log(`[applicator:route] Job ${jobId} details enriched successfully`);
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    console.error(`[applicator:route] Failed to enrich job ${jobId} details: ${errorMessage}`);
   }
 }
 
@@ -253,13 +226,13 @@ router.post("/apply-batch", async (_req: Request, res: Response) => {
   const { userInfo, profileId } = config;
 
   const eligibleJobs = await prisma.jobListing.findMany({
-    where: { status: "init" },
+    where: { status: "init", application_url: { not: null } },
     orderBy: { created_date: "asc" },
   });
 
   const hasNoEligibleJobs = eligibleJobs.length === 0;
   if (hasNoEligibleJobs) {
-    res.status(400).json({ error: "No job listings with status 'init' to apply to" });
+    res.status(400).json({ error: "No job listings with status 'init' and a resolved application_url to apply to. Run Fetch Data on the jobs first." });
     return;
   }
 
@@ -283,13 +256,15 @@ router.post("/apply-batch", async (_req: Request, res: Response) => {
 
 /**
  * Processes a batch of job listings one at a time, applying to each sequentially.
- * Updates the batchState as each job is processed.
- * @param {Array<{ id: number; url: string }>} jobs - The jobs to apply to
+ * Updates the batchState as each job is processed. Drives Browser-Use against
+ * each row's application_url (the off-platform application form URL) — the
+ * batch-eligible filter in the route handler guarantees application_url is set.
+ * @param {Array<{ id: number; url: string; application_url: string | null }>} jobs - The jobs to apply to
  * @param {UserInfo} userInfo - The user's personal information
  * @param {string} profileId - The Browser Use profile ID
  */
 async function runBatchApply(
-  jobs: Array<{ id: number; url: string }>,
+  jobs: Array<{ id: number; url: string; application_url: string | null }>,
   userInfo: UserInfo,
   profileId: string,
 ): Promise<void> {
@@ -316,7 +291,10 @@ async function runBatchApply(
         });
       };
 
-      const result = await applyToJob(job.url, userInfo, profileId, handleLiveUrlReady, job.id);
+      // Drive Browser-Use against the resolved application_url (the off-platform
+      // form), not the original Indeed/LinkedIn job-details URL. The batch-eligible
+      // filter above already ensures application_url is non-null.
+      const result = await applyToJob(job.application_url!, userInfo, profileId, handleLiveUrlReady, job.id);
 
       let finalStatus: "applied" | "error_applying" | "closed";
       if (result.closedListing) {
@@ -336,7 +314,6 @@ async function runBatchApply(
 
       if (result.success) {
         batchState.completed.push(job.id);
-        await enrichJobListingDetails(job.id, job.url);
       } else {
         batchState.errors.push({ jobId: job.id, error: result.message });
       }

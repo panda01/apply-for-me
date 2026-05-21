@@ -58,6 +58,7 @@ function JobList({ jobListings, onJobDeleted }: JobListProps) {
       applied: { color: "success", label: "Applied" },
       error_applying: { color: "error", label: "Error" },
       closed: { color: "default", label: "Closed" },
+      missing_form_url: { color: "warning", label: "No form URL" },
     };
     const config = statusConfig[status] ?? { color: "warning" as const, label: status };
     return <Chip size="small" color={config.color} label={config.label} />;

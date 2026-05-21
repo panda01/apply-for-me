@@ -25,12 +25,6 @@ vi.mock("../services/jobApplicationService.js", () => {
   };
 });
 
-vi.mock("../services/jobListingScraperService.js", () => {
-  return {
-    fetchJobListingFromUrl: vi.fn(),
-  };
-});
-
 const { mockReadFile } = vi.hoisted(() => ({
   mockReadFile: vi.fn(),
 }));
@@ -62,6 +56,7 @@ const mockInitJobListing = {
   id: 1,
   title: "Test Job",
   url: "https://linkedin.com/jobs/view/123",
+  application_url: "https://acme.com/jobs/123/apply",
   description: "Test description",
   salary: null,
   location: null,
@@ -102,6 +97,49 @@ describe("POST /api/job-listings/:id/apply", () => {
     });
   });
 
+  it("should drive applyToJob against the application_url, not the source url", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
+
+    await request(app).post("/api/job-listings/1/apply");
+
+    await vi.waitFor(() => {
+      expect(applyToJob).toHaveBeenCalledWith(
+        "https://acme.com/jobs/123/apply",
+        expect.anything(),
+        "test-profile-id",
+        expect.any(Function),
+        1
+      );
+    });
+  });
+
+  it("should return 400 when application_url is null", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue({
+      ...mockInitJobListing,
+      application_url: null,
+    });
+
+    const response = await request(app).post("/api/job-listings/1/apply");
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/no application_url/i);
+    expect(applyToJob).not.toHaveBeenCalled();
+  });
+
+  it("should return 400 when application_url is an empty string", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue({
+      ...mockInitJobListing,
+      application_url: "",
+    });
+
+    const response = await request(app).post("/api/job-listings/1/apply");
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/no application_url/i);
+  });
+
   it("should return 400 for invalid id", async () => {
     const response = await request(app)
       .post("/api/job-listings/abc/apply");
@@ -131,6 +169,18 @@ describe("POST /api/job-listings/:id/apply", () => {
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain("applied");
+  });
+
+  it("should return 400 when status is missing_form_url", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue({
+      ...mockInitJobListing,
+      status: "missing_form_url" as const,
+      application_url: null,
+    });
+
+    const response = await request(app).post("/api/job-listings/1/apply");
+
+    expect(response.status).toBe(400);
   });
 
   it("should allow re-applying when status is error_applying", async () => {
@@ -287,65 +337,6 @@ describe("POST /api/job-listings/:id/apply", () => {
     errorSpy.mockRestore();
   });
 
-  it("should enrich job listing details after successful application when title is empty", async () => {
-    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
-    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
-    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
-    // findUnique called again inside enrichJobListingDetails — return listing with empty title
-    vi.mocked(prisma.jobListing.findUnique)
-      .mockResolvedValueOnce(mockInitJobListing)  // first call: route handler
-      .mockResolvedValueOnce({ ...mockInitJobListing, title: "" });  // second call: enrichment check
-
-    await request(app)
-      .post("/api/job-listings/1/apply");
-
-    await vi.waitFor(() => {
-      // Verify status was set to applied
-      expect(prisma.jobListing.update).toHaveBeenCalledWith({
-        where: { id: 1 },
-        data: { status: "applied" as const, live_url: null },
-      });
-    });
-  });
-
-  it("should skip enrichment when job already has a title", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.mocked(prisma.jobListing.findUnique)
-      .mockResolvedValueOnce(mockInitJobListing)  // route handler
-      .mockResolvedValueOnce({ ...mockInitJobListing, title: "Existing Title" });  // enrichment check
-    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
-    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
-
-    await request(app)
-      .post("/api/job-listings/1/apply");
-
-    await vi.waitFor(() => {
-      const logCalls = logSpy.mock.calls.map(c => c[0] as string);
-      const hasSkipLog = logCalls.some(msg => msg.includes("already has title"));
-      expect(hasSkipLog).toBe(true);
-    });
-    logSpy.mockRestore();
-  });
-
-  it("should enrich LinkedIn job listing with credentials path", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.mocked(prisma.jobListing.findUnique)
-      .mockResolvedValueOnce({ ...mockInitJobListing, url: "https://www.linkedin.com/jobs/view/123" })
-      .mockResolvedValueOnce({ ...mockInitJobListing, title: "", url: "https://www.linkedin.com/jobs/view/123" });
-    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
-    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
-
-    await request(app)
-      .post("/api/job-listings/1/apply");
-
-    await vi.waitFor(() => {
-      const logCalls = logSpy.mock.calls.map(c => c[0] as string);
-      const hasEnrichLog = logCalls.some(msg => msg.includes("Enriching job"));
-      expect(hasEnrichLog).toBe(true);
-    });
-    logSpy.mockRestore();
-  });
-
   it("should call handleLiveUrlReady during single job application", async () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
@@ -380,59 +371,6 @@ describe("POST /api/job-listings/:id/apply", () => {
         data: { status: "closed", live_url: null },
       });
     });
-  });
-
-  it("should not attach LinkedIn credentials path when the URL host is not a LinkedIn host", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.mocked(prisma.jobListing.findUnique)
-      .mockResolvedValueOnce({ ...mockInitJobListing, url: "https://example.com/jobs/view/123" })
-      .mockResolvedValueOnce({ ...mockInitJobListing, title: "", url: "https://example.com/jobs/view/123" });
-    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
-    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
-
-    await request(app).post("/api/job-listings/1/apply");
-
-    await vi.waitFor(() => {
-      const logCalls = logSpy.mock.calls.map((c) => c[0] as string);
-      const hasEnrichLog = logCalls.some((msg) => msg.includes("Enriching job"));
-      expect(hasEnrichLog).toBe(true);
-    });
-    logSpy.mockRestore();
-  });
-
-  it("should stringify a non-Error rejection during enrichment", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    vi.mocked(prisma.jobListing.findUnique)
-      .mockResolvedValueOnce(mockInitJobListing)
-      .mockRejectedValueOnce("non-error-enrichment");
-    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
-    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
-
-    await request(app).post("/api/job-listings/1/apply");
-
-    await vi.waitFor(() => {
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to enrich job 1 details: non-error-enrichment")
-      );
-    });
-    errorSpy.mockRestore();
-  });
-
-  it("should handle enrichment failure gracefully", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    vi.mocked(prisma.jobListing.findUnique)
-      .mockResolvedValueOnce(mockInitJobListing)
-      .mockRejectedValueOnce(new Error("DB error during enrichment"));
-    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
-    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
-
-    await request(app)
-      .post("/api/job-listings/1/apply");
-
-    await vi.waitFor(() => {
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to enrich"));
-    });
-    errorSpy.mockRestore();
   });
 
   it("should update status to error_applying and log error when application fails", async () => {
@@ -489,6 +427,19 @@ describe("POST /api/job-listings/apply-batch", () => {
     expect(response.body.message).toContain("2 jobs");
   });
 
+  it("filters out jobs whose application_url is null via the findMany where clause", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockInitJobListing]);
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
+
+    await request(app).post("/api/job-listings/apply-batch");
+
+    expect(prisma.jobListing.findMany).toHaveBeenCalledWith({
+      where: { status: "init", application_url: { not: null } },
+      orderBy: { created_date: "asc" },
+    });
+  });
+
   it("should return 400 when no eligible jobs exist", async () => {
     vi.mocked(prisma.jobListing.findMany).mockResolvedValue([]);
 
@@ -512,26 +463,20 @@ describe("POST /api/job-listings/apply-batch", () => {
 
 describe("POST /api/job-listings/apply-batch (batch already running)", () => {
   it("should return 409 when a batch is already running", async () => {
-    // First, start a batch so batchState.isRunning becomes true
-    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([
-      mockInitJobListing,
-    ]);
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockInitJobListing]);
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
-    // Make applyToJob hang so the batch stays running during our second request
     vi.mocked(applyToJob).mockReturnValue(new Promise(() => {}));
 
     const firstResponse = await request(app)
       .post("/api/job-listings/apply-batch");
     expect(firstResponse.status).toBe(202);
 
-    // Second request while batch is still running
     const secondResponse = await request(app)
       .post("/api/job-listings/apply-batch");
 
     expect(secondResponse.status).toBe(409);
     expect(secondResponse.body.error).toContain("already running");
 
-    // Reset the batchState so other tests aren't affected
     const { batchState } = await import("./jobApplications.js");
     batchState.isRunning = false;
     batchState.currentJobId = null;
@@ -554,14 +499,26 @@ describe("runBatchApply", () => {
       return { success: true, message: "Applied" };
     });
 
-    const jobs = [{ id: 1, url: "https://linkedin.com/jobs/view/123" }];
+    const jobs = [{ id: 1, url: "https://linkedin.com/jobs/view/123", application_url: "https://acme.com/apply" }];
     await runBatchApply(jobs, userInfo, "test-profile-id");
 
-    // Verify the live_url was set via the callback
     expect(prisma.jobListing.update).toHaveBeenCalledWith({
       where: { id: 1 },
       data: { live_url: "https://live.example.com/session" },
     });
+  });
+
+  it("drives applyToJob against the application_url, not the source url", async () => {
+    const { runBatchApply } = await import("./jobApplications.js");
+    const userInfo = JSON.parse(mockUserInfoJson);
+
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
+
+    const jobs = [{ id: 1, url: "https://linkedin.com/jobs/view/1", application_url: "https://acme.com/apply" }];
+    await runBatchApply(jobs, userInfo, "test-profile-id");
+
+    expect(applyToJob).toHaveBeenCalledWith("https://acme.com/apply", expect.anything(), "test-profile-id", expect.any(Function), 1);
   });
 
   it("should set status to closed in batch when closedListing is true", async () => {
@@ -576,7 +533,7 @@ describe("runBatchApply", () => {
     batchState.errors = [];
     batchState.totalJobs = 1;
 
-    const jobs = [{ id: 40, url: "https://linkedin.com/jobs/view/closed" }];
+    const jobs = [{ id: 40, url: "https://linkedin.com/jobs/view/closed", application_url: "https://acme.com/closed" }];
     await runBatchApply(jobs, userInfo, "test-profile-id");
 
     expect(prisma.jobListing.update).toHaveBeenCalledWith({
@@ -598,13 +555,12 @@ describe("runBatchApply", () => {
     batchState.errors = [];
     batchState.totalJobs = 1;
 
-    const jobs = [{ id: 10, url: "https://linkedin.com/jobs/view/999" }];
+    const jobs = [{ id: 10, url: "https://linkedin.com/jobs/view/999", application_url: "https://acme.com/999" }];
     await runBatchApply(jobs, userInfo, "test-profile-id");
 
     expect(batchState.errors).toEqual([{ jobId: 10, error: "Task stopped" }]);
     expect(batchState.completed).toEqual([]);
 
-    // Verify error_applying status was set
     expect(prisma.jobListing.update).toHaveBeenCalledWith({
       where: { id: 10 },
       data: { status: "error_applying", live_url: null },
@@ -623,7 +579,7 @@ describe("runBatchApply", () => {
     batchState.errors = [];
     batchState.totalJobs = 1;
 
-    const jobs = [{ id: 20, url: "https://linkedin.com/jobs/view/888" }];
+    const jobs = [{ id: 20, url: "https://linkedin.com/jobs/view/888", application_url: "https://acme.com/888" }];
     await runBatchApply(jobs, userInfo, "test-profile-id");
 
     expect(batchState.errors).toEqual([{ jobId: 20, error: "Network failure" }]);
@@ -645,7 +601,7 @@ describe("runBatchApply", () => {
     batchState.errors = [];
     batchState.totalJobs = 1;
 
-    const jobs = [{ id: 30, url: "https://linkedin.com/jobs/view/777" }];
+    const jobs = [{ id: 30, url: "https://linkedin.com/jobs/view/777", application_url: "https://acme.com/777" }];
     await runBatchApply(jobs, userInfo, "test-profile-id");
 
     expect(batchState.errors).toEqual([{ jobId: 30, error: "string error" }]);

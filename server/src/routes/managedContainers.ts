@@ -1,11 +1,7 @@
 import { Router, Request, Response } from "express";
 import prisma from "../prismaClient.js";
-import {
-  generateContainerName,
-  isValidContainerName,
-  runContainer,
-  stopAndRemove,
-} from "../services/dockerContainerService.js";
+import { stopAndRemove } from "../services/dockerContainerService.js";
+import { spawnAndRegisterContainer, SpawnContainerError } from "../services/managedContainerService.js";
 
 const router = Router();
 
@@ -42,82 +38,32 @@ const ANALYZE_TIMEOUT_MS = 120000;
  */
 router.post("/", async (req: Request, res: Response) => {
   const requestedNameRaw = (req.body as { name?: unknown } | undefined)?.name;
-  const hasRequestedName = typeof requestedNameRaw === "string" && requestedNameRaw.length > 0;
-  const containerName = hasRequestedName ? requestedNameRaw : generateContainerName();
+  const requestedName = typeof requestedNameRaw === "string" && requestedNameRaw.length > 0 ? requestedNameRaw : undefined;
 
-  const isInvalidName = !isValidContainerName(containerName);
-  if (isInvalidName) {
-    res.status(400).json({ error: "Invalid container name" });
-    return;
-  }
-
-  const existingByName = await prisma.managedContainer.findUnique({
-    where: { name: containerName },
-  });
-  const isNameTaken = existingByName !== null;
-  if (isNameTaken) {
-    res.status(409).json({ error: "A managed container with that name already exists" });
-    return;
-  }
-
-  let dockerId: string;
-  let hostPort: number;
-  let wgConfigName: string;
   try {
-    const result = await runContainer(containerName);
-    dockerId = result.dockerId;
-    hostPort = result.hostPort;
-    wgConfigName = result.wgConfigName;
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    console.error(`[managed-containers] Failed to start container "${containerName}": ${errorMessage}`);
-    res.status(500).json({ error: `Failed to start container: ${errorMessage}` });
-    return;
-  }
-
-  // If the DB insert fails after docker created the container, we need to roll back
-  // the docker side or the container leaks (running with no record to find/delete it).
-  try {
-    const newRecord = await prisma.managedContainer.create({
-      data: {
-        name: containerName,
-        dockerId,
-        hostPort,
-        wgConfigName,
-        status: "running",
-      },
-    });
+    const newRecord = await spawnAndRegisterContainer(requestedName);
     res.status(201).json(newRecord);
   } catch (err) {
-    await stopAndRemove(dockerId).catch((cleanupErr: unknown) => {
-      const cleanupMessage = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
-      console.error(`[managed-containers] Failed to clean up orphaned container ${dockerId}: ${cleanupMessage}`);
-    });
-
-    const isUniqueViolation = isPrismaUniqueViolation(err);
-    if (isUniqueViolation) {
-      res.status(409).json({ error: "A managed container with that name already exists" });
+    if (err instanceof SpawnContainerError) {
+      const statusCode = spawnErrorToHttpStatus(err.kind);
+      res.status(statusCode).json({ error: err.message });
       return;
     }
-
     const errorMessage = err instanceof Error ? err.message : String(err);
-    console.error(`[managed-containers] DB insert failed; rolled back docker container ${dockerId}: ${errorMessage}`);
-    res.status(500).json({ error: `Failed to persist container: ${errorMessage}` });
+    res.status(500).json({ error: errorMessage });
   }
 });
 
 /**
- * Determines whether a thrown error is a Prisma P2002 unique-constraint violation.
- * @param {unknown} err - The thrown error
- * @returns {boolean} True if the error is a P2002 unique-constraint violation
+ * Maps a structured spawn-failure kind to the right HTTP status code.
+ *
+ * @param {SpawnContainerError["kind"]} kind - The classified spawn failure
+ * @returns {number} The HTTP status code to respond with
  */
-function isPrismaUniqueViolation(err: unknown): boolean {
-  const isObject = typeof err === "object" && err !== null;
-  if (!isObject) {
-    return false;
-  }
-  const code = (err as { code?: string }).code;
-  return code === "P2002";
+function spawnErrorToHttpStatus(kind: SpawnContainerError["kind"]): number {
+  if (kind === "invalid_name") return 400;
+  if (kind === "name_taken") return 409;
+  return 500; // docker_failed, db_failed
 }
 
 /**
@@ -327,7 +273,7 @@ router.post("/:id/screenshot", async (req: Request, res: Response) => {
  * along with a final screenshot (base64). Streams the JSON body back to the caller.
  * @param {number} req.params.id - The managed container id
  * @param {string} req.body.url - The URL to analyze
- * @returns {object} 200 - { is_job_description, apply_button_present, description_signals, reasoning, screenshot_b64 }
+ * @returns {object} 200 - { is_job_description, apply_button_present, description_signals, reasoning, screenshot_b64, title, company, description, salary, post_date, apply_button_url }
  * @returns {object} 400 - Invalid id or missing/invalid URL
  * @returns {object} 404 - Managed container not found
  * @returns {object} 503 - Container unreachable or upstream agent failed

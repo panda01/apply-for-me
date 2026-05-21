@@ -6,6 +6,18 @@ import { createHash } from "node:crypto";
 import { runAnalyzeAgent } from "./agent.js";
 import { captureCleanedScreenshot } from "./popup.js";
 import { getSmartproxyConfig } from "./smartproxy.js";
+import {
+  begin as beginProgress,
+  recordStep as recordProgressStep,
+  finalize as finalizeProgress,
+  get as getProgress,
+  type LiveStep,
+} from "./resolutionProgressStore.js";
+import {
+  isResolutionPhase,
+  isStepStatus,
+  isApplicationUrlResolutionOutcome,
+} from "./resolutionTypes.js";
 
 /**
  * Where every captured screenshot is persisted inside the container, before
@@ -223,7 +235,7 @@ app.post("/screenshot", async (req: Request, res: Response) => {
  * residential exits — necessary for Cloudflare-protected sites like Indeed.
  * @param {string} req.body.url - The URL to analyze
  * @param {boolean} [req.body.useProxy] - When true, route the agent's page through Smartproxy
- * @returns {object} 200 - { is_job_description, apply_button_present, description_signals, reasoning, screenshot_b64 }
+ * @returns {object} 200 - { is_job_description, apply_button_present, description_signals, reasoning, screenshot_b64, title, company, description, salary, post_date, apply_button_url }
  * @returns {object} 400 - Missing or invalid URL
  * @returns {object} 500 - Agent loop or upstream Claude error (incl. missing proxy creds when useProxy=true)
  */
@@ -263,6 +275,183 @@ app.post("/analyze", async (req: Request, res: Response) => {
       await context.close().catch(() => { /* ignore close error */ });
     }
   }
+});
+
+/**
+ * Validates and extracts the :logId path parameter for the
+ * /resolution-progress/* endpoints. Sends a 400 directly and returns null
+ * when the value is not a positive integer.
+ *
+ * @param {Request} req - The express request
+ * @param {Response} res - The express response (used to send 400 on bad input)
+ * @returns {number | null} The parsed log id, or null when invalid
+ */
+function parseLogIdParam(req: Request, res: Response): number | null {
+  const rawParam = req.params.logId;
+  const raw = typeof rawParam === "string" ? rawParam : "";
+  const parsed = Number.parseInt(raw, 10);
+  const isInvalid = !Number.isFinite(parsed) || parsed <= 0 || String(parsed) !== raw;
+  if (isInvalid) {
+    res.status(400).json({ error: `Invalid logId: "${raw}"` });
+    return null;
+  }
+  return parsed;
+}
+
+/**
+ * POST /resolution-progress/:logId/begin
+ * Initializes the in-memory progress entry for a new resolver attempt.
+ * Replaces any prior entry under the same logId.
+ *
+ * @param {number} req.params.logId - The ApplicationUrlResolutionLog row id
+ * @param {number} req.body.jobListingId - The JobListing row this attempt is resolving
+ * @returns {object} 204 - Created (empty body)
+ * @returns {object} 400 - Invalid logId or missing/invalid jobListingId
+ */
+app.post("/resolution-progress/:logId/begin", (req: Request, res: Response) => {
+  const logId = parseLogIdParam(req, res);
+  if (logId === null) return;
+
+  const body = req.body as { jobListingId?: unknown } | undefined;
+  const rawJobListingId = body?.jobListingId;
+  const isInvalidJobListingId =
+    typeof rawJobListingId !== "number" || !Number.isFinite(rawJobListingId) || rawJobListingId <= 0;
+  if (isInvalidJobListingId) {
+    res.status(400).json({ error: "Request body must include a positive integer 'jobListingId'" });
+    return;
+  }
+
+  beginProgress(logId, rawJobListingId);
+  res.status(204).end();
+});
+
+/**
+ * POST /resolution-progress/:logId/step
+ * Inserts (or overwrites by stepIndex) one step of an in-progress resolver
+ * attempt. The same stepIndex is sent twice per phase: once with status
+ * "running" at the start and once with a terminal status at the end.
+ *
+ * @param {number} req.params.logId - The ApplicationUrlResolutionLog row id
+ * @param {number} req.body.stepIndex - Monotonic index assigned by the server-side reporter
+ * @param {string} req.body.phase - One of ResolutionPhase
+ * @param {string} req.body.status - One of StepStatus
+ * @param {string} req.body.message - Human-readable summary
+ * @param {object} req.body.payload - Structured detail blob
+ * @param {string} req.body.startedAt - ISO timestamp the step began
+ * @param {string|null} req.body.endedAt - ISO timestamp the step ended (null while still running)
+ * @param {number|null} req.body.durationMs - Elapsed ms (null while still running)
+ * @returns {object} 204 - Recorded (empty body)
+ * @returns {object} 400 - Invalid logId or step body
+ */
+app.post("/resolution-progress/:logId/step", (req: Request, res: Response) => {
+  const logId = parseLogIdParam(req, res);
+  if (logId === null) return;
+
+  const body = req.body as Partial<LiveStep> | undefined;
+  const rawStepIndex = body?.stepIndex;
+  const rawPhase = body?.phase;
+  const rawStatus = body?.status;
+  const rawMessage = body?.message;
+  const rawPayload = body?.payload;
+  const rawStartedAt = body?.startedAt;
+  const rawEndedAt = body?.endedAt;
+  const rawDurationMs = body?.durationMs;
+
+  const isInvalidStepIndex = typeof rawStepIndex !== "number" || !Number.isFinite(rawStepIndex) || rawStepIndex < 0;
+  if (isInvalidStepIndex) {
+    res.status(400).json({ error: "Body must include a non-negative integer 'stepIndex'" });
+    return;
+  }
+  if (!isResolutionPhase(rawPhase)) {
+    res.status(400).json({ error: `Body 'phase' must be one of the ResolutionPhase enum values; got: ${String(rawPhase)}` });
+    return;
+  }
+  if (!isStepStatus(rawStatus)) {
+    res.status(400).json({ error: `Body 'status' must be one of the StepStatus enum values; got: ${String(rawStatus)}` });
+    return;
+  }
+  if (typeof rawMessage !== "string") {
+    res.status(400).json({ error: "Body 'message' must be a string" });
+    return;
+  }
+  if (typeof rawStartedAt !== "string") {
+    res.status(400).json({ error: "Body 'startedAt' must be an ISO timestamp string" });
+    return;
+  }
+  const payload: Record<string, unknown> =
+    rawPayload !== undefined && !Array.isArray(rawPayload)
+      ? rawPayload
+      : {};
+  const endedAt = typeof rawEndedAt === "string" ? rawEndedAt : null;
+  const durationMs = typeof rawDurationMs === "number" && Number.isFinite(rawDurationMs) ? rawDurationMs : null;
+
+  recordProgressStep(logId, {
+    stepIndex: rawStepIndex,
+    phase: rawPhase,
+    status: rawStatus,
+    message: rawMessage,
+    payload,
+    startedAt: rawStartedAt,
+    endedAt,
+    durationMs,
+  });
+  res.status(204).end();
+});
+
+/**
+ * POST /resolution-progress/:logId/finalize
+ * Marks the attempt as finished and stores the final outcome. The entry
+ * stays queryable for ~10 minutes before being evicted from memory.
+ *
+ * @param {number} req.params.logId - The ApplicationUrlResolutionLog row id
+ * @param {string|null} req.body.finalOutcome - One of ApplicationUrlResolutionOutcome, or null when the resolver crashed before classifying
+ * @param {string|null} req.body.finalApplicationUrl - The resolved URL, or null on not_found / crash
+ * @param {string|null} req.body.reason - Free-text reason; usually populated on not_found
+ * @returns {object} 204 - Finalized (empty body)
+ * @returns {object} 400 - Invalid logId or finalOutcome value
+ */
+app.post("/resolution-progress/:logId/finalize", (req: Request, res: Response) => {
+  const logId = parseLogIdParam(req, res);
+  if (logId === null) return;
+
+  const body = req.body as { finalOutcome?: unknown; finalApplicationUrl?: unknown; reason?: unknown } | undefined;
+  const rawFinalOutcome = body?.finalOutcome;
+  const isFinalOutcomeAcceptable = rawFinalOutcome === null || isApplicationUrlResolutionOutcome(rawFinalOutcome);
+  if (!isFinalOutcomeAcceptable) {
+    // Coerce non-string finalOutcome to JSON for a useful 400 body; lets us
+    // satisfy ESLint's no-base-to-string without leaking an "[object Object]".
+    const displayValue = typeof rawFinalOutcome === "string" ? rawFinalOutcome : JSON.stringify(rawFinalOutcome);
+    res.status(400).json({ error: `Body 'finalOutcome' must be one of ApplicationUrlResolutionOutcome or null; got: ${displayValue}` });
+    return;
+  }
+  const rawFinalApplicationUrl = body?.finalApplicationUrl;
+  const finalApplicationUrl = typeof rawFinalApplicationUrl === "string" ? rawFinalApplicationUrl : null;
+  const rawReason = body?.reason;
+  const reason = typeof rawReason === "string" ? rawReason : null;
+
+  finalizeProgress(logId, rawFinalOutcome ?? null, finalApplicationUrl, reason);
+  res.status(204).end();
+});
+
+/**
+ * GET /resolution-progress/:logId
+ * Returns the current live progress snapshot for a resolver attempt, or 404
+ * when no entry exists (never begun, or already evicted from memory).
+ *
+ * @param {number} req.params.logId - The ApplicationUrlResolutionLog row id
+ * @returns {object} 200 - The LiveProgress JSON
+ * @returns {object} 400 - Invalid logId
+ * @returns {object} 404 - No live progress entry for this logId
+ */
+app.get("/resolution-progress/:logId", (req: Request, res: Response) => {
+  const logId = parseLogIdParam(req, res);
+  if (logId === null) return;
+  const progress = getProgress(logId);
+  if (progress === null) {
+    res.status(404).json({ error: `No live progress entry for logId=${String(logId)}` });
+    return;
+  }
+  res.json(progress);
 });
 
 app.listen(PORT, () => {

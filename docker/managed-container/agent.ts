@@ -26,6 +26,22 @@ const MAX_TOKENS_PER_TURN = 1024;
 
 /**
  * Final structured result the in-container /analyze endpoint returns to the host.
+ * Beyond the original verdict fields, this now also carries the structured job-listing
+ * details (title, company, description, salary, post_date) the host uses to populate
+ * the JobListing row, plus the first absolute apply-button URL found on the page
+ * (the host's resolver compares its hostname to the original URL's to decide whether
+ * it's an off-platform redirect).
+ *
+ * Field-by-field semantics:
+ *   - title / company: LLM-extracted from headings + page title; empty string when unknown
+ *   - description: NOT LLM-extracted. The container captures the page's mainText from the
+ *     last get_page_summary call (post-expand). This is more faithful than asking the LLM
+ *     to repeat multi-paragraph text within a 1024-token budget.
+ *   - salary / post_date: nullable strings. The LLM picks the most prominent value from
+ *     the page; null when the field isn't visible.
+ *   - apply_button_url: nullable absolute URL. The container captures applyButtons[0].href
+ *     from the last get_page_summary call after resolving to absolute via `new URL(href, location.href)`.
+ *     Null when no apply button was found.
  */
 export interface AnalyzeResult {
   is_job_description: boolean;
@@ -33,16 +49,22 @@ export interface AnalyzeResult {
   description_signals: string[];
   reasoning: string;
   screenshot_b64: string;
+  title: string;
+  company: string;
+  description: string;
+  salary: string | null;
+  post_date: string | null;
+  apply_button_url: string | null;
 }
 
-const SYSTEM_PROMPT = `You inspect a web page and decide whether it is a JOB DESCRIPTION page.
+const SYSTEM_PROMPT = `You inspect a web page and decide whether it is a JOB DESCRIPTION page, then extract structured job details.
 
 Procedure:
 1. Call dismiss_popups once to clear cookie banners, sign-in modals, and other overlays.
 2. Call get_page_summary to read the page's headings, button labels, salary text, and employment-type tokens.
 3. Based on the get_page_summary result, decide preliminarily whether this looks like a job description page (Class A apply affordance present AND >= 2 Class B signals). If yes, call expand_collapsed_sections to click any "Show more" / "Show full description" / "...more" buttons so the full description is visible, then call get_page_summary again so the final report reflects the expanded content.
 4. Call screenshot once to capture the final cleared+expanded page.
-5. Call report with your verdict.
+5. Call report with your verdict AND the extracted structured fields.
 
 Detection rule:
   is_job_description = (>= 1 Class A signal) AND (>= 2 Class B signals)
@@ -59,6 +81,14 @@ Class B — Description content (need >= 2 distinct):
   - Employment type: "Full-time", "Part-time", "Contract", "Internship", "Temporary"
   - Worksite: "Remote", "Hybrid", "On-site", "On site", "In-person"
   - Experience marker: "3+ years", "5 years experience", "Senior", "Junior", "Mid-level", "Entry-level"
+
+Structured field extraction (fill in your report tool call):
+  - title: The job title as displayed (e.g. "Software Engineer", "Senior Product Designer"). Strip company suffixes like " at Acme" or " | LinkedIn" — just the role. Empty string if you cannot find it.
+  - company: The hiring company's name only (e.g. "Acme Corp"). Empty string if not identifiable.
+  - salary: The displayed salary or compensation range exactly as shown (e.g. "$160,000–$250,000/yr", "£60k–£80k"). Empty string if not listed.
+  - post_date: The post date string as displayed (e.g. "2 hours ago", "March 1, 2026", "Posted 3 days ago"). Empty string if not visible.
+
+The description text, the apply_button_url, and the screenshot are captured automatically by the container — do NOT include them in your report tool input.
 
 Always end with a report call. Do not exceed ${String(MAX_TURNS)} turns. If you cannot decide, report is_job_description: false and explain why in reasoning.`;
 
@@ -94,7 +124,7 @@ const tools: Anthropic.Messages.Tool[] = [
   },
   {
     name: "report",
-    description: "End the loop and return the final verdict.",
+    description: "End the loop and return the final verdict and structured job details. Description text, apply_button_url, and the screenshot are populated automatically by the container — do not include them here.",
     input_schema: {
       type: "object",
       properties: {
@@ -102,8 +132,12 @@ const tools: Anthropic.Messages.Tool[] = [
         apply_button_present: { type: "boolean" },
         description_signals: { type: "array", items: { type: "string" }, description: "Names of the Class B signals you actually found, e.g. ['Responsibilities', 'Full-time', 'Remote']" },
         reasoning: { type: "string", description: "1-2 sentences explaining your verdict" },
+        title: { type: "string", description: "The job title only (strip company suffixes). Empty string if unknown." },
+        company: { type: "string", description: "The hiring company name only. Empty string if unknown." },
+        salary: { type: "string", description: "The displayed salary range exactly as shown, or empty string if not listed." },
+        post_date: { type: "string", description: "The displayed post date string (e.g. '2 hours ago'), or empty string if not visible." },
       },
-      required: ["is_job_description", "apply_button_present", "description_signals", "reasoning"],
+      required: ["is_job_description", "apply_button_present", "description_signals", "reasoning", "title", "company", "salary", "post_date"],
     },
   },
 ];
@@ -154,15 +188,31 @@ const SUMMARY_HELPER_SCRIPT = `
     // regardless of visibility, so the agent can verify Class A even on pages
     // where Apply lives deep in DOM order or inside a hidden trigger.
     if (APPLY_REGEX.test(label) || APPLY_REGEX.test(text) || APPLY_REGEX.test(aria)) {
+      const rawHref = (b.getAttribute("href") || "").trim();
+      // Resolve relative hrefs to absolute via the page's URL so the host
+      // resolver downstream can compare hostnames without a base-URL guess.
+      // Invalid hrefs (javascript:void(0), mailto:, #fragments, "") fall back
+      // to the raw string so the agent still sees something useful.
+      let absoluteHref = "";
+      if (rawHref.length > 0) {
+        try {
+          absoluteHref = new URL(rawHref, location.href).href.slice(0, 500);
+        } catch (err) {
+          absoluteHref = rawHref.slice(0, 500);
+        }
+      }
       applyButtons.push({
         label: label.slice(0, 80),
-        href: (b.getAttribute("href") || "").slice(0, 200),
+        href: absoluteHref,
       });
     }
   });
 
   const main = document.querySelector("main") || document.body;
-  const mainText = (main.innerText || "").trim().slice(0, 600);
+  // 10000 chars is generous enough for the longest typical job-description body
+  // text and keeps a single get_page_summary call under ~3k tokens, well within
+  // the agent's context budget.
+  const mainText = (main.innerText || "").trim().slice(0, 10000);
 
   const fullPageText = (document.body.innerText || "").slice(0, 20000);
   const salaryMatches = (fullPageText.match(/[$£€]\\s?\\d[\\d,.]*(?:\\s?[-–to]+\\s?[$£€]?\\s?\\d[\\d,.]*)?/g) || []).slice(0, 5);
@@ -261,21 +311,74 @@ function getAnthropicClient(): Anthropic {
 }
 
 /**
+ * Snapshot of fields the container-side helpers extract from the page (not the
+ * LLM) and persist across the agent loop. The orchestrator updates this after
+ * each get_page_summary so the final AnalyzeResult can use the most recent
+ * description text and the first applyButton href without the LLM having to
+ * copy multi-paragraph text or compute URL math.
+ */
+interface PageSnapshot {
+  mainText: string;
+  applyButtonUrl: string | null;
+}
+
+/**
+ * Parses a get_page_summary JSON output string and extracts the fields the
+ * container fills in automatically (description text + the first absolute
+ * apply-button href). Returns null fields when parsing fails so the
+ * orchestrator can fall through to whatever earlier snapshot it had.
+ *
+ * @param {string} summaryJson - The JSON string returned by SUMMARY_HELPER_SCRIPT
+ * @returns {PageSnapshot} mainText (empty string if missing) + applyButtonUrl (null when no apply button has an absolute http(s) href)
+ */
+function parsePageSnapshot(summaryJson: string): PageSnapshot {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(summaryJson);
+  } catch {
+    return { mainText: "", applyButtonUrl: null };
+  }
+  const isObject = typeof parsed === "object" && parsed !== null;
+  if (!isObject) {
+    return { mainText: "", applyButtonUrl: null };
+  }
+  const obj = parsed as { mainText?: unknown; applyButtons?: unknown };
+  const mainText = typeof obj.mainText === "string" ? obj.mainText : "";
+  const applyButtons = Array.isArray(obj.applyButtons) ? obj.applyButtons : [];
+  const firstHttpHref = applyButtons
+    .map((entry): string | null => {
+      const isObj = typeof entry === "object" && entry !== null;
+      if (!isObj) return null;
+      const href = (entry as { href?: unknown }).href;
+      if (typeof href !== "string" || href.length === 0) return null;
+      const isHttp = href.startsWith("http://") || href.startsWith("https://");
+      return isHttp ? href : null;
+    })
+    .find((href): href is string => href !== null) ?? null;
+  return { mainText, applyButtonUrl: firstHttpHref };
+}
+
+/**
  * Dispatches a single tool_use block by running the corresponding Playwright
  * action against the supplied page. `report` is treated as terminal: its input
- * is captured (along with the cached screenshot) and returned in `result`.
+ * is captured (along with the cached screenshot and the latest page snapshot)
+ * and returned in `result`.
  *
  * @param {Page} page - The Playwright page the agent is inspecting
  * @param {Anthropic.Messages.ToolUseBlock} toolUse - The tool_use block from Claude
  * @param {() => string | null} getCachedScreenshot - Returns the most recent screenshot the agent took, or null if none yet
  * @param {(b64: string) => void} setCachedScreenshot - Stores a freshly captured screenshot
+ * @param {() => PageSnapshot} getLatestSnapshot - Returns the mainText + applyButtonUrl from the most recent get_page_summary parse
+ * @param {(snapshot: PageSnapshot) => void} setLatestSnapshot - Stores a freshly parsed snapshot after get_page_summary
  * @returns {Promise<{ output: string; finalReport: AnalyzeResult | null }>} The string sent back to Claude, plus the verdict if the tool was `report`
  */
 async function dispatchTool(
   page: Page,
   toolUse: Anthropic.Messages.ToolUseBlock,
   getCachedScreenshot: () => string | null,
-  setCachedScreenshot: (b64: string) => void
+  setCachedScreenshot: (b64: string) => void,
+  getLatestSnapshot: () => PageSnapshot,
+  setLatestSnapshot: (snapshot: PageSnapshot) => void
 ): Promise<{ output: string; finalReport: AnalyzeResult | null }> {
   switch (toolUse.name) {
     case "dismiss_popups": {
@@ -283,8 +386,9 @@ async function dispatchTool(
       return { output: `Popups dismissed: ${String(result)}`, finalReport: null };
     }
     case "get_page_summary": {
-      const summaryJson = await page.evaluate(SUMMARY_HELPER_SCRIPT);
-      return { output: String(summaryJson), finalReport: null };
+      const summaryJson = String(await page.evaluate(SUMMARY_HELPER_SCRIPT));
+      setLatestSnapshot(parsePageSnapshot(summaryJson));
+      return { output: summaryJson, finalReport: null };
     }
     case "expand_collapsed_sections": {
       const result = await page.evaluate(EXPAND_HELPER_SCRIPT);
@@ -318,9 +422,18 @@ async function dispatchTool(
         apply_button_present?: unknown;
         description_signals?: unknown;
         reasoning?: unknown;
+        title?: unknown;
+        company?: unknown;
+        salary?: unknown;
+        post_date?: unknown;
       };
       const cachedScreenshot = getCachedScreenshot();
       const fallbackScreenshot = cachedScreenshot ?? (await captureCleanedScreenshot(page)).toString("base64");
+      const snapshot = getLatestSnapshot();
+      // Treat blank LLM-supplied strings as null for salary/post_date so the
+      // host doesn't have to second-guess "" vs missing-value semantics.
+      const rawSalary = typeof input.salary === "string" ? input.salary.trim() : "";
+      const rawPostDate = typeof input.post_date === "string" ? input.post_date.trim() : "";
       const finalReport: AnalyzeResult = {
         is_job_description: typeof input.is_job_description === "boolean" ? input.is_job_description : false,
         apply_button_present: typeof input.apply_button_present === "boolean" ? input.apply_button_present : false,
@@ -329,6 +442,12 @@ async function dispatchTool(
           : [],
         reasoning: typeof input.reasoning === "string" ? input.reasoning : "(no reasoning provided)",
         screenshot_b64: fallbackScreenshot,
+        title: typeof input.title === "string" ? input.title.trim() : "",
+        company: typeof input.company === "string" ? input.company.trim() : "",
+        description: snapshot.mainText,
+        salary: rawSalary.length > 0 ? rawSalary : null,
+        post_date: rawPostDate.length > 0 ? rawPostDate : null,
+        apply_button_url: snapshot.applyButtonUrl,
       };
       return { output: "Report received.", finalReport };
     }
@@ -356,6 +475,7 @@ export async function runAnalyzeAgent(page: Page, url: string): Promise<AnalyzeR
   ];
 
   let cachedScreenshot: string | null = null;
+  let latestSnapshot: PageSnapshot = { mainText: "", applyButtonUrl: null };
 
   for (let turn = 0; turn < MAX_TURNS; turn += 1) {
     const response = await client.messages.create({
@@ -383,7 +503,9 @@ export async function runAnalyzeAgent(page: Page, url: string): Promise<AnalyzeR
         page,
         toolUse,
         () => cachedScreenshot,
-        (b64) => { cachedScreenshot = b64; }
+        (b64) => { cachedScreenshot = b64; },
+        () => latestSnapshot,
+        (snapshot) => { latestSnapshot = snapshot; }
       );
       toolResults.push({
         type: "tool_result",

@@ -152,6 +152,8 @@ export async function ensureImageBuilt(): Promise<void> {
           "agent.ts",
           "popup.ts",
           "smartproxy.ts",
+          "resolutionProgressStore.ts",
+          "resolutionTypes.ts",
           "package.json",
           "tsconfig.json",
           "entrypoint.sh",

@@ -1,10 +1,10 @@
 import { Router, Request, Response } from "express";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { parseDate } from "chrono-node";
 import prisma from "../prismaClient.js";
-import { fetchJobListingFromUrl } from "../services/jobListingScraperService.js";
-import type { LinkedInCredentials } from "../services/jobListingScraperService.js";
+import { scrapeJobViaContainer } from "../services/smartProxyScraperService.js";
+import { findOrSpawnRunningContainer, SpawnContainerError } from "../services/managedContainerService.js";
+import { resolveApplicationUrl, createContainerProgressReporter } from "../services/applicationUrlResolverService.js";
+import type { ResolverOutcome, ResolutionTrace } from "../services/applicationUrlResolverService.js";
 import { findJobListingOrSend404 } from "./_helpers.js";
 
 const router = Router();
@@ -62,23 +62,32 @@ function parsePostDate(postDateString: string): Date {
 }
 
 /**
- * Reads the credentials file (if provided), scrapes the job listing, and updates
- * the database record with the scraped title, description, salary, and post date.
- * Does not modify the job's application status — status only tracks the application lifecycle.
- * @param {number} jobListingId - The ID of the job listing record to enrich
+ * Scrapes a job listing via the managed-container smart proxy, persists the
+ * scraped fields, and then attempts to resolve the off-platform application
+ * URL. On resolver success the application_url column is populated; on
+ * "not_found" the JobListing's status is flipped to "missing_form_url" so
+ * the UI can surface the failure and offer a Retry button.
+ *
+ * Before kicking off the resolver, an `ApplicationUrlResolutionLog` row is
+ * inserted with `outcome=null` and `managed_container_id` pointing at the
+ * supplied container — this is what the live-trace UI reads to find the
+ * in-progress attempt. The same row is UPDATEd with the terminal fields when
+ * the resolver settles.
+ *
+ * Designed to be fire-and-forget from the POST /:id/fetch route — exceptions
+ * are caught and logged so a stalled scrape never crashes the API.
+ *
+ * @param {number} jobListingId - The id of the job listing row to enrich
  * @param {string} url - The job listing URL to scrape
- * @param {string | null} credentialsPath - Absolute path to the LinkedIn credentials JSON file, or null if no login is needed
+ * @param {{ id: number; hostPort: number }} container - The chosen managed container; its id is stored on the log row and its hostPort hosts the live progress map the resolver pushes to
  */
-async function scrapeAndUpdateJobListing(jobListingId: number, url: string, credentialsPath: string | null): Promise<void> {
+async function scrapeAndUpdateJobListing(
+  jobListingId: number,
+  url: string,
+  container: { id: number; hostPort: number }
+): Promise<void> {
   try {
-    let credentials: LinkedInCredentials | null = null;
-    const hasCredentialsPath = !!credentialsPath;
-    if (hasCredentialsPath) {
-      const credentialsJson = await readFile(credentialsPath, "utf-8");
-      credentials = JSON.parse(credentialsJson) as LinkedInCredentials;
-    }
-
-    const scrapedData = await fetchJobListingFromUrl(url, credentials);
+    const scrapedData = await scrapeJobViaContainer(container.hostPort, url);
 
     const formattedTitle = scrapedData.company
       ? `${scrapedData.company} - ${scrapedData.title}`
@@ -89,13 +98,136 @@ async function scrapeAndUpdateJobListing(jobListingId: number, url: string, cred
       data: {
         title: formattedTitle,
         description: scrapedData.description,
-        salary: scrapedData.salary || null,
-        post_date: parsePostDate(scrapedData.postDate),
+        salary: scrapedData.salary,
+        post_date: scrapedData.post_date !== null ? parsePostDate(scrapedData.post_date) : new Date(),
       },
     });
-  } catch {
-    console.error(`[scraper] Failed to scrape job listing ${jobListingId} at ${url}`);
+
+    const logId = await beginResolutionLog(jobListingId, container);
+    const resolverResult = await resolveApplicationUrl({
+      originalUrl: url,
+      originalTitle: scrapedData.title,
+      originalDescription: scrapedData.description,
+      originalCompany: scrapedData.company,
+      originalApplyButtonUrl: scrapedData.apply_button_url,
+      progressReporter: createContainerProgressReporter(container.hostPort, logId),
+    });
+
+    await finalizeResolutionLog(logId, resolverResult.outcome, resolverResult.trace);
+    await applyResolverOutcomeToListing(jobListingId, resolverResult.outcome);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[scraper] Failed to scrape/resolve job listing ${String(jobListingId)} at ${url}: ${errorMessage}`);
   }
+}
+
+/**
+ * Inserts the `application_url_resolution_logs` row up-front (with
+ * outcome=null) so the live-trace UI can find this attempt while it's still
+ * running. Also POSTs `/resolution-progress/:logId/begin` to the chosen
+ * container so its in-memory progress map starts tracking under the same
+ * logId.
+ *
+ * The container `/begin` call is best-effort — a failure is logged but does
+ * not block the resolver. A row with `outcome=null` and an unreachable
+ * container is what the route's /url-resolution/live endpoint detects and
+ * surfaces as a crashed attempt.
+ *
+ * @param {number} jobListingId - The id of the JobListing this attempt belongs to
+ * @param {{ id: number; hostPort: number }} container - The chosen managed container to host the live progress map
+ * @returns {Promise<number>} The id of the newly-inserted log row
+ */
+async function beginResolutionLog(
+  jobListingId: number,
+  container: { id: number; hostPort: number }
+): Promise<number> {
+  const created = await prisma.applicationUrlResolutionLog.create({
+    data: {
+      job_listing_id: jobListingId,
+      managed_container_id: container.id,
+      outcome: null,
+      brave_results: "[]",
+      inspected_candidates: "[]",
+    },
+  });
+
+  try {
+    await fetch(`http://127.0.0.1:${String(container.hostPort)}/resolution-progress/${String(created.id)}/begin`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobListingId }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.warn(`[resolver-log] /begin POST to container failed for log=${String(created.id)}: ${errorMessage}`);
+  }
+
+  return created.id;
+}
+
+/**
+ * UPDATEs an existing `application_url_resolution_logs` row with the terminal
+ * fields the resolver produced. The row already exists (it was inserted by
+ * `beginResolutionLog`); this call settles its outcome, search query,
+ * inspected candidates, final URL, and reason. Best-effort — a failure here
+ * leaves the row in `outcome=null` state, which the live endpoint surfaces
+ * as a crashed attempt.
+ *
+ * @param {number} logId - The id of the log row to finalize (returned by beginResolutionLog)
+ * @param {ResolverOutcome} outcome - The classified resolver outcome
+ * @param {ResolutionTrace} trace - The trace produced during this invocation
+ * @returns {Promise<void>}
+ */
+async function finalizeResolutionLog(
+  logId: number,
+  outcome: ResolverOutcome,
+  trace: ResolutionTrace
+): Promise<void> {
+  try {
+    const finalApplicationUrl = outcome.outcome === "not_found" ? null : outcome.applicationUrl;
+    const reasonText = outcome.outcome === "not_found" ? outcome.reason : null;
+    await prisma.applicationUrlResolutionLog.update({
+      where: { id: logId },
+      data: {
+        outcome: outcome.outcome,
+        search_query: trace.searchQuery,
+        brave_results: JSON.stringify(trace.braveResults),
+        inspected_candidates: JSON.stringify(trace.inspectedCandidates),
+        final_application_url: finalApplicationUrl,
+        reason: reasonText,
+      },
+    });
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[resolver-log] Failed to finalize resolution log ${String(logId)}: ${errorMessage}`);
+  }
+}
+
+/**
+ * Persists a resolver outcome onto the job listing row. Sets application_url
+ * on success and flips status to "missing_form_url" on a "not_found" outcome
+ * so the UI can render the failure state and the apply gate can refuse to
+ * start an application until the user retries.
+ *
+ * @param {number} jobListingId - The id of the listing to update
+ * @param {ResolverOutcome} outcome - The classified resolver result
+ */
+async function applyResolverOutcomeToListing(jobListingId: number, outcome: ResolverOutcome): Promise<void> {
+  const isFound = outcome.outcome !== "not_found";
+  if (isFound) {
+    await prisma.jobListing.update({
+      where: { id: jobListingId },
+      data: { application_url: outcome.applicationUrl },
+    });
+    console.log(`[resolver] Job ${String(jobListingId)} application_url resolved via ${outcome.outcome}: ${outcome.applicationUrl}`);
+    return;
+  }
+  await prisma.jobListing.update({
+    where: { id: jobListingId },
+    data: { application_url: null, status: "missing_form_url" },
+  });
+  console.warn(`[resolver] Job ${String(jobListingId)} application_url not found: ${outcome.reason}`);
 }
 
 /**
@@ -150,12 +282,20 @@ router.post("/bulk", async (req: Request, res: Response) => {
 
 /**
  * POST /api/job-listings/:id/fetch
- * Triggers background scraping to enrich a job listing with title, description, salary, and post date.
- * Returns 202 immediately while the scraping runs asynchronously.
+ * Triggers background scraping (via the managed-container smart proxy) to enrich
+ * a job listing with title, description, salary, and post date, then resolves
+ * the off-platform application URL.
+ *
+ * Auto-spawns a managed container when none is running so the user never has
+ * to spawn one manually before clicking Fetch Data. The spawn is synchronous —
+ * the route blocks until the container is up (typically ~10s warm, ~30s+ cold)
+ * before returning 202 — so callers know whether to expect data or an error.
+ *
  * @param {number} req.params.id - The ID of the job listing to fetch data for
  * @returns {object} 202 - The current job listing record (data will update once scraping completes)
  * @returns {object} 400 - Invalid id parameter error
  * @returns {object} 404 - Job listing not found error
+ * @returns {object} 503 - Auto-spawn failed and no running container could be obtained
  */
 router.post("/:id/fetch", async (req: Request, res: Response) => {
   const jobListing = await findJobListingOrSend404(req, res);
@@ -163,18 +303,224 @@ router.post("/:id/fetch", async (req: Request, res: Response) => {
     return;
   }
 
+  let container: { id: number; hostPort: number };
+  try {
+    container = await findOrSpawnRunningContainer();
+  } catch (err) {
+    const errorMessage = err instanceof SpawnContainerError ? err.message : err instanceof Error ? err.message : String(err);
+    console.error(`[fetch] auto-spawn failed for job ${String(jobListing.id)}: ${errorMessage}`);
+    res.status(503).json({ error: `Could not obtain a managed container: ${errorMessage}` });
+    return;
+  }
+
   res.status(202).json(jobListing);
 
-  const parsedUrl = new URL(jobListing.url);
-  const isLinkedInUrl = parsedUrl.hostname === "linkedin.com" || parsedUrl.hostname.endsWith(".linkedin.com");
-  const credentialsPath = isLinkedInUrl
-    ? resolve(__dirname, "../scripts/linkedin_credentials.json")
-    : null;
-
-  scrapeAndUpdateJobListing(jobListing.id, jobListing.url, credentialsPath).catch(() => {
+  scrapeAndUpdateJobListing(jobListing.id, jobListing.url, container).catch(() => {
     /* error already handled inside scrapeAndUpdateJobListing */
   });
 });
+
+/**
+ * POST /api/job-listings/:id/resolve-application-url
+ * Re-runs the application-URL resolver against the persisted DB fields for a
+ * job listing whose initial resolution failed. Reads the stored title +
+ * description + url and runs the resolver without an apply_button_url hint
+ * (so the resolver re-scrapes the original URL to inspect its apply button).
+ *
+ * Returns 202 immediately and runs the resolver async; the row updates when
+ * the resolver completes. The UI polls and reflects the new state.
+ *
+ * @param {number} req.params.id - The ID of the job listing to retry resolution for
+ * @returns {object} 202 - The current job listing record (will update once resolution completes)
+ * @returns {object} 400 - Invalid id parameter error or missing scraped title/description (run /fetch first)
+ * @returns {object} 404 - Job listing not found error
+ * @returns {object} 503 - No running managed container available to perform the resolution
+ */
+router.post("/:id/resolve-application-url", async (req: Request, res: Response) => {
+  const jobListing = await findJobListingOrSend404(req, res);
+  if (jobListing === null) {
+    return;
+  }
+
+  const hasNoScrapedFields =
+    !jobListing.title || jobListing.title.length === 0 ||
+    !jobListing.description || jobListing.description.length === 0;
+  if (hasNoScrapedFields) {
+    res.status(400).json({ error: "Job listing has not been scraped yet. Run POST /:id/fetch first." });
+    return;
+  }
+
+  let container: { id: number; hostPort: number };
+  try {
+    container = await findOrSpawnRunningContainer();
+  } catch (err) {
+    const errorMessage = err instanceof SpawnContainerError ? err.message : err instanceof Error ? err.message : String(err);
+    console.error(`[resolver:retry] auto-spawn failed for job ${String(jobListing.id)}: ${errorMessage}`);
+    res.status(503).json({ error: `Could not obtain a managed container: ${errorMessage}` });
+    return;
+  }
+
+  // Synchronously insert the in-progress log row BEFORE returning 202 so the
+  // frontend (which navigates to /jobs/:id/url-resolution as soon as this
+  // returns) can find the attempt on its very first poll. Without this, the
+  // trace page would 404 in the brief window before the async resolver
+  // started writing.
+  const logId = await beginResolutionLog(jobListing.id, container);
+
+  res.status(202).json({ ...jobListing, latest_resolution_log_id: logId });
+
+  // Narrowing — hasNoScrapedFields guard above guarantees these are non-null/non-empty.
+  runResolverForExistingListing(jobListing.id, jobListing.url, jobListing.title!, jobListing.description!, container, logId).catch(() => {
+    /* error already handled inside runResolverForExistingListing */
+  });
+});
+
+/**
+ * Runs the application-URL resolver for a listing that's already been scraped.
+ * Used by POST /:id/resolve-application-url so the retry path doesn't re-scrape
+ * fields the user has already seen. Wraps the resolver in a try/catch so any
+ * unexpected failure is logged rather than thrown into an async void.
+ *
+ * The retry route inserts the `ApplicationUrlResolutionLog` row synchronously
+ * before returning 202 (so the frontend's trace page never 404s on the first
+ * poll); this function receives that row's id, runs the resolver with a
+ * progressReporter wired to the same container/logId, and UPDATEs the row
+ * with the terminal fields when the resolver settles.
+ *
+ * @param {number} jobListingId - The id of the listing to update
+ * @param {string} url - The original (Indeed/LinkedIn) URL
+ * @param {string} formattedTitle - The persisted formatted title ("Company - Role"); the company prefix is stripped before passing to the resolver so title-match comparisons stay accurate
+ * @param {string} description - The persisted description text
+ * @param {{ id: number; hostPort: number }} container - The chosen managed container hosting the live progress map
+ * @param {number} logId - The pre-inserted ApplicationUrlResolutionLog row id this attempt belongs to
+ */
+async function runResolverForExistingListing(
+  jobListingId: number,
+  url: string,
+  formattedTitle: string,
+  description: string,
+  container: { id: number; hostPort: number },
+  logId: number
+): Promise<void> {
+  try {
+    const { company, title } = splitFormattedTitle(formattedTitle);
+    const resolverResult = await resolveApplicationUrl({
+      originalUrl: url,
+      originalTitle: title,
+      originalDescription: description,
+      originalCompany: company,
+      // No apply-button hint — let the resolver re-scrape the original URL.
+      progressReporter: createContainerProgressReporter(container.hostPort, logId),
+    });
+    await finalizeResolutionLog(logId, resolverResult.outcome, resolverResult.trace);
+    await applyResolverOutcomeToListing(jobListingId, resolverResult.outcome);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[resolver:retry] Failed for job listing ${String(jobListingId)}: ${errorMessage}`);
+  }
+}
+
+/**
+ * GET /api/job-listings/:id/resolution-logs
+ * Returns every resolver attempt for this job listing, latest first. The two
+ * JSON columns (brave_results, inspected_candidates) are parsed on the server
+ * so the client never has to double-parse.
+ *
+ * @param {number} req.params.id - The ID of the job listing
+ * @returns {object[]} 200 - Array of parsed resolution-log rows, newest first
+ * @returns {object} 400 - Invalid id parameter
+ * @returns {object} 404 - Job listing not found
+ */
+router.get("/:id/resolution-logs", async (req: Request, res: Response) => {
+  const jobListing = await findJobListingOrSend404(req, res);
+  if (jobListing === null) {
+    return;
+  }
+  const rows = await prisma.applicationUrlResolutionLog.findMany({
+    where: { job_listing_id: jobListing.id },
+    orderBy: { created_date: "desc" },
+  });
+  const parsed = rows.map(parseResolutionLogRow);
+  res.json(parsed);
+});
+
+/**
+ * Shape of a resolution-log row after the two JSON columns have been parsed.
+ * Returned by GET /:id/resolution-logs. `outcome` is null while the resolver
+ * attempt is still running (the row was inserted up-front so the live-trace
+ * UI can find it); it is populated to a terminal value on finalize.
+ */
+export interface ParsedResolutionLog {
+  id: number;
+  job_listing_id: number;
+  managed_container_id: number | null;
+  outcome: string | null;
+  search_query: string | null;
+  brave_results: unknown[];
+  inspected_candidates: unknown[];
+  final_application_url: string | null;
+  reason: string | null;
+  created_date: Date;
+}
+
+/**
+ * Type alias for a raw `ApplicationUrlResolutionLog` row as returned by
+ * `prisma.applicationUrlResolutionLog.findMany`. Derived rather than hand-rolled
+ * so it stays in sync with the generated client.
+ */
+type ResolutionLogRow = Awaited<ReturnType<typeof prisma.applicationUrlResolutionLog.findMany>>[number];
+
+/**
+ * Parses the two text-as-JSON columns from a single resolution-log row.
+ * Tolerates malformed JSON by falling back to an empty array, so a single
+ * corrupted historical row never breaks the entire list response.
+ *
+ * @param {ResolutionLogRow} row - The raw row from Prisma
+ * @returns {ParsedResolutionLog} The row with the JSON columns parsed
+ */
+export function parseResolutionLogRow(row: ResolutionLogRow): ParsedResolutionLog {
+  const safeParse = (raw: string): unknown[] => {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  return {
+    id: row.id,
+    job_listing_id: row.job_listing_id,
+    managed_container_id: row.managed_container_id,
+    outcome: row.outcome,
+    search_query: row.search_query,
+    brave_results: safeParse(row.brave_results),
+    inspected_candidates: safeParse(row.inspected_candidates),
+    final_application_url: row.final_application_url,
+    reason: row.reason,
+    created_date: row.created_date,
+  };
+}
+
+/**
+ * Splits a stored "Company - Title" formatted title back into its parts so
+ * the resolver gets a clean job title (which the match step normalizes and
+ * compares against candidate-page titles). Falls back to treating the whole
+ * string as the title when no separator is present.
+ *
+ * @param {string} formattedTitle - Either "Company - Title" or just "Title"
+ * @returns {{ company: string; title: string }} Best-effort split; company is empty when no separator exists
+ */
+export function splitFormattedTitle(formattedTitle: string): { company: string; title: string } {
+  const separatorIndex = formattedTitle.indexOf(" - ");
+  const hasNoSeparator = separatorIndex === -1;
+  if (hasNoSeparator) {
+    return { company: "", title: formattedTitle };
+  }
+  return {
+    company: formattedTitle.slice(0, separatorIndex).trim(),
+    title: formattedTitle.slice(separatorIndex + 3).trim(),
+  };
+}
 
 /**
  * GET /api/job-listings
@@ -191,9 +537,14 @@ router.get("/", async (_req: Request, res: Response) => {
 
 /**
  * GET /api/job-listings/:id
- * Retrieves a single job listing by its ID.
+ * Retrieves a single job listing by its ID, augmented with a
+ * `resolution_in_progress` boolean computed from the latest
+ * ApplicationUrlResolutionLog row (true when its `outcome` is null). The
+ * JobViewPage uses this flag to swap its Retry button for a "View Resolution
+ * Progress" link without needing a second request.
+ *
  * @param {number} req.params.id - The ID of the job listing
- * @returns {object} 200 - The job listing
+ * @returns {object} 200 - The job listing fields + `resolution_in_progress: boolean`
  * @returns {object} 404 - Job listing not found error
  */
 router.get("/:id", async (req: Request, res: Response) => {
@@ -201,8 +552,251 @@ router.get("/:id", async (req: Request, res: Response) => {
   if (jobListing === null) {
     return;
   }
-  res.json(jobListing);
+  const latestLog = await prisma.applicationUrlResolutionLog.findFirst({
+    where: { job_listing_id: jobListing.id },
+    orderBy: { created_date: "desc" },
+    select: { id: true, outcome: true },
+  });
+  const isResolutionInProgress = latestLog !== null && latestLog.outcome === null;
+  res.json({
+    ...jobListing,
+    resolution_in_progress: isResolutionInProgress,
+    latest_resolution_log_id: latestLog?.id ?? null,
+  });
 });
+
+/**
+ * GET /api/job-listings/:id/url-resolution/live
+ * Returns the live trace for the latest application-URL resolution attempt
+ * on this job. Used by the admin UrlResolutionTracePage which polls this
+ * endpoint every ~1s while the attempt is running and falls through to the
+ * final synthesized payload once it terminates.
+ *
+ * Three response shapes:
+ *  - 404 when no resolution attempt has been recorded yet.
+ *  - In-progress (outcome=null in the log row): proxies the container's
+ *    /resolution-progress/:logId GET. If the container can't be reached or
+ *    has no entry, returns a synthesized "crashed" terminal payload so the
+ *    page exits its polling loop.
+ *  - Terminal (outcome non-null): returns a synthesized LiveProgress built
+ *    from the durable log fields, so the trace page still renders after the
+ *    container's in-memory entry expires.
+ *
+ * @param {number} req.params.id - The ID of the job listing
+ * @returns {object} 200 - The live progress JSON (in-progress or synthesized terminal)
+ * @returns {object} 404 - No resolution attempts found for this job
+ */
+router.get("/:id/url-resolution/live", async (req: Request, res: Response) => {
+  const jobListing = await findJobListingOrSend404(req, res);
+  if (jobListing === null) {
+    return;
+  }
+  const latestLog = await prisma.applicationUrlResolutionLog.findFirst({
+    where: { job_listing_id: jobListing.id },
+    orderBy: { created_date: "desc" },
+  });
+  if (latestLog === null) {
+    res.status(404).json({ error: "No resolution attempts found for this job" });
+    return;
+  }
+
+  const isStillRunning = latestLog.outcome === null;
+  if (isStillRunning) {
+    const container = latestLog.managed_container_id === null
+      ? null
+      : await prisma.managedContainer.findUnique({ where: { id: latestLog.managed_container_id }, select: { hostPort: true } });
+    if (container === null) {
+      res.json(buildCrashedLiveProgressPayload(latestLog.id, jobListing.id, latestLog.created_date.toISOString(), "Resolution attempt is missing its managed container; cannot fetch live progress."));
+      return;
+    }
+    try {
+      const upstream = await fetch(`http://127.0.0.1:${String(container.hostPort)}/resolution-progress/${String(latestLog.id)}`, {
+        method: "GET",
+        signal: AbortSignal.timeout(5000),
+      });
+      if (upstream.ok) {
+        const live = await upstream.json() as unknown;
+        res.json(live);
+        return;
+      }
+      if (upstream.status === 404) {
+        res.json(buildCrashedLiveProgressPayload(latestLog.id, jobListing.id, latestLog.created_date.toISOString(), "Container did not return live progress; the process may have crashed."));
+        return;
+      }
+      res.json(buildCrashedLiveProgressPayload(latestLog.id, jobListing.id, latestLog.created_date.toISOString(), `Container returned status ${String(upstream.status)}; cannot fetch live progress.`));
+      return;
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      res.json(buildCrashedLiveProgressPayload(latestLog.id, jobListing.id, latestLog.created_date.toISOString(), `Container unreachable: ${errorMessage}`));
+      return;
+    }
+  }
+
+  // Terminal — synthesize a LiveProgress from the persisted log row.
+  res.json(buildTerminalLiveProgressFromLog(latestLog, jobListing.id));
+});
+
+/**
+ * Builds a "crashed terminal" LiveProgress payload used when the resolver's
+ * log row still has outcome=null but its container can't be reached or no
+ * longer has the progress entry in memory. Lets the trace page exit its
+ * polling loop with a clear reason rather than spinning indefinitely.
+ *
+ * @param {number} logId - The id of the log row this payload describes
+ * @param {number} jobListingId - The job listing id the attempt was for
+ * @param {string} startedAt - ISO timestamp of when the attempt was recorded
+ * @param {string} reason - Free-text reason to surface in the UI
+ * @returns {object} A LiveProgress-shaped object with isFinished=true and finalOutcome=null
+ */
+function buildCrashedLiveProgressPayload(
+  logId: number,
+  jobListingId: number,
+  startedAt: string,
+  reason: string
+): {
+  logId: number;
+  jobListingId: number;
+  isFinished: boolean;
+  startedAt: string;
+  finishedAt: string;
+  steps: unknown[];
+  finalOutcome: null;
+  finalApplicationUrl: null;
+  reason: string;
+} {
+  return {
+    logId,
+    jobListingId,
+    isFinished: true,
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    steps: [],
+    finalOutcome: null,
+    finalApplicationUrl: null,
+    reason,
+  };
+}
+
+/**
+ * Synthesizes a LiveProgress payload from a finalized log row so the trace
+ * page can still render the final state long after the container has evicted
+ * the in-memory entry. Step entries are derived from the persisted Brave
+ * results and inspected-candidate verdicts so admins still see a meaningful
+ * timeline post-eviction.
+ *
+ * @param {ResolutionLogRow} row - The terminal log row
+ * @param {number} jobListingId - The job listing id this attempt was for
+ * @returns {object} A LiveProgress-shaped object derived from the persisted fields
+ */
+function buildTerminalLiveProgressFromLog(
+  row: ResolutionLogRow,
+  jobListingId: number
+): {
+  logId: number;
+  jobListingId: number;
+  isFinished: boolean;
+  startedAt: string;
+  finishedAt: string;
+  steps: Array<{
+    stepIndex: number;
+    phase: string;
+    status: string;
+    message: string;
+    payload: Record<string, unknown>;
+    startedAt: string;
+    endedAt: string;
+    durationMs: number | null;
+  }>;
+  finalOutcome: string | null;
+  finalApplicationUrl: string | null;
+  reason: string | null;
+} {
+  const startedAt = row.created_date.toISOString();
+  const parsedBraveResults: unknown[] = (() => {
+    try {
+      const parsed: unknown = JSON.parse(row.brave_results);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })();
+  const parsedInspectedCandidates: unknown[] = (() => {
+    try {
+      const parsed: unknown = JSON.parse(row.inspected_candidates);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })();
+
+  const syntheticSteps: Array<{
+    stepIndex: number;
+    phase: string;
+    status: string;
+    message: string;
+    payload: Record<string, unknown>;
+    startedAt: string;
+    endedAt: string;
+    durationMs: number | null;
+  }> = [];
+  let stepIndex = 0;
+
+  if (row.search_query !== null) {
+    syntheticSteps.push({
+      stepIndex: stepIndex++,
+      phase: "brave_search",
+      status: "succeeded",
+      message: `Brave query: "${row.search_query}" returned ${String(parsedBraveResults.length)} result(s)`,
+      payload: { query: row.search_query, results: parsedBraveResults, resultCount: parsedBraveResults.length },
+      startedAt,
+      endedAt: startedAt,
+      durationMs: null,
+    });
+  }
+
+  for (const candidate of parsedInspectedCandidates) {
+    const candidateRecord = candidate as { url?: unknown; scrapedTitle?: unknown; matched?: unknown; rejectionReason?: unknown };
+    const url = typeof candidateRecord.url === "string" ? candidateRecord.url : "(unknown)";
+    const scrapedTitle = typeof candidateRecord.scrapedTitle === "string" ? candidateRecord.scrapedTitle : "";
+    const matched = candidateRecord.matched === true;
+    const rejectionReason = typeof candidateRecord.rejectionReason === "string" ? candidateRecord.rejectionReason : "";
+    syntheticSteps.push({
+      stepIndex: stepIndex++,
+      phase: "candidate_evaluate",
+      status: matched ? "succeeded" : "skipped",
+      message: matched ? `Match accepted: ${rejectionReason}` : `Match rejected: ${rejectionReason}`,
+      payload: { url, scrapedTitle, matched, reason: rejectionReason },
+      startedAt,
+      endedAt: startedAt,
+      durationMs: null,
+    });
+  }
+
+  // row.outcome is non-null in this branch — the caller only invokes
+  // buildTerminalLiveProgressFromLog when the log row has terminated.
+  syntheticSteps.push({
+    stepIndex,
+    phase: "finalize",
+    status: "succeeded",
+    message: row.reason ?? `Outcome: ${String(row.outcome)}`,
+    payload: { outcome: row.outcome, applicationUrl: row.final_application_url, reason: row.reason },
+    startedAt,
+    endedAt: startedAt,
+    durationMs: null,
+  });
+
+  return {
+    logId: row.id,
+    jobListingId,
+    isFinished: true,
+    startedAt,
+    finishedAt: startedAt,
+    steps: syntheticSteps,
+    finalOutcome: row.outcome,
+    finalApplicationUrl: row.final_application_url,
+    reason: row.reason,
+  };
+}
 
 /**
  * DELETE /api/job-listings/:id
@@ -224,4 +818,4 @@ router.delete("/:id", async (req: Request, res: Response) => {
   res.json(deletedJobListing);
 });
 
-export { router as jobListingsRouter, scrapeAndUpdateJobListing, parsePostDate };
+export { router as jobListingsRouter, scrapeAndUpdateJobListing, parsePostDate, applyResolverOutcomeToListing };

@@ -509,6 +509,12 @@ describe("POST /api/managed-containers/:id/analyze", () => {
     description_signals: ["Responsibilities", "Full-time", "Remote"],
     reasoning: "Page has an Apply button and matching description sections.",
     screenshot_b64: "iVBORw0KGgo=",
+    title: "Software Engineer",
+    company: "Acme Corp",
+    description: "We are hiring a Software Engineer to build things.",
+    salary: "$120,000-$150,000/yr",
+    post_date: "2 hours ago",
+    apply_button_url: "https://acme.com/jobs/123/apply",
   };
 
   it("returns 400 when id is not a number", async () => {

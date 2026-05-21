@@ -3,6 +3,7 @@ import NavMenu from "./components/NavMenu";
 import AddJobPage from "./pages/AddJobPage";
 import JobsListPage from "./pages/JobsListPage";
 import JobViewPage from "./pages/JobViewPage";
+import UrlResolutionTracePage from "./pages/UrlResolutionTracePage";
 import ApplicationDashboardPage from "./pages/ApplicationDashboardPage";
 import ContainersListPage from "./pages/ContainersListPage";
 import ContainerViewPage from "./pages/ContainerViewPage";
@@ -13,6 +14,7 @@ import ContainerViewPage from "./pages/ContainerViewPage";
  *   / — Add a new job listing
  *   /jobs — View all job listings
  *   /jobs/:id — View a single job listing
+ *   /jobs/:id/url-resolution — Admin-facing live trace of the application-URL resolver
  *   /apply — Application dashboard for applying to jobs
  *   /containers — List + spawn managed Docker containers (create is inline)
  *   /containers/:id — View a single managed container with health-check ping
@@ -25,6 +27,7 @@ function App() {
         <Route path="/" element={<AddJobPage />} />
         <Route path="/jobs" element={<JobsListPage />} />
         <Route path="/jobs/:id" element={<JobViewPage />} />
+        <Route path="/jobs/:id/url-resolution" element={<UrlResolutionTracePage />} />
         <Route path="/apply" element={<ApplicationDashboardPage />} />
         <Route path="/containers" element={<ContainersListPage />} />
         <Route path="/containers/:id" element={<ContainerViewPage />} />

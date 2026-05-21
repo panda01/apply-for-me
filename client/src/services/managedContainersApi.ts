@@ -96,6 +96,12 @@ export interface AnalyzeResponse {
   description_signals: string[];
   reasoning: string;
   screenshot_b64: string;
+  title: string;
+  company: string;
+  description: string;
+  salary: string | null;
+  post_date: string | null;
+  apply_button_url: string | null;
 }
 
 /**

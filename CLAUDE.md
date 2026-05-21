@@ -1,6 +1,7 @@
 If a command doesn't work or something doesn't go as expected, ask the user what to do. Do not just make decisions beyond the very explicit ones given to you
 
 # Workflow
+- CRITICAL: Never say your work is done without confirming your changes worked, if you do not know how to check your changes ask the user how you should check if your changes actually worked as intended.
 - CRITICAL: Always write the intent of functions in a the comments with params in a jsdoc format. Also write the intent for any api routes in the server also in this format with the params defined. If you change a function, and there is no jsdoc, be sure to add it.
 - CRITICAL: When creating api routes, always write the intention of the api route above it with the proper jsdoc. Also be sure that all requests that use 
 - CRITICAL: When importing components avoiding using the whole default imported object. Where possible import only the necessary parts of the module. If the module doesn't have type definitions look for the "Definitely Typed" package, install it and use the definitions from there. If no types can be found use another package, unless the user asked specifically for that package, in which case stop, and suggest the user options, and ask what they would like to use.

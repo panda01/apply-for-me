@@ -47,12 +47,15 @@ describe("JobsListPage", () => {
         id: 1,
         title: "Acme Corp - Software Engineer",
         url: "https://linkedin.com/jobs/1",
+        application_url: null,
         description: "Build cool stuff",
         salary: null,
         post_date: "2026-03-01T00:00:00.000Z",
         created_date: "2026-03-07T00:00:00.000Z",
         status: "init",
         live_url: null,
+        resolution_in_progress: false,
+        latest_resolution_log_id: null,
       },
     ]);
 
@@ -108,12 +111,15 @@ describe("JobsListPage", () => {
       id: 1,
       title: "",
       url: "https://linkedin.com/jobs/1",
+      application_url: null,
       description: "",
       salary: null,
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
       status: "applying",
       live_url: null,
+      resolution_in_progress: false,
+      latest_resolution_log_id: null,
     };
 
     const completedListing = {
@@ -150,12 +156,15 @@ describe("JobsListPage", () => {
       id: 1,
       title: "Acme Corp - Engineer",
       url: "https://linkedin.com/jobs/1",
+      application_url: null,
       description: "Build stuff",
       salary: null,
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
       status: "applied",
       live_url: null,
+      resolution_in_progress: false,
+      latest_resolution_log_id: null,
     };
 
     vi.mocked(getJobListings).mockResolvedValue([completedListing]);

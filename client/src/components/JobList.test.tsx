@@ -15,36 +15,45 @@ const mockCompletedListing: JobListingResponse = {
   id: 1,
   title: "Acme Corp - Software Engineer",
   url: "https://linkedin.com/jobs/1",
+  application_url: null,
   description: "Build cool stuff with great teams",
   salary: null,
   status: "init",
   live_url: null,
   post_date: "2026-03-01T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
+  resolution_in_progress: false,
+  latest_resolution_log_id: null,
 };
 
 const mockApplyingListing: JobListingResponse = {
   id: 2,
   title: "",
   url: "https://linkedin.com/jobs/2",
+  application_url: null,
   description: "",
   salary: null,
   status: "applying",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
+  resolution_in_progress: false,
+  latest_resolution_log_id: null,
 };
 
 const mockErrorListing: JobListingResponse = {
   id: 3,
   title: "",
   url: "https://linkedin.com/jobs/3",
+  application_url: null,
   description: "",
   salary: null,
   status: "error_applying",
   live_url: null,
   post_date: "2026-03-07T00:00:00.000Z",
   created_date: "2026-03-07T00:00:00.000Z",
+  resolution_in_progress: false,
+  latest_resolution_log_id: null,
 };
 
 beforeEach(() => {

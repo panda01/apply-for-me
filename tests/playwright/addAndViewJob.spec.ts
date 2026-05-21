@@ -28,9 +28,10 @@ test.describe("Add and View Job Flow", () => {
     // Should show "Untitled" since no data has been fetched
     await expect(page.getByText("Untitled")).toBeVisible();
 
-    // Should show both action buttons
+    // Should show the Fetch Data button. Apply is intentionally hidden until
+    // the resolver populates application_url (the new apply gate).
     await expect(page.getByRole("button", { name: /Fetch Data/ })).toBeVisible();
-    await expect(page.getByRole("button", { name: /Apply/ })).toBeVisible();
+    await expect(page.getByRole("button", { name: /^Apply$/ })).toHaveCount(0);
 
     // Should show the "no details yet" message
     await expect(page.getByText(/No job details yet/)).toBeVisible();
