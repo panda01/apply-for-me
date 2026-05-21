@@ -16,10 +16,23 @@
  *      outcome = "resolved_via_redirect", application_url = the apply
  *      button URL.
  *
- *   3. Otherwise, web-search for "{company} {title}", inspect each non-
- *      linkedin/indeed candidate with the smart proxy, and accept the first
- *      one whose scraped title + description match the original (via
- *      jobMatchService). Outcome = "resolved_via_search".
+ *   3. Otherwise, web-search for "{company} {title}". Every non-gated Brave
+ *      result is sent to {@link classifyPages}, which labels each as either
+ *      direct_job_listing, careers_page, or irrelevant. Two ordered sweeps
+ *      follow, both gated by the existing jobMatchService:
+ *
+ *        a. Fuzzy-rank the direct_job_listing subset by snippet vs target
+ *           title, then iterate scrape + evaluate. First match wins →
+ *           outcome = "resolved_via_search".
+ *        b. If none match, fuzzy-rank the careers_page subset, drill into
+ *           each via careersPageHarvesterService (extract anchors,
+ *           fuzzy-match to target title, keep top-K on-domain hrefs), then
+ *           iterate scrape + evaluate on those hrefs. First match →
+ *           outcome = "resolved_via_careers_page".
+ *
+ *      The total number of scrape+evaluate operations across both sweeps is
+ *      capped by MAX_SEARCH_CANDIDATES_TO_INSPECT so worst-case latency
+ *      remains bounded.
  *
  *   4. If no candidate matches → outcome = "not_found", application_url =
  *      null. The caller flips the JobListing's status to "missing_form_url"
@@ -35,6 +48,14 @@
 import { searchWeb, type BraveSearchResult } from "./braveSearchService.js";
 import { evaluateJobMatch } from "./jobMatchService.js";
 import { scrapeJobViaContainer, findFirstRunningContainer } from "./smartProxyScraperService.js";
+import {
+  classifyPages,
+  PageClassifierProtocolError,
+  type BraveCandidateInput,
+  type ClassifiedCandidate,
+} from "./aiPageClassifierService.js";
+import { rankByFuzzyScore } from "./fuzzyMatchService.js";
+import { harvestCareersPage } from "./careersPageHarvesterService.js";
 
 /**
  * Identifies each distinct phase the resolver runs through. The string values
@@ -51,6 +72,14 @@ export enum ResolutionPhase {
   ApplyButtonDecision = "apply_button_decision",
   BuildQuery = "build_query",
   BraveSearch = "brave_search",
+  /** AI classifies each non-gated Brave result as direct_job_listing / careers_page / irrelevant. One Anthropic call per resolver attempt. */
+  AIPageClassify = "ai_page_classify",
+  /** Code-side fuzzy ranking (no threshold) of the direct_job_listing subset by snippet-vs-target-title. Determines scrape order. */
+  FuzzyRankDirectListings = "fuzzy_rank_direct_listings",
+  /** Code-side fuzzy ranking (no threshold) of the careers_page subset by snippet-vs-target-title. Determines harvest order. */
+  FuzzyRankCareersPages = "fuzzy_rank_careers_pages",
+  /** Drill into a single classified careers page: extract <a> tags via the container, fuzzy-match against the target title, keep top-K hrefs. */
+  CareersPageHarvest = "careers_page_harvest",
   CandidateScrape = "candidate_scrape",
   CandidateEvaluate = "candidate_evaluate",
   Finalize = "finalize",
@@ -80,19 +109,31 @@ const GATED_HOSTS = ["linkedin.com", "indeed.com"];
  * Maximum number of search candidates the resolver will smart-proxy-scrape
  * before giving up. Each candidate costs an /analyze call (several seconds
  * + an LLM round-trip + possibly Smartproxy fees), so the cap keeps total
- * latency bounded.
+ * latency bounded. Applied across BOTH the direct-listing sweep and any
+ * careers-page-harvested href sweep — once N total candidates have been
+ * scraped (matched or not), the resolver stops.
  */
 const MAX_SEARCH_CANDIDATES_TO_INSPECT = 5;
 
 /**
- * Discriminated union representing the four resolver outcomes. Callers use
+ * Maximum number of careers pages the resolver will drill into during the
+ * Step 7 careers-page sweep. Each careers page costs one /extract-links
+ * navigation; this cap prevents a long classified-careers-page list from
+ * blowing up resolver latency. Per-page hrefs are independently capped by
+ * the harvester's FUZZY_MATCH_TOP_K.
+ */
+const MAX_CAREERS_PAGES_TO_HARVEST = 3;
+
+/**
+ * Discriminated union representing the five resolver outcomes. Callers use
  * this to decide whether to update the JobListing's status (only on
- * "not_found") or just write application_url (on the three success cases).
+ * "not_found") or just write application_url (on the four success cases).
  */
 export type ResolverOutcome =
   | { outcome: "direct"; applicationUrl: string }
   | { outcome: "resolved_via_redirect"; applicationUrl: string }
   | { outcome: "resolved_via_search"; applicationUrl: string }
+  | { outcome: "resolved_via_careers_page"; applicationUrl: string }
   | { outcome: "not_found"; reason: string };
 
 /**
@@ -407,64 +448,242 @@ export async function resolveApplicationUrl(input: ResolverInput): Promise<Resol
   console.log(`[resolver] brave returned=${String(trace.braveResults.length)} result(s)`);
   await safeEndStep(reporter, braveSearchStepIndex, StepStatus.Succeeded, `Brave returned ${String(trace.braveResults.length)} result(s)`, { resultCount: trace.braveResults.length, results: trace.braveResults, durationMs: Date.now() - braveStartedAt });
 
-  // Phases: CandidateScrape + CandidateEvaluate — one pair per inspected candidate.
-  for (const candidate of trace.braveResults) {
-    if (trace.inspectedCandidates.length >= MAX_SEARCH_CANDIDATES_TO_INSPECT) break;
+  // Pre-filter Brave results: drop malformed URLs and gated hosts (linkedin/
+  // indeed) before classification so we don't burn LLM tokens on candidates
+  // the resolver can never adopt anyway.
+  const eligibleBraveResults: BraveSearchResult[] = trace.braveResults.filter((result) => {
+    const host = tryGetHostname(result.url);
+    if (host === null) return false;
+    if (isGatedHost(host)) return false;
+    return true;
+  });
 
-    const candidateHost = tryGetHostname(candidate.url);
-    if (candidateHost === null) continue;
-    if (isGatedHost(candidateHost)) continue;
-
-    const candidateNumber = trace.inspectedCandidates.length + 1;
-    const candidateScrapeStepIndex = await safeStartStep(reporter, ResolutionPhase.CandidateScrape, `Scraping candidate ${String(candidateNumber)}: ${candidate.url}`, { url: candidate.url, candidateNumber });
-    const candidateScrapeStartedAt = Date.now();
-    let candidateScrapedTitle = "";
+  // Phase: AIPageClassify — one Anthropic call labels each eligible Brave
+  // result as direct_job_listing / careers_page / irrelevant. Empty result
+  // set short-circuits the call (no point spending tokens to learn that an
+  // empty list classifies to an empty list).
+  const aiClassifyStepIndex = await safeStartStep(reporter, ResolutionPhase.AIPageClassify, `Classifying ${String(eligibleBraveResults.length)} eligible Brave result(s)`, { eligibleCount: eligibleBraveResults.length });
+  let classifications: ClassifiedCandidate[] = [];
+  if (eligibleBraveResults.length === 0) {
+    await safeEndStep(reporter, aiClassifyStepIndex, StepStatus.Skipped, "No eligible Brave results to classify", { eligibleCount: 0 });
+  } else {
+    const classifyStartedAt = Date.now();
+    const candidatesForClassifier: BraveCandidateInput[] = eligibleBraveResults.map((result, index) => ({
+      index,
+      title: result.title,
+      snippet: result.description,
+      url: result.url,
+    }));
     try {
-      const candidateScrape = await scrapeJobViaContainer(container.hostPort, candidate.url);
-      candidateScrapedTitle = candidateScrape.title;
-      await safeEndStep(reporter, candidateScrapeStepIndex, StepStatus.Succeeded, `Scraped title: "${candidateScrape.title}"`, { url: candidate.url, scrapedTitle: candidateScrape.title, scrapedDescription: candidateScrape.description, durationMs: Date.now() - candidateScrapeStartedAt });
-
-      const candidateEvaluateStepIndex = await safeStartStep(reporter, ResolutionPhase.CandidateEvaluate, `Evaluating match for candidate ${String(candidateNumber)}`, { url: candidate.url, scrapedTitle: candidateScrape.title });
-      const verdict = evaluateJobMatch({
-        originalTitle: input.originalTitle,
-        originalDescription: input.originalDescription,
-        candidateTitle: candidateScrape.title,
-        candidateDescription: candidateScrape.description,
+      const classifierResult = await classifyPages({
+        targetTitle: input.originalTitle,
+        targetCompany: input.originalCompany,
+        targetDescription: input.originalDescription,
+        candidates: candidatesForClassifier,
       });
-      trace.inspectedCandidates.push({
-        url: candidate.url,
-        scrapedTitle: candidateScrape.title,
-        matched: verdict.matched,
-        rejectionReason: verdict.reason,
-      });
-      console.log(`[resolver] candidate=${candidate.url} scrapedTitle="${candidateScrape.title}" verdict=${verdict.matched ? "accept" : "reject"} reason="${verdict.reason}"`);
-      await safeEndStep(reporter, candidateEvaluateStepIndex, verdict.matched ? StepStatus.Succeeded : StepStatus.Skipped, verdict.matched ? `Match accepted: ${verdict.reason}` : `Match rejected: ${verdict.reason}`, { matched: verdict.matched, reason: verdict.reason });
-      if (verdict.matched) {
-        await safeFinalize(reporter, "resolved_via_search", candidate.url, null);
-        return { outcome: { outcome: "resolved_via_search", applicationUrl: candidate.url }, trace };
-      }
+      classifications = classifierResult.classifications;
+      await safeEndStep(reporter, aiClassifyStepIndex, StepStatus.Succeeded, `Classified ${String(classifications.length)} result(s)`, { classifications, durationMs: Date.now() - classifyStartedAt });
     } catch (err) {
-      // One bad candidate shouldn't abort the search — record the failure
-      // verbatim in the trace and move on to the next.
       const errorMessage = err instanceof Error ? err.message : String(err);
-      trace.inspectedCandidates.push({
-        url: candidate.url,
-        scrapedTitle: candidateScrapedTitle,
-        matched: false,
-        rejectionReason: `scrape failed: ${errorMessage}`,
+      const isProtocolError = err instanceof PageClassifierProtocolError;
+      console.warn(`[resolver] AI page classifier failed (${isProtocolError ? "protocol" : "transport"}): ${errorMessage}`);
+      await safeEndStep(reporter, aiClassifyStepIndex, StepStatus.Failed, `AI page classifier failed: ${errorMessage}`, { error: errorMessage, isProtocolError, durationMs: Date.now() - classifyStartedAt });
+      const reason = `AI page classifier failed: ${errorMessage}`;
+      await safeFinalize(reporter, "not_found", null, reason);
+      return { outcome: { outcome: "not_found", reason }, trace };
+    }
+  }
+
+  // Bucket the eligible results by classification. Drops "irrelevant"
+  // entries entirely (the LLM has told us they are not worth inspecting).
+  const directListings: BraveSearchResult[] = [];
+  const careersPages: BraveSearchResult[] = [];
+  for (const entry of classifications) {
+    const matchingResult = eligibleBraveResults[entry.index];
+    if (matchingResult === undefined) continue;
+    if (entry.classification === "direct_job_listing") directListings.push(matchingResult);
+    else if (entry.classification === "careers_page") careersPages.push(matchingResult);
+  }
+
+  // Track URLs already scraped this attempt so a careers-page-harvested href
+  // that duplicates a direct-listing URL doesn't burn a second /analyze call.
+  const inspectedUrls = new Set<string>();
+
+  // Phase: FuzzyRankDirectListings — code-side ranking of the
+  // direct_job_listing subset by snippet vs target title. No threshold; the
+  // existing jobMatchService is still the accept/reject gate.
+  const rankDirectStepIndex = await safeStartStep(reporter, ResolutionPhase.FuzzyRankDirectListings, `Fuzzy-ranking ${String(directListings.length)} direct-listing candidate(s)`, { count: directListings.length });
+  const rankedDirect = rankByFuzzyScore(
+    directListings,
+    (result) => result.description,
+    input.originalTitle,
+    (result) => result.url
+  );
+  await safeEndStep(reporter, rankDirectStepIndex, StepStatus.Succeeded, `Ranked ${String(rankedDirect.length)} direct-listing candidate(s)`, { ranked: rankedDirect.map(({ item, score }) => ({ url: item.url, score })) });
+
+  // Phases: CandidateScrape + CandidateEvaluate — iterate ranked direct
+  // listings best-first. First match wins.
+  for (const { item: candidate } of rankedDirect) {
+    if (trace.inspectedCandidates.length >= MAX_SEARCH_CANDIDATES_TO_INSPECT) break;
+    if (inspectedUrls.has(candidate.url)) continue;
+    inspectedUrls.add(candidate.url);
+
+    const directMatch = await tryScrapeAndEvaluateCandidate({
+      reporter,
+      container,
+      input,
+      trace,
+      candidateUrl: candidate.url,
+      candidateLabel: "direct-listing",
+    });
+    if (directMatch !== null) {
+      await safeFinalize(reporter, "resolved_via_search", directMatch, null);
+      return { outcome: { outcome: "resolved_via_search", applicationUrl: directMatch }, trace };
+    }
+  }
+
+  // Phase: FuzzyRankCareersPages — code-side ranking of the careers_page
+  // subset by snippet vs target title. Determines harvest order.
+  const rankCareersStepIndex = await safeStartStep(reporter, ResolutionPhase.FuzzyRankCareersPages, `Fuzzy-ranking ${String(careersPages.length)} careers-page candidate(s)`, { count: careersPages.length });
+  const rankedCareers = rankByFuzzyScore(
+    careersPages,
+    (result) => result.description,
+    input.originalTitle,
+    (result) => result.url
+  );
+  await safeEndStep(reporter, rankCareersStepIndex, StepStatus.Succeeded, `Ranked ${String(rankedCareers.length)} careers-page candidate(s)`, { ranked: rankedCareers.map(({ item, score }) => ({ url: item.url, score })) });
+
+  // Phase: CareersPageHarvest — drill into each ranked careers page,
+  // extract its anchors, fuzzy-match link text against the target title,
+  // then scrape + evaluate each top href. First match wins → outcome =
+  // "resolved_via_careers_page".
+  let careersPagesHarvestedCount = 0;
+  for (const { item: careersResult } of rankedCareers) {
+    if (trace.inspectedCandidates.length >= MAX_SEARCH_CANDIDATES_TO_INSPECT) break;
+    if (careersPagesHarvestedCount >= MAX_CAREERS_PAGES_TO_HARVEST) break;
+    careersPagesHarvestedCount += 1;
+
+    const harvestStepIndex = await safeStartStep(reporter, ResolutionPhase.CareersPageHarvest, `Harvesting careers page ${String(careersPagesHarvestedCount)}: ${careersResult.url}`, { url: careersResult.url, careersPageNumber: careersPagesHarvestedCount });
+    const harvestStartedAt = Date.now();
+    let topHrefs: { href: string; text: string; accessibleName: string; score: number }[] = [];
+    try {
+      const harvestResult = await harvestCareersPage(container.hostPort, careersResult.url, input.originalTitle);
+      topHrefs = harvestResult.topHrefs;
+      await safeEndStep(reporter, harvestStepIndex, StepStatus.Succeeded, `Harvested ${String(harvestResult.rawLinkCount)} link(s); kept ${String(harvestResult.topHrefs.length)} after fuzzy match`, { rawLinkCount: harvestResult.rawLinkCount, topHrefs: harvestResult.topHrefs, durationMs: Date.now() - harvestStartedAt });
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.warn(`[resolver] careers-page harvest failed for ${careersResult.url}: ${errorMessage}`);
+      await safeEndStep(reporter, harvestStepIndex, StepStatus.Failed, `Careers-page harvest failed: ${errorMessage}`, { url: careersResult.url, error: errorMessage, durationMs: Date.now() - harvestStartedAt });
+      continue;
+    }
+
+    for (const harvested of topHrefs) {
+      if (trace.inspectedCandidates.length >= MAX_SEARCH_CANDIDATES_TO_INSPECT) break;
+      const harvestedHost = tryGetHostname(harvested.href);
+      if (harvestedHost === null) continue;
+      if (isGatedHost(harvestedHost)) continue;
+      if (inspectedUrls.has(harvested.href)) continue;
+      inspectedUrls.add(harvested.href);
+
+      const careersMatch = await tryScrapeAndEvaluateCandidate({
+        reporter,
+        container,
+        input,
+        trace,
+        candidateUrl: harvested.href,
+        candidateLabel: `careers-page-href (${careersResult.url})`,
       });
-      console.warn(`[resolver] candidate=${candidate.url} scrape failed: ${errorMessage}`);
-      await safeEndStep(reporter, candidateScrapeStepIndex, StepStatus.Failed, `Scrape failed: ${errorMessage}`, { url: candidate.url, error: errorMessage, durationMs: Date.now() - candidateScrapeStartedAt });
+      if (careersMatch !== null) {
+        await safeFinalize(reporter, "resolved_via_careers_page", careersMatch, null);
+        return { outcome: { outcome: "resolved_via_careers_page", applicationUrl: careersMatch }, trace };
+      }
     }
   }
 
   const inspectedCount = trace.inspectedCandidates.length;
   console.log(`[resolver] outcome=not_found inspected=${String(inspectedCount)} candidate(s) without a match`);
-  const finalizeStepIndex = await safeStartStep(reporter, ResolutionPhase.Finalize, "Finalizing not_found outcome", { inspectedCount });
-  const notFoundReason = `Inspected ${String(inspectedCount)} candidate(s) from web search; none matched the original title + description.`;
+  const finalizeStepIndex = await safeStartStep(reporter, ResolutionPhase.Finalize, "Finalizing not_found outcome", { inspectedCount, directListingCount: directListings.length, careersPageCount: careersPages.length, careersPagesHarvested: careersPagesHarvestedCount });
+  const notFoundReason = `Inspected ${String(inspectedCount)} candidate(s) (across ${String(directListings.length)} direct listing(s) and ${String(careersPagesHarvestedCount)} careers page(s)); none matched the original title + description.`;
   await safeEndStep(reporter, finalizeStepIndex, StepStatus.Succeeded, notFoundReason, { outcome: "not_found", inspectedCount });
   await safeFinalize(reporter, "not_found", null, notFoundReason);
   return { outcome: { outcome: "not_found", reason: notFoundReason }, trace };
+}
+
+/**
+ * Inputs to {@link tryScrapeAndEvaluateCandidate}. Bundled into an object so
+ * the function signature stays readable as the resolver evolves.
+ */
+interface ScrapeAndEvaluateArgs {
+  reporter: ResolverProgressReporter | undefined;
+  container: { id: number; hostPort: number };
+  input: ResolverInput;
+  trace: ResolutionTrace;
+  /** The URL to scrape + evaluate. */
+  candidateUrl: string;
+  /** Free-text label distinguishing call sites in logs (e.g. "direct-listing" vs "careers-page-href (https://...)"). */
+  candidateLabel: string;
+}
+
+/**
+ * Scrapes a single candidate URL via the managed container and evaluates the
+ * scraped result against the original job using jobMatchService. Pushes the
+ * verdict (matched or not) into trace.inspectedCandidates and emits
+ * CandidateScrape + CandidateEvaluate phase events.
+ *
+ * Returns the candidate URL when the match is accepted, or null when the
+ * candidate was rejected (mismatch) or could not be scraped (error). Callers
+ * decide which outcome key to finalize on (resolved_via_search vs
+ * resolved_via_careers_page) and proceed accordingly.
+ *
+ * A scrape error is intentionally NOT propagated — one bad candidate must
+ * never abort the resolver's overall sweep. The failure is recorded as a
+ * rejection in trace.inspectedCandidates with the error message verbatim.
+ *
+ * @param {ScrapeAndEvaluateArgs} args - Bundled call arguments
+ * @returns {Promise<string | null>} The matched URL, or null when no match
+ */
+async function tryScrapeAndEvaluateCandidate(args: ScrapeAndEvaluateArgs): Promise<string | null> {
+  const { reporter, container, input, trace, candidateUrl, candidateLabel } = args;
+  const candidateNumber = trace.inspectedCandidates.length + 1;
+  const candidateScrapeStepIndex = await safeStartStep(reporter, ResolutionPhase.CandidateScrape, `Scraping candidate ${String(candidateNumber)} [${candidateLabel}]: ${candidateUrl}`, { url: candidateUrl, candidateNumber, candidateLabel });
+  const candidateScrapeStartedAt = Date.now();
+  let candidateScrapedTitle = "";
+  try {
+    const candidateScrape = await scrapeJobViaContainer(container.hostPort, candidateUrl);
+    candidateScrapedTitle = candidateScrape.title;
+    await safeEndStep(reporter, candidateScrapeStepIndex, StepStatus.Succeeded, `Scraped title: "${candidateScrape.title}"`, { url: candidateUrl, scrapedTitle: candidateScrape.title, scrapedDescription: candidateScrape.description, durationMs: Date.now() - candidateScrapeStartedAt });
+
+    const candidateEvaluateStepIndex = await safeStartStep(reporter, ResolutionPhase.CandidateEvaluate, `Evaluating match for candidate ${String(candidateNumber)}`, { url: candidateUrl, scrapedTitle: candidateScrape.title, candidateLabel });
+    const verdict = evaluateJobMatch({
+      originalTitle: input.originalTitle,
+      originalDescription: input.originalDescription,
+      candidateTitle: candidateScrape.title,
+      candidateDescription: candidateScrape.description,
+    });
+    trace.inspectedCandidates.push({
+      url: candidateUrl,
+      scrapedTitle: candidateScrape.title,
+      matched: verdict.matched,
+      rejectionReason: verdict.reason,
+    });
+    console.log(`[resolver] candidate=${candidateUrl} [${candidateLabel}] scrapedTitle="${candidateScrape.title}" verdict=${verdict.matched ? "accept" : "reject"} reason="${verdict.reason}"`);
+    await safeEndStep(reporter, candidateEvaluateStepIndex, verdict.matched ? StepStatus.Succeeded : StepStatus.Skipped, verdict.matched ? `Match accepted: ${verdict.reason}` : `Match rejected: ${verdict.reason}`, { matched: verdict.matched, reason: verdict.reason });
+    if (verdict.matched) return candidateUrl;
+    return null;
+  } catch (err) {
+    // One bad candidate shouldn't abort the search — record the failure
+    // verbatim in the trace and return null so the caller moves on.
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    trace.inspectedCandidates.push({
+      url: candidateUrl,
+      scrapedTitle: candidateScrapedTitle,
+      matched: false,
+      rejectionReason: `scrape failed: ${errorMessage}`,
+    });
+    console.warn(`[resolver] candidate=${candidateUrl} [${candidateLabel}] scrape failed: ${errorMessage}`);
+    await safeEndStep(reporter, candidateScrapeStepIndex, StepStatus.Failed, `Scrape failed: ${errorMessage}`, { url: candidateUrl, error: errorMessage, durationMs: Date.now() - candidateScrapeStartedAt });
+    return null;
+  }
 }
 
 /**

@@ -53,6 +53,7 @@ function colorForFinalOutcome(outcome: ApplicationUrlResolutionOutcome | null): 
     case ApplicationUrlResolutionOutcome.Direct: return "success";
     case ApplicationUrlResolutionOutcome.ResolvedViaRedirect: return "success";
     case ApplicationUrlResolutionOutcome.ResolvedViaSearch: return "success";
+    case ApplicationUrlResolutionOutcome.ResolvedViaCareersPage: return "success";
     case ApplicationUrlResolutionOutcome.NotFound: return "warning";
   }
 }

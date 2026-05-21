@@ -35,6 +35,10 @@ export enum ResolutionPhase {
   ApplyButtonDecision = "apply_button_decision",
   BuildQuery = "build_query",
   BraveSearch = "brave_search",
+  AIPageClassify = "ai_page_classify",
+  FuzzyRankDirectListings = "fuzzy_rank_direct_listings",
+  FuzzyRankCareersPages = "fuzzy_rank_careers_pages",
+  CareersPageHarvest = "careers_page_harvest",
   CandidateScrape = "candidate_scrape",
   CandidateEvaluate = "candidate_evaluate",
   Finalize = "finalize",
@@ -53,6 +57,7 @@ export enum ApplicationUrlResolutionOutcome {
   Direct = "direct",
   ResolvedViaRedirect = "resolved_via_redirect",
   ResolvedViaSearch = "resolved_via_search",
+  ResolvedViaCareersPage = "resolved_via_careers_page",
   NotFound = "not_found",
 }
 
@@ -193,7 +198,7 @@ export interface ResolutionLogInspectedCandidate {
 export interface ResolutionLog {
   id: number;
   job_listing_id: number;
-  outcome: "direct" | "resolved_via_redirect" | "resolved_via_search" | "not_found";
+  outcome: "direct" | "resolved_via_redirect" | "resolved_via_search" | "resolved_via_careers_page" | "not_found";
   search_query: string | null;
   brave_results: ResolutionLogBraveResult[];
   inspected_candidates: ResolutionLogInspectedCandidate[];

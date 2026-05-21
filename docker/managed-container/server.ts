@@ -278,6 +278,110 @@ app.post("/analyze", async (req: Request, res: Response) => {
 });
 
 /**
+ * Hard cap on the number of links returned by /extract-links. Careers pages
+ * with hundreds of anchors (filter rails, footer nav, location selectors)
+ * should not blow up the resolver's host-side fuzzy-match step or the JSON
+ * response size. 500 is generous enough to cover realistic careers index
+ * pages while bounding worst-case payloads.
+ */
+const EXTRACT_LINKS_HARD_CAP = 500;
+
+/**
+ * Default per-request timeout (ms) for /extract-links navigation. Matches
+ * the other Playwright endpoints; can be lowered per-request via the
+ * `timeoutMs` body field for callers that want to fail fast on JS-heavy
+ * SPAs.
+ */
+const EXTRACT_LINKS_DEFAULT_TIMEOUT_MS = PAGE_NAV_TIMEOUT_MS;
+
+/**
+ * Browser-side function passed to `page.evaluate` by /extract-links. Iterates
+ * over every `<a>` tag in the rendered DOM, resolves relative href values to
+ * absolute URLs against the page's base, and returns the trimmed link text +
+ * accessible-name. Declared at module scope so its source is portable across
+ * Playwright contexts (no closure captures from the enclosing route).
+ *
+ * @returns {Array<{ href: string; text: string; accessibleName: string }>} One entry per anchor with an absolute http(s) href
+ */
+function collectAnchorsForExtractLinks(): { href: string; text: string; accessibleName: string }[] {
+  const results: { href: string; text: string; accessibleName: string }[] = [];
+  for (const anchor of Array.from(document.querySelectorAll<HTMLAnchorElement>("a"))) {
+    const href = anchor.href;
+    const isAbsoluteHttpHref =
+      typeof href === "string" &&
+      (href.startsWith("http://") || href.startsWith("https://"));
+    if (!isAbsoluteHttpHref) continue;
+    const text = (anchor.textContent ?? "").trim().replace(/\s+/g, " ");
+    const ariaLabel = (anchor.getAttribute("aria-label") ?? "").trim();
+    const title = (anchor.getAttribute("title") ?? "").trim();
+    const accessibleName = ariaLabel.length > 0 ? ariaLabel : title;
+    results.push({ href, text, accessibleName });
+  }
+  return results;
+}
+
+/**
+ * POST /extract-links
+ * Navigates to the supplied URL and returns every absolute http(s) anchor
+ * on the rendered page. The host's careersPageHarvesterService consumes the
+ * response: it fuzzy-matches link text + accessibleName against a target job
+ * title to choose which hrefs to scrape via /analyze.
+ *
+ * The response is capped at EXTRACT_LINKS_HARD_CAP entries; pathological
+ * pages do not blow up the JSON payload.
+ *
+ * @param {string} req.body.url - The page URL to navigate and inspect
+ * @param {string} [req.body.waitForSelector] - When supplied, page.waitForSelector is called before extraction to give JS-heavy pages a chance to render
+ * @param {number} [req.body.timeoutMs] - Override navigation/wait timeout (ms); defaults to EXTRACT_LINKS_DEFAULT_TIMEOUT_MS
+ * @param {boolean} [req.body.useProxy] - When true, route the page fetch through Smartproxy
+ * @returns {object} 200 - { url, links: Array<{ href, text, accessibleName }> }
+ * @returns {object} 400 - Missing or invalid URL/options
+ * @returns {object} 500 - Navigation or extraction failure (incl. missing proxy creds when useProxy=true)
+ */
+app.post("/extract-links", async (req: Request, res: Response) => {
+  const body = req.body as { url?: unknown; waitForSelector?: unknown; timeoutMs?: unknown; useProxy?: unknown } | undefined;
+  const rawUrl = body?.url;
+  const isInvalidUrl = typeof rawUrl !== "string" || rawUrl.length === 0;
+  if (isInvalidUrl) {
+    res.status(400).json({ error: "Request body must include a non-empty 'url' string" });
+    return;
+  }
+  const targetUrl = rawUrl;
+  const useProxy = body?.useProxy === true;
+  const rawWaitForSelector = body?.waitForSelector;
+  const waitForSelector = typeof rawWaitForSelector === "string" && rawWaitForSelector.length > 0 ? rawWaitForSelector : null;
+  const rawTimeoutMs = body?.timeoutMs;
+  const isValidTimeout = typeof rawTimeoutMs === "number" && Number.isFinite(rawTimeoutMs) && rawTimeoutMs > 0;
+  const timeoutMs = isValidTimeout ? rawTimeoutMs : EXTRACT_LINKS_DEFAULT_TIMEOUT_MS;
+
+  let context: BrowserContext | undefined;
+  let page;
+  try {
+    const browser = await getBrowser();
+    context = await browser.newContext(buildContextOptions(useProxy));
+    page = await context.newPage();
+    await page.goto(targetUrl, { waitUntil: "load", timeout: timeoutMs });
+    if (waitForSelector !== null) {
+      await page.waitForSelector(waitForSelector, { timeout: timeoutMs });
+    }
+    const rawLinks = await page.evaluate(collectAnchorsForExtractLinks);
+    const cappedLinks = rawLinks.slice(0, EXTRACT_LINKS_HARD_CAP);
+    res.json({ url: targetUrl, links: cappedLinks });
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[extract-links] Extraction failed for ${targetUrl} (useProxy=${String(useProxy)}): ${errorMessage}`);
+    res.status(500).json({ error: `Extract-links failed: ${errorMessage}` });
+  } finally {
+    if (page !== undefined) {
+      await page.close().catch(() => { /* ignore close error */ });
+    }
+    if (context !== undefined) {
+      await context.close().catch(() => { /* ignore close error */ });
+    }
+  }
+});
+
+/**
  * Validates and extracts the :logId path parameter for the
  * /resolution-progress/* endpoints. Sends a 400 directly and returns null
  * when the value is not a positive integer.

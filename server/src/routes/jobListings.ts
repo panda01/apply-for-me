@@ -205,10 +205,17 @@ async function finalizeResolutionLog(
 }
 
 /**
- * Persists a resolver outcome onto the job listing row. Sets application_url
- * on success and flips status to "missing_form_url" on a "not_found" outcome
- * so the UI can render the failure state and the apply gate can refuse to
- * start an application until the user retries.
+ * Persists a resolver outcome onto the job listing row.
+ *
+ * On a success outcome (anything other than not_found): writes
+ * application_url. If the row is currently stuck in "missing_form_url" from
+ * a prior failed attempt, also flips status back to "init" so the UI clears
+ * the failure banner and the apply gate re-opens. Other statuses
+ * (applying / applied / error_applying / closed) are left untouched.
+ *
+ * On not_found: clears application_url and flips status to
+ * "missing_form_url" so the UI can render the failure state and the apply
+ * gate refuses to start an application until the user retries.
  *
  * @param {number} jobListingId - The id of the listing to update
  * @param {ResolverOutcome} outcome - The classified resolver result
@@ -216,11 +223,18 @@ async function finalizeResolutionLog(
 async function applyResolverOutcomeToListing(jobListingId: number, outcome: ResolverOutcome): Promise<void> {
   const isFound = outcome.outcome !== "not_found";
   if (isFound) {
+    const currentRow = await prisma.jobListing.findUnique({
+      where: { id: jobListingId },
+      select: { status: true },
+    });
+    const isRecoveringFromMissingFormUrl = currentRow?.status === "missing_form_url";
     await prisma.jobListing.update({
       where: { id: jobListingId },
-      data: { application_url: outcome.applicationUrl },
+      data: isRecoveringFromMissingFormUrl
+        ? { application_url: outcome.applicationUrl, status: "init" }
+        : { application_url: outcome.applicationUrl },
     });
-    console.log(`[resolver] Job ${String(jobListingId)} application_url resolved via ${outcome.outcome}: ${outcome.applicationUrl}`);
+    console.log(`[resolver] Job ${String(jobListingId)} application_url resolved via ${outcome.outcome}: ${outcome.applicationUrl}${isRecoveringFromMissingFormUrl ? " (status flipped missing_form_url -> init)" : ""}`);
     return;
   }
   await prisma.jobListing.update({
