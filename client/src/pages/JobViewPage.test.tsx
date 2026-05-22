@@ -4,6 +4,24 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import JobViewPage from "./JobViewPage";
 
+/**
+ * Minimal in-memory localStorage stand-in. The configured jsdom environment
+ * does not expose a real Storage implementation, so we stub one onto window
+ * before the component under test reads `afm:selectedApplicationProfileId`.
+ */
+const inMemoryStorage = new Map<string, string>();
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (key: string): string | null => inMemoryStorage.get(key) ?? null,
+    setItem: (key: string, value: string): void => { inMemoryStorage.set(key, value); },
+    removeItem: (key: string): void => { inMemoryStorage.delete(key); },
+    clear: (): void => { inMemoryStorage.clear(); },
+    key: (index: number): string | null => Array.from(inMemoryStorage.keys())[index] ?? null,
+    get length(): number { return inMemoryStorage.size; },
+  },
+});
+
 vi.mock("../services/jobListingsApi", () => ({
   getJobListing: vi.fn(),
   fetchJobData: vi.fn(),
@@ -64,6 +82,9 @@ beforeEach(() => {
   // Default the trace panel's API call to an empty array so the panel doesn't
   // surface a spurious error in unrelated tests that don't care about the trace.
   vi.mocked(getResolutionLogs).mockResolvedValue([]);
+  // Seed the localStorage key used by handleApply so Apply doesn't bail with
+  // the "pick a profile" message in tests that exercise the apply flow.
+  window.localStorage.setItem("afm:selectedApplicationProfileId", "7");
 });
 
 afterEach(() => {
@@ -201,7 +222,7 @@ describe("JobViewPage", () => {
     expect(fetchJobData).toHaveBeenCalledWith(1);
   });
 
-  it("should call applyToJob when Apply button is clicked", async () => {
+  it("should call applyToJob with the stored profile id when Apply button is clicked", async () => {
     const user = userEvent.setup();
     vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
     vi.mocked(applyToJob).mockResolvedValue({ ...mockCompletedListing, status: "applying" });
@@ -214,7 +235,25 @@ describe("JobViewPage", () => {
 
     await user.click(screen.getByRole("button", { name: /^Apply$/ }));
 
-    expect(applyToJob).toHaveBeenCalledWith(1);
+    expect(applyToJob).toHaveBeenCalledWith(1, 7);
+  });
+
+  it("should surface a helpful message when no profile is selected", async () => {
+    window.localStorage.removeItem("afm:selectedApplicationProfileId");
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
+
+    renderJobViewPage();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^Apply$/ })).toBeDefined();
+    });
+    await user.click(screen.getByRole("button", { name: /^Apply$/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Pick an application profile/)).toBeDefined();
+    });
+    expect(applyToJob).not.toHaveBeenCalled();
   });
 
   it("should show applying view when listing is in applying status", async () => {

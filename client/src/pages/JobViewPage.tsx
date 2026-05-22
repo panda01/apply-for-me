@@ -166,6 +166,9 @@ function JobViewPage() {
 
   /**
    * Starts the application process for this job listing.
+   * Reads the most-recently-selected ApplicationProfile id from localStorage
+   * (set on the apply dashboard). If none is selected the user is told to
+   * pick one on the apply dashboard first.
    * Transitions the page to show the live browser iframe.
    */
   const handleApply = async () => {
@@ -173,10 +176,18 @@ function JobViewPage() {
     const isInvalidId = isNaN(parsedId);
     if (isInvalidId) return;
 
+    const storedRaw = window.localStorage.getItem("afm:selectedApplicationProfileId");
+    const storedProfileId = storedRaw === null ? NaN : parseInt(storedRaw, 10);
+    const hasNoStoredProfile = Number.isNaN(storedProfileId);
+    if (hasNoStoredProfile) {
+      setActionErrorMessage("Pick an application profile on the Apply dashboard before applying.");
+      return;
+    }
+
     setIsStartingApply(true);
     setActionErrorMessage("");
     try {
-      await applyToJob(parsedId);
+      await applyToJob(parsedId, storedProfileId);
       await fetchJobListing();
     } catch (err) {
       const errorText = err instanceof Error ? err.message : "Failed to start application";

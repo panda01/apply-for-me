@@ -1,9 +1,7 @@
 import { Router, Request, Response } from "express";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import prisma from "../prismaClient.js";
 import { applyToJob } from "../services/jobApplicationService.js";
-import type { UserInfo, StepLog } from "../services/jobApplicationService.js";
+import type { UserInfo, StepLog, WorkAuthorization } from "../services/jobApplicationService.js";
 import { findJobListingOrSend404 } from "./_helpers.js";
 
 const router = Router();
@@ -29,21 +27,13 @@ let batchState: BatchApplyState = {
 };
 
 /**
- * Reads the user info JSON file from the scripts directory.
- * @returns {Promise<UserInfo>} The parsed user info
- */
-async function readUserInfo(): Promise<UserInfo> {
-  const userInfoPath = resolve(__dirname, "../scripts/user_info.json");
-  const userInfoJson = await readFile(userInfoPath, "utf-8");
-  return JSON.parse(userInfoJson) as UserInfo;
-}
-
-/**
- * Reads the Browser Use profile ID from environment variables.
- * @returns {string} The profile ID
+ * Reads the Browser Use profile ID from environment variables. This is the
+ * persistent browser-session profile (cookies, logins, etc.), unrelated to
+ * the ApplicationProfile row that holds the user's identity for form-fill.
+ * @returns {string} The Browser Use profile ID
  * @throws {Error} If the profile ID is not set
  */
-function getProfileId(): string {
+function getBrowserUseProfileId(): string {
   const profileId = process.env["BROWSER_USE_PROFILE_ID"];
   const isMissing = !profileId;
   if (isMissing) {
@@ -53,22 +43,84 @@ function getProfileId(): string {
 }
 
 /**
- * Loads the user info file and the Browser Use profile id, returning both on success.
- * Sends a 400 response and returns null when either fails so the caller can early-exit.
+ * Extracts and validates the applicationProfileId field from a request body.
+ * Sends a 400 response when missing or not a positive integer and returns null.
+ * @param {Request} req - The request to read the body from
+ * @param {Response} res - The response (used to write 400 on error)
+ * @returns {number | null} The validated id, or null when an error response has been written
+ */
+function parseApplicationProfileIdOrSend400(req: Request, res: Response): number | null {
+  const body = req.body as { applicationProfileId?: unknown } | undefined;
+  const raw = body?.applicationProfileId;
+  const isNumber = typeof raw === "number" && Number.isFinite(raw);
+  const isPositiveInteger = isNumber && Number.isInteger(raw) && raw > 0;
+  if (!isPositiveInteger) {
+    res.status(400).json({ error: "Missing or invalid 'applicationProfileId' in request body — pick a profile before applying" });
+    return null;
+  }
+  return raw;
+}
+
+/**
+ * Loads an ApplicationProfile by id and maps it into the UserInfo shape used
+ * by the Browser-Use prompt builder. Returns null when the row is missing so
+ * the caller can respond with 400 / "profile not found".
+ * @param {number} applicationProfileId - The selected ApplicationProfile.id
+ * @returns {Promise<UserInfo | null>} The mapped UserInfo, or null when the profile is missing
+ */
+async function loadUserInfoFromProfile(applicationProfileId: number): Promise<UserInfo | null> {
+  const profile = await prisma.applicationProfile.findUnique({ where: { id: applicationProfileId } });
+  if (profile === null) {
+    return null;
+  }
+  return {
+    firstName: profile.firstName,
+    middleName: profile.middleName,
+    lastName: profile.lastName,
+    email: profile.email,
+    phone: profile.phone,
+    github: profile.github,
+    linkedin: profile.linkedin,
+    website: profile.website,
+    resumeUrl: profile.resumeUrl,
+    coverLetterUrl: profile.coverLetterUrl,
+    workAuthorization: profile.workAuthorization as WorkAuthorization | null,
+    desiredSalaryMin: profile.desiredSalaryMin,
+  };
+}
+
+/**
+ * Loads the UserInfo for the chosen applicationProfileId plus the Browser Use
+ * profile id from the environment. Sends a 400 response and returns null when
+ * either lookup fails so the caller can early-exit.
+ * @param {Request} req - The request carrying applicationProfileId in the JSON body
  * @param {Response} res - The response (used to write 400 on error)
  * @param {string} logTag - Prefix for the error log line (e.g., "applicator:route")
- * @returns {Promise<{ userInfo: UserInfo; profileId: string } | null>} The loaded values or null on error
+ * @returns {Promise<{ userInfo: UserInfo; browserUseProfileId: string } | null>} The loaded values or null on error
  */
 async function loadConfigOrSend400(
+  req: Request,
   res: Response,
   logTag: string
-): Promise<{ userInfo: UserInfo; profileId: string } | null> {
+): Promise<{ userInfo: UserInfo; browserUseProfileId: string } | null> {
+  const applicationProfileId = parseApplicationProfileIdOrSend400(req, res);
+  if (applicationProfileId === null) {
+    return null;
+  }
+
+  const userInfo = await loadUserInfoFromProfile(applicationProfileId);
+  if (userInfo === null) {
+    res.status(400).json({ error: `Application profile ${String(applicationProfileId)} not found` });
+    return null;
+  }
+
   try {
-    const userInfo = await readUserInfo();
-    const profileId = getProfileId();
-    return { userInfo, profileId };
+    const browserUseProfileId = getBrowserUseProfileId();
+    return { userInfo, browserUseProfileId };
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
+    // getBrowserUseProfileId only ever throws Error so the cast is safe; no
+    // String(err) fallback because there's nowhere for a non-Error to come from.
+    const errorMessage = (err as Error).message;
     console.error(`[${logTag}] Config error: ${errorMessage}`);
     res.status(400).json({ error: errorMessage });
     return null;
@@ -81,8 +133,9 @@ async function loadConfigOrSend400(
  * Sets the job status to "applying" and kicks off the Browser Use agent in the background.
  * Returns 202 immediately while the application runs asynchronously.
  * @param {number} req.params.id - The ID of the job listing to apply to
+ * @param {number} req.body.applicationProfileId - The ApplicationProfile.id whose fields fill the form
  * @returns {object} 202 - The job listing with status "applying"
- * @returns {object} 400 - Invalid id, job not in "init" status, or missing config
+ * @returns {object} 400 - Invalid id, job not in "init" status, missing applicationProfileId, or missing config
  * @returns {object} 404 - Job listing not found
  */
 router.post("/:id/apply", async (req: Request, res: Response) => {
@@ -107,7 +160,7 @@ router.post("/:id/apply", async (req: Request, res: Response) => {
     return;
   }
 
-  const config = await loadConfigOrSend400(res, "applicator:route");
+  const config = await loadConfigOrSend400(req, res, "applicator:route");
   if (config === null) {
     return;
   }
@@ -122,7 +175,7 @@ router.post("/:id/apply", async (req: Request, res: Response) => {
   res.status(202).json(updatedListing);
 
   // Narrowing — the hasNoApplicationUrl gate above guarantees non-null at this point.
-  applyToSingleJob(jobListing.id, jobListing.application_url!, config.userInfo, config.profileId).catch(() => {
+  applyToSingleJob(jobListing.id, jobListing.application_url!, config.userInfo, config.browserUseProfileId).catch(() => {
     /* error already handled inside */
   });
 });
@@ -208,22 +261,23 @@ async function saveAttemptLog(
  * POST /api/job-listings/apply-batch
  * Starts the batch application process for all job listings with status "init".
  * Processes jobs one at a time sequentially. Only one batch can run at a time.
+ * @param {number} req.body.applicationProfileId - The ApplicationProfile.id used for every job in the batch
  * @returns {object} 202 - Batch started with initial status
  * @returns {object} 409 - A batch is already running
- * @returns {object} 400 - Missing config or no jobs to apply to
+ * @returns {object} 400 - Missing config, missing applicationProfileId, or no jobs to apply to
  */
-router.post("/apply-batch", async (_req: Request, res: Response) => {
+router.post("/apply-batch", async (req: Request, res: Response) => {
   const isBatchAlreadyRunning = batchState.isRunning;
   if (isBatchAlreadyRunning) {
     res.status(409).json({ error: "A batch application process is already running" });
     return;
   }
 
-  const config = await loadConfigOrSend400(res, "applicator:batch");
+  const config = await loadConfigOrSend400(req, res, "applicator:batch");
   if (config === null) {
     return;
   }
-  const { userInfo, profileId } = config;
+  const { userInfo, browserUseProfileId } = config;
 
   const eligibleJobs = await prisma.jobListing.findMany({
     where: { status: "init", application_url: { not: null } },
@@ -249,7 +303,7 @@ router.post("/apply-batch", async (_req: Request, res: Response) => {
     totalJobs: eligibleJobs.length,
   });
 
-  runBatchApply(eligibleJobs, userInfo, profileId).catch(() => {
+  runBatchApply(eligibleJobs, userInfo, browserUseProfileId).catch(() => {
     /* error already handled inside */
   });
 });
@@ -353,4 +407,4 @@ router.get("/apply-batch/status", (_req: Request, res: Response) => {
   });
 });
 
-export { router as jobApplicationsRouter, applyToSingleJob, runBatchApply, batchState, readUserInfo, getProfileId };
+export { router as jobApplicationsRouter, applyToSingleJob, runBatchApply, batchState, loadUserInfoFromProfile, getBrowserUseProfileId };

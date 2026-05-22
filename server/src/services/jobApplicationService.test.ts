@@ -105,6 +105,9 @@ const mockUserInfo: UserInfo = {
   linkedin: "https://www.linkedin.com/in/khalahjonesgolden/",
   website: "https://khalah.medium.com",
   resumeUrl: "https://drive.google.com/file/d/test/view",
+  coverLetterUrl: null,
+  workAuthorization: null,
+  desiredSalaryMin: null,
 };
 
 const mockProfileId = "439bc116-ae1f-4f98-aee1-6a7cd16d4968";

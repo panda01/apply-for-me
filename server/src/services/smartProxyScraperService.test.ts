@@ -9,7 +9,11 @@ vi.mock("../prismaClient.js", () => ({
 }));
 
 import prisma from "../prismaClient.js";
-import { findFirstRunningContainer, scrapeJobViaContainer } from "./smartProxyScraperService.js";
+import {
+  findFirstRunningContainer,
+  scrapeJobViaContainer,
+  extractLinksViaContainer,
+} from "./smartProxyScraperService.js";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -112,5 +116,70 @@ describe("scrapeJobViaContainer", () => {
     }));
 
     await expect(scrapeJobViaContainer(41010, "https://example.com")).rejects.toThrow(/503 Service Unavailable/);
+  });
+});
+
+describe("extractLinksViaContainer", () => {
+  it("POSTs to /extract-links and returns the parsed body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ url: "https://acme.com/careers", links: [{ href: "https://acme.com/jobs/1", text: "SWE", accessibleName: "SWE" }] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await extractLinksViaContainer(41010, "https://acme.com/careers");
+
+    expect(result.links).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:41010/extract-links",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ url: "https://acme.com/careers", useProxy: true }),
+      })
+    );
+  });
+
+  it("forwards useProxy, waitForSelector, and timeoutMs overrides when provided", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ url: "https://x", links: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await extractLinksViaContainer(41010, "https://x", {
+      useProxy: false,
+      waitForSelector: "#jobs",
+      timeoutMs: 5000,
+    });
+
+    const bodyArg = (fetchMock.mock.calls[0][1] as { body: string }).body;
+    expect(JSON.parse(bodyArg)).toEqual({
+      url: "https://x",
+      useProxy: false,
+      waitForSelector: "#jobs",
+      timeoutMs: 5000,
+    });
+  });
+
+  it("throws a descriptive error when the container returns a non-2xx JSON error body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      json: () => Promise.resolve({ error: "playwright crashed" }),
+    }));
+
+    await expect(extractLinksViaContainer(41010, "https://x")).rejects.toThrow(/playwright crashed/);
+  });
+
+  it("falls back to status text when the non-2xx response has no JSON error body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      statusText: "Service Unavailable",
+      json: () => Promise.reject(new Error("non-json")),
+    }));
+
+    await expect(extractLinksViaContainer(41010, "https://x")).rejects.toThrow(/503 Service Unavailable/);
   });
 });

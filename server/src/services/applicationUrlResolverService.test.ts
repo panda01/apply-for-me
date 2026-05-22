@@ -13,9 +13,26 @@ vi.mock("./jobMatchService.js", () => ({
   evaluateJobMatch: vi.fn(),
 }));
 
+vi.mock("./careersPageHarvesterService.js", () => ({
+  harvestCareersPage: vi.fn(),
+}));
+
+// Mock the LLM-backed classifier so tests don't hit the Anthropic SDK (which
+// refuses to run inside jsdom). Re-exports the real types/errors so callers
+// can still `instanceof PageClassifierProtocolError` if a test wants to.
+vi.mock("./aiPageClassifierService.js", async () => {
+  const actual = await vi.importActual<typeof import("./aiPageClassifierService.js")>("./aiPageClassifierService.js");
+  return {
+    ...actual,
+    classifyPages: vi.fn(),
+  };
+});
+
 import { searchWeb } from "./braveSearchService.js";
 import { scrapeJobViaContainer, findFirstRunningContainer } from "./smartProxyScraperService.js";
 import { evaluateJobMatch } from "./jobMatchService.js";
+import { classifyPages } from "./aiPageClassifierService.js";
+import { harvestCareersPage } from "./careersPageHarvesterService.js";
 import {
   resolveApplicationUrl,
   isGatedHost,
@@ -63,6 +80,13 @@ function makeStubReporter(): {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default classifier behavior: label every candidate as a direct listing.
+  // Individual tests can override with mockResolvedValueOnce / mockImplementation
+  // when they need careers-page or irrelevant labels, or when they want the
+  // classifier itself to throw.
+  vi.mocked(classifyPages).mockImplementation(async (input) => ({
+    classifications: input.candidates.map((c) => ({ index: c.index, classification: "direct_job_listing" })),
+  }));
 });
 
 describe("isGatedHost", () => {
@@ -467,6 +491,96 @@ describe("resolveApplicationUrl", () => {
     expect(result.outcome.outcome).toBe("not_found");
     expect(result.trace.braveResults).toEqual([]);
     expect(result.trace.inspectedCandidates).toEqual([]);
+  });
+
+  it("resolves via a careers page when no direct listing matches but a careers-page link does", async () => {
+    vi.mocked(findFirstRunningContainer).mockResolvedValue({ id: 1, hostPort: 41010 });
+    vi.mocked(searchWeb).mockResolvedValue([
+      { title: "Acme Careers", url: "https://acme.com/careers", description: "All openings" },
+    ]);
+    // Classifier labels the only Brave result as a careers_page so the resolver
+    // takes the harvest-then-scrape branch.
+    vi.mocked(classifyPages).mockResolvedValueOnce({
+      classifications: [{ index: 0, classification: "careers_page" }],
+    });
+    vi.mocked(harvestCareersPage).mockResolvedValue({
+      careersPageUrl: "https://acme.com/careers",
+      rawLinkCount: 5,
+      topHrefs: [{ href: "https://acme.com/jobs/swe", text: "SWE", accessibleName: "SWE", score: 0.9 }],
+    });
+    vi.mocked(scrapeJobViaContainer).mockResolvedValue({
+      title: "Software Engineer",
+      company: "Acme",
+      description: "Build cool things at Acme",
+      salary: null,
+      post_date: null,
+      apply_button_url: null,
+      is_job_description: true,
+      reasoning: "",
+    });
+    vi.mocked(evaluateJobMatch).mockReturnValue(matchedVerdict);
+
+    const result = await resolveApplicationUrl({ ...baseInput, originalApplyButtonUrl: null });
+
+    expect(result.outcome).toEqual({
+      outcome: "resolved_via_careers_page",
+      applicationUrl: "https://acme.com/jobs/swe",
+    });
+    expect(harvestCareersPage).toHaveBeenCalledWith(41010, "https://acme.com/careers", "Software Engineer");
+  });
+
+  it("falls back to not_found when the careers-page harvest itself throws", async () => {
+    vi.mocked(findFirstRunningContainer).mockResolvedValue({ id: 1, hostPort: 41010 });
+    vi.mocked(searchWeb).mockResolvedValue([
+      { title: "Acme Careers", url: "https://acme.com/careers", description: "All openings" },
+    ]);
+    vi.mocked(classifyPages).mockResolvedValueOnce({
+      classifications: [{ index: 0, classification: "careers_page" }],
+    });
+    vi.mocked(harvestCareersPage).mockRejectedValue(new Error("container unreachable"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const result = await resolveApplicationUrl({ ...baseInput, originalApplyButtonUrl: null });
+
+    expect(result.outcome.outcome).toBe("not_found");
+    warnSpy.mockRestore();
+  });
+
+  it("skips careers-page harvested hrefs that are gated or malformed", async () => {
+    vi.mocked(findFirstRunningContainer).mockResolvedValue({ id: 1, hostPort: 41010 });
+    vi.mocked(searchWeb).mockResolvedValue([
+      { title: "Acme Careers", url: "https://acme.com/careers", description: "All openings" },
+    ]);
+    vi.mocked(classifyPages).mockResolvedValueOnce({
+      classifications: [{ index: 0, classification: "careers_page" }],
+    });
+    vi.mocked(harvestCareersPage).mockResolvedValue({
+      careersPageUrl: "https://acme.com/careers",
+      rawLinkCount: 3,
+      topHrefs: [
+        { href: "not-a-url", text: "Bad", accessibleName: "Bad", score: 0.8 },
+        { href: "https://linkedin.com/jobs/123", text: "LI", accessibleName: "LI", score: 0.7 },
+        { href: "https://acme.com/jobs/swe", text: "SWE", accessibleName: "SWE", score: 0.9 },
+      ],
+    });
+    vi.mocked(scrapeJobViaContainer).mockResolvedValue({
+      title: "Software Engineer",
+      company: "Acme",
+      description: "Build cool things at Acme",
+      salary: null,
+      post_date: null,
+      apply_button_url: null,
+      is_job_description: true,
+      reasoning: "",
+    });
+    vi.mocked(evaluateJobMatch).mockReturnValue(matchedVerdict);
+
+    const result = await resolveApplicationUrl({ ...baseInput, originalApplyButtonUrl: null });
+
+    expect(result.outcome.outcome).toBe("resolved_via_careers_page");
+    // The bad URL and the gated LinkedIn href should have been skipped — only
+    // the valid acme.com URL is scraped.
+    expect(scrapeJobViaContainer).toHaveBeenCalledWith(41010, "https://acme.com/jobs/swe");
   });
 });
 

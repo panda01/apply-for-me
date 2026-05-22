@@ -12,18 +12,36 @@ import { resolve } from "node:path";
  */
 
 /**
- * User information used to fill out job application forms.
+ * Allowed values for UserInfo.workAuthorization. Mirrors the Prisma
+ * WorkAuthorization enum so the prompt builder doesn't depend on the
+ * generated client. US-only scope by design.
+ */
+export type WorkAuthorization =
+  | "us_citizen"
+  | "permanent_resident"
+  | "authorized_no_sponsorship_needed"
+  | "authorized_future_sponsorship_needed"
+  | "sponsorship_required";
+
+/**
+ * User information used to fill out job application forms. Sourced from a
+ * selected ApplicationProfile row. Required fields below correspond to NOT
+ * NULL columns; everything else is optional and only injected into the agent
+ * prompt when present.
  */
 export interface UserInfo {
   firstName: string;
-  middleName: string;
+  middleName: string | null;
   lastName: string;
   email: string;
   phone: string;
-  github: string;
-  linkedin: string;
-  website: string;
-  resumeUrl: string;
+  github: string | null;
+  linkedin: string | null;
+  website: string | null;
+  resumeUrl: string | null;
+  coverLetterUrl: string | null;
+  workAuthorization: WorkAuthorization | null;
+  desiredSalaryMin: number | null;
 }
 
 /**
@@ -260,30 +278,90 @@ async function saveTaskLog(
 // ─── Prompt Builder ──────────────────────────────────────────────────────────
 
 /**
+ * Maps each WorkAuthorization enum value to a human-readable sentence the
+ * agent can paste into a form when asked. Centralized here so the prompt
+ * stays consistent across application attempts.
+ */
+const WORK_AUTHORIZATION_LABELS: Record<WorkAuthorization, string> = {
+  us_citizen: "US Citizen — authorized to work in the US, no sponsorship needed",
+  permanent_resident: "US Permanent Resident (Green Card holder) — authorized to work in the US, no sponsorship needed",
+  authorized_no_sponsorship_needed: "Authorized to work in the US without sponsorship",
+  authorized_future_sponsorship_needed: "Currently authorized to work in the US, but will require sponsorship in the future",
+  sponsorship_required: "Not currently authorized to work in the US — requires visa sponsorship",
+};
+
+/**
+ * Builds a "Field: value" line for the prompt only when the value is set.
+ * Returns null when the value is null/empty so the caller can filter it out.
+ * @param {string} label - The label that appears before the colon
+ * @param {string | number | null} value - The value to render
+ * @returns {string | null} A formatted line, or null when the value is empty
+ */
+function buildOptionalLine(label: string, value: string | number | null): string | null {
+  const isMissing = value === null || (typeof value === "string" && value.trim().length === 0);
+  if (isMissing) {
+    return null;
+  }
+  return `- ${label}: ${String(value)}`;
+}
+
+/**
+ * Builds the full name line, gracefully omitting the middle name when not
+ * supplied. Returns a "First Last" or "First Middle Last" string.
+ * @param {UserInfo} userInfo - The selected application profile data
+ * @returns {string} The formatted full name
+ */
+function buildFullName(userInfo: UserInfo): string {
+  const parts = [userInfo.firstName, userInfo.middleName, userInfo.lastName].filter(
+    (part) => part !== null && part.trim().length > 0
+  );
+  return parts.join(" ");
+}
+
+/**
  * Builds the prompt that instructs the Browser Use agent to apply to a job.
- * Includes the user's personal information so the agent can fill out application forms.
+ * Includes the user's personal information so the agent can fill out
+ * application forms. Optional fields are omitted when null/empty so the
+ * agent never sees "Field: null" style lines.
  * @param {string} jobUrl - The URL of the job listing to apply to
  * @param {UserInfo} userInfo - The user's personal information for filling out forms
  * @returns {string} The full prompt for the Browser Use agent
  */
 function buildApplicationPrompt(jobUrl: string, userInfo: UserInfo): string {
-  return `Navigate to ${jobUrl}. Your goal is to apply to this job listing.
+  const identityLines = [
+    `- First Name: ${userInfo.firstName}`,
+    buildOptionalLine("Middle Name", userInfo.middleName),
+    `- Last Name: ${userInfo.lastName}`,
+    `- Full Name: ${buildFullName(userInfo)}`,
+    `- Email: ${userInfo.email}`,
+    `- Phone: ${userInfo.phone}`,
+    buildOptionalLine("LinkedIn", userInfo.linkedin),
+    buildOptionalLine("GitHub", userInfo.github),
+    buildOptionalLine("Website/Portfolio", userInfo.website),
+    buildOptionalLine("Resume URL", userInfo.resumeUrl),
+    buildOptionalLine("Cover Letter URL", userInfo.coverLetterUrl),
+    buildOptionalLine(
+      "Work Authorization",
+      userInfo.workAuthorization === null ? null : WORK_AUTHORIZATION_LABELS[userInfo.workAuthorization]
+    ),
+    buildOptionalLine(
+      "Minimum Desired Salary (USD)",
+      userInfo.desiredSalaryMin === null ? null : `$${userInfo.desiredSalaryMin.toLocaleString("en-US")}`
+    ),
+  ].filter((line): line is string => line !== null);
+
+  const coverLetterHint = userInfo.coverLetterUrl !== null
+    ? "\nIf the form has a cover-letter or 'why are you interested' field, open the Cover Letter URL in a new tab to read it and paste the relevant content into the field."
+    : "";
+
+  return `Navigate to ${jobUrl}. Your goal is to apply to this job listing. The position is for a US-based role.
 
   Look for buttons or links that indicate applying to the job, such as "Apply", "Easy Apply", "Submit Application", or similar. Click through those links to get to the application form.
 
 Fill out the application form with the following information:
-- First Name: ${userInfo.firstName}
-- Middle Name: ${userInfo.middleName}
-- Last Name: ${userInfo.lastName}
-- Full Name: ${userInfo.firstName} ${userInfo.middleName} ${userInfo.lastName}
-- Email: ${userInfo.email}
-- Phone: ${userInfo.phone}
-- LinkedIn: ${userInfo.linkedin}
-- GitHub: ${userInfo.github}
-- Website/Portfolio: ${userInfo.website}
-- Resume URL: ${userInfo.resumeUrl}
+${identityLines.join("\n")}
 
-If the form asks to upload a resume, upload the file from the provided resume URL. If a field is optional and you don't have the information, skip it. If there are multiple steps in the application, complete all of them.
+If the form asks to upload a resume, upload the file from the provided resume URL. If a field is optional and you don't have the information, skip it. If there are multiple steps in the application, complete all of them.${coverLetterHint}
 
 If the job listing says it is no longer accepting applications, or the position is closed/filled/expired, stop immediately and report that the listing is closed.
 

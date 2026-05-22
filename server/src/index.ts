@@ -3,6 +3,7 @@ import type { Server } from "node:http";
 import { app } from "./app.js";
 import prisma from "./prismaClient.js";
 import { cleanupAllManagedContainers } from "./services/managedContainerCleanup.js";
+import { seedDefaultProfileIfEmpty } from "./services/applicationProfileSeed.js";
 
 const serverPort = process.env["SERVER_PORT"];
 const isMissingServerPort = !serverPort;
@@ -73,7 +74,12 @@ async function gracefulShutdown(httpServer: Server, signal: string): Promise<voi
   process.exit(0);
 }
 
-verifyDatabaseConnection().then(() => {
+verifyDatabaseConnection().then(async () => {
+  await seedDefaultProfileIfEmpty().catch((err: unknown) => {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[startup] ApplicationProfile seed failed: ${errorMessage}`);
+  });
+
   const httpServer = app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });

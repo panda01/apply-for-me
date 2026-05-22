@@ -7,6 +7,7 @@ import UrlResolutionTracePage from "./pages/UrlResolutionTracePage";
 import ApplicationDashboardPage from "./pages/ApplicationDashboardPage";
 import ContainersListPage from "./pages/ContainersListPage";
 import ContainerViewPage from "./pages/ContainerViewPage";
+import ApplicationProfilesPage from "./pages/ApplicationProfilesPage";
 
 /**
  * Root application component that sets up routing and the navigation menu.
@@ -16,6 +17,7 @@ import ContainerViewPage from "./pages/ContainerViewPage";
  *   /jobs/:id — View a single job listing
  *   /jobs/:id/url-resolution — Admin-facing live trace of the application-URL resolver
  *   /apply — Application dashboard for applying to jobs
+ *   /profiles — CRUD UI for ApplicationProfile rows
  *   /containers — List + spawn managed Docker containers (create is inline)
  *   /containers/:id — View a single managed container with health-check ping
  */
@@ -29,6 +31,7 @@ function App() {
         <Route path="/jobs/:id" element={<JobViewPage />} />
         <Route path="/jobs/:id/url-resolution" element={<UrlResolutionTracePage />} />
         <Route path="/apply" element={<ApplicationDashboardPage />} />
+        <Route path="/profiles" element={<ApplicationProfilesPage />} />
         <Route path="/containers" element={<ContainersListPage />} />
         <Route path="/containers/:id" element={<ContainerViewPage />} />
       </Routes>

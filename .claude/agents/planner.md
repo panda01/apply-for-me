@@ -68,20 +68,36 @@ For new features / refactors / additive changes (no bug to reproduce), Phase 0 i
 
 **Phase 1 — Implement the source-code changes ONLY.** No test code is written in this phase — only the non-test code that delivers the feature/fix/refactor.
 
-**Phase 2 — Invoke the `manual-verifier` agent.** The plan MUST explicitly call out this step. The manual-verifier runs in the "sweet spot" — AFTER non-test source code changes are complete, but BEFORE any test code (vitest, Playwright spec, etc.) is written. It exercises the change end-to-end, checks regressions in adjacent functionality, and reports back to the main agent with PASS / FAIL / REGRESSION / BLOCKED. For bug fixes, the verifier MUST re-run the Phase 0 reproduction steps and confirm the bug NO LONGER reproduces (this is what proves the fix). If verification fails, the main agent fixes the source code and re-invokes the manual-verifier before proceeding. **Tests are NEVER written before manual verification passes** — writing tests first just codifies whatever bug the implementation has.
+**Phase 2 — Invoke the `manual-verifier` agent.** The plan MUST explicitly call out this step. The manual-verifier runs in the "sweet spot" — AFTER non-test source code changes are complete, but BEFORE any automated tests are added (when tests will be added at all — see Phase 3). It exercises the change end-to-end, checks regressions in adjacent functionality, and reports back to the main agent with PASS / FAIL / REGRESSION / BLOCKED. For bug fixes, the verifier MUST re-run the Phase 0 reproduction steps and confirm the bug NO LONGER reproduces (this is what proves the fix). If verification fails, the main agent fixes the source code and re-invokes the manual-verifier before proceeding. **Tests are NEVER written before manual verification passes** — writing tests first just codifies whatever bug the implementation has.
 
-**Phase 3 — Write the automated tests** (vitest unit tests, Playwright specs under `tests/playwright/`). Per project rules, every new feature gets a Playwright test that mirrors the manual checks the manual-verifier ran. For bug fixes, the spec MUST include a regression test that would have caught the original bug (the same scenario the Phase 0 reproduction exercised).
+**Phase 3 — Automated tests (conditional, NOT default).**
+
+Playwright specs under `tests/playwright/` are NOT written by default. Decide using this rule:
+
+1. The user explicitly asked for tests → write them.
+2. Major feature or new user-facing use case AND no existing Playwright spec covers this functionality even partially → planner MUST ask the user (yes/no) whether to add a spec, noting that no current coverage exists.
+3. Major feature or use case AND existing Playwright specs partially cover the area → no new Playwright specs by default; mention the existing coverage in the plan and let the user opt into extending it.
+4. Small change, bug fix, refactor, or any change where partial coverage exists → no new Playwright specs by default.
+
+For bug fixes where Playwright tests are being added anyway (rules 1 or 2), the spec MUST include a regression test that would have caught the original bug (the same scenario the Phase 0 reproduction exercised).
+
+Vitest unit tests follow a lighter rule: add them when the change introduces pure-logic that benefits from focused unit coverage (a new utility, a non-trivial reducer, a parser, a calculation), and skip them for thin UI wiring. Do not write vitest tests just to inflate coverage.
+
+Before declaring whether tests will or will not be written, the planner MUST actually grep `tests/playwright/` for existing coverage of the affected area — never assume.
 
 **Phase 4 — Full verification command sequence**: `/review` (fix must-fix and should-fix) → `npm run test` → `npm run tsc` → `npm run check:duplication` → `npm run test:coverage` → `npm run lint`. Restart the chain on any source change.
 
 **For the manual-verifier handoff (Phase 2), the plan MUST specify:**
-- Concrete, step-by-step manual test scenarios using `npx playwright` (per project rules, unless user requests otherwise)
+- Concrete, step-by-step manual test scenarios the manual-verifier will execute in a real browser (via the Playwright MCP tools)
 - Health-check and homepage sniff-test for dev server verification
 - Expected outcomes for each step
 - Edge cases and failure scenarios
 - A POSITIVE-case fixture (URL/ID that exercises the new behavior) AND a REGRESSION-case fixture (adjacent scenario that must keep working unchanged)
 
-**For the test-writing phase (Phase 3), the plan MUST list:** which Playwright specs in `tests/playwright/` will be added, and what they assert.
+**For Phase 3, the plan MUST state exactly one of:**
+- "No automated tests will be added" + the reason per the Phase 3 rule (e.g. "small change", "partial coverage already exists in tests/playwright/X.spec.ts"), OR
+- "Asking the user: no Playwright coverage exists for this functionality — should I add a spec?" (and the plan blocks on the answer), OR
+- The list of test files that will be added/modified and what each asserts.
 
 **Your Workflow**:
 1. Receive the user's request
@@ -97,7 +113,7 @@ For new features / refactors / additive changes (no bug to reproduce), Phase 0 i
 - Does Section 4 explicitly call out the phase ordering (Phase 0 reproduction if applicable → Phase 1 source code → Phase 2 manual-verifier → Phase 3 tests → Phase 4 full verification chain)?
 - For bug/regression requests: did I include Phase 0 (reproduction by the manual-verifier) BEFORE any source-code phase, with explicit instructions that the bug must reproduce before a fix is attempted?
 - For all requests: does Section 4 explicitly name the `manual-verifier` agent as the gate between source-code implementation and test writing?
-- Does the testing strategy include both manual playwright steps AND the full verification command sequence?
+- Does Section 4 explicitly state whether Phase 3 will write tests (per the Phase 3 rule) or skip them — and does the strategy include the manual-verifier steps and the Phase 4 verification chain?
 - Have I flagged any CLAUDE.md rules that apply (TypeScript only, .mts for modules, JSDoc, MUI components, prisma, etc.)?
 - Have I avoided making any implementation decisions the user should make?
 

@@ -15,6 +15,9 @@ vi.mock("../prismaClient.js", () => {
       applicationAttemptLogs: {
         create: vi.fn(),
       },
+      applicationProfile: {
+        findUnique: vi.fn(),
+      },
     },
   };
 });
@@ -25,22 +28,17 @@ vi.mock("../services/jobApplicationService.js", () => {
   };
 });
 
-const { mockReadFile } = vi.hoisted(() => ({
-  mockReadFile: vi.fn(),
-}));
-vi.mock("node:fs/promises", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return {
-    ...actual,
-    default: { ...actual, readFile: mockReadFile },
-    readFile: mockReadFile,
-  };
-});
-
 import prisma from "../prismaClient.js";
 import { applyToJob } from "../services/jobApplicationService.js";
 
-const mockUserInfoJson = JSON.stringify({
+/**
+ * Fixture mirroring an ApplicationProfile row as returned by Prisma. Used as
+ * the default findUnique mock value so every apply/apply-batch test has a
+ * usable profile to bind to.
+ */
+const mockApplicationProfile = {
+  id: 1,
+  name: "Default",
   firstName: "Khalah",
   middleName: "Ciskei",
   lastName: "Jones-Golden",
@@ -50,7 +48,12 @@ const mockUserInfoJson = JSON.stringify({
   linkedin: "https://www.linkedin.com/in/khalahjonesgolden/",
   website: "https://khalah.medium.com",
   resumeUrl: "https://drive.google.com/file/d/test/view",
-});
+  coverLetterUrl: null,
+  workAuthorization: null,
+  desiredSalaryMin: null,
+  created_date: new Date("2026-05-21T00:00:00.000Z"),
+  updated_date: new Date("2026-05-21T00:00:00.000Z"),
+};
 
 const mockInitJobListing = {
   id: 1,
@@ -74,7 +77,7 @@ const mockApplyingJobListing = {
 beforeEach(() => {
   vi.clearAllMocks();
   process.env["BROWSER_USE_PROFILE_ID"] = "test-profile-id";
-  mockReadFile.mockResolvedValue(mockUserInfoJson);
+  vi.mocked(prisma.applicationProfile.findUnique).mockResolvedValue(mockApplicationProfile);
   vi.mocked(prisma.applicationAttemptLogs.create).mockResolvedValue({
     id: 1, job_listing_id: 1, logs: "[]", end_response: "", created_date: new Date(),
   });
@@ -87,7 +90,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
 
     const response = await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(202);
     expect(response.body.status).toBe("applying");
@@ -102,12 +106,14 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
 
-    await request(app).post("/api/job-listings/1/apply");
+    await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(applyToJob).toHaveBeenCalledWith(
         "https://acme.com/jobs/123/apply",
-        expect.anything(),
+        expect.objectContaining({ firstName: "Khalah", lastName: "Jones-Golden" }),
         "test-profile-id",
         expect.any(Function),
         1
@@ -121,7 +127,9 @@ describe("POST /api/job-listings/:id/apply", () => {
       application_url: null,
     });
 
-    const response = await request(app).post("/api/job-listings/1/apply");
+    const response = await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toMatch(/no application_url/i);
@@ -134,7 +142,9 @@ describe("POST /api/job-listings/:id/apply", () => {
       application_url: "",
     });
 
-    const response = await request(app).post("/api/job-listings/1/apply");
+    const response = await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toMatch(/no application_url/i);
@@ -142,7 +152,8 @@ describe("POST /api/job-listings/:id/apply", () => {
 
   it("should return 400 for invalid id", async () => {
     const response = await request(app)
-      .post("/api/job-listings/abc/apply");
+      .post("/api/job-listings/abc/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toMatch(/Invalid id/);
@@ -152,7 +163,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(null);
 
     const response = await request(app)
-      .post("/api/job-listings/999/apply");
+      .post("/api/job-listings/999/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(404);
     expect(response.body.error).toMatch(/not found/);
@@ -165,7 +177,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     });
 
     const response = await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain("applied");
@@ -178,7 +191,9 @@ describe("POST /api/job-listings/:id/apply", () => {
       application_url: null,
     });
 
-    const response = await request(app).post("/api/job-listings/1/apply");
+    const response = await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(400);
   });
@@ -192,9 +207,31 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
 
     const response = await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(202);
+  });
+
+  it("should return 400 when applicationProfileId is missing from the body", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
+
+    const response = await request(app).post("/api/job-listings/1/apply").send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/applicationProfileId/);
+  });
+
+  it("should return 400 when applicationProfileId points at a missing profile", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
+    vi.mocked(prisma.applicationProfile.findUnique).mockResolvedValue(null);
+
+    const response = await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 999 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/not found/);
   });
 
   it("should return 400 when BROWSER_USE_PROFILE_ID is missing", async () => {
@@ -202,33 +239,11 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
 
     const response = await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain("BROWSER_USE_PROFILE_ID");
-  });
-
-  it("should return 400 when user_info.json cannot be read", async () => {
-    mockReadFile.mockRejectedValue(new Error("ENOENT: no such file"));
-    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
-
-    const response = await request(app)
-      .post("/api/job-listings/1/apply");
-
-    expect(response.status).toBe(400);
-    expect(response.body.error).toContain("ENOENT");
-  });
-
-  it("should stringify a non-Error rejection from readFile in the 400 body", async () => {
-    mockReadFile.mockRejectedValue("non-error-config-failure");
-    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    const response = await request(app).post("/api/job-listings/1/apply");
-
-    expect(response.status).toBe(400);
-    expect(response.body.error).toBe("non-error-config-failure");
-    consoleErrorSpy.mockRestore();
   });
 
   it("should stringify a non-Error rejection from applyToJob in the failure log line", async () => {
@@ -237,7 +252,9 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(applyToJob).mockRejectedValue("non-error-apply-failure");
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    await request(app).post("/api/job-listings/1/apply");
+    await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(consoleErrorSpy).toHaveBeenCalledWith(
@@ -254,7 +271,9 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(prisma.applicationAttemptLogs.create).mockRejectedValue("non-error-attempt-log");
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    await request(app).post("/api/job-listings/1/apply");
+    await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(consoleErrorSpy).toHaveBeenCalledWith(
@@ -270,7 +289,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied", stepLogs: [] });
 
     await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(prisma.jobListing.update).toHaveBeenCalledWith({
@@ -289,7 +309,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     ] });
 
     await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(prisma.applicationAttemptLogs.create).toHaveBeenCalledWith({
@@ -308,7 +329,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(applyToJob).mockRejectedValue(new Error("Application error"));
 
     await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(prisma.applicationAttemptLogs.create).toHaveBeenCalledWith({
@@ -329,7 +351,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(prisma.applicationAttemptLogs.create).mockRejectedValue(new Error("DB write error"));
 
     await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to save attempt log"));
@@ -347,7 +370,9 @@ describe("POST /api/job-listings/:id/apply", () => {
       return { success: true, message: "Applied" };
     });
 
-    await request(app).post("/api/job-listings/1/apply");
+    await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(prisma.jobListing.update).toHaveBeenCalledWith({
@@ -363,7 +388,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(applyToJob).mockResolvedValue({ success: false, closedListing: true, message: "No longer accepting" });
 
     await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(prisma.jobListing.update).toHaveBeenCalledWith({
@@ -380,7 +406,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(applyToJob).mockRejectedValue(new Error("Application error"));
 
     await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(prisma.jobListing.update).toHaveBeenCalledWith({
@@ -399,7 +426,8 @@ describe("POST /api/job-listings/:id/apply", () => {
     vi.mocked(applyToJob).mockResolvedValue({ success: false, message: "Task stopped" });
 
     await request(app)
-      .post("/api/job-listings/1/apply");
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
 
     await vi.waitFor(() => {
       expect(prisma.jobListing.update).toHaveBeenCalledWith({
@@ -420,7 +448,8 @@ describe("POST /api/job-listings/apply-batch", () => {
     vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
 
     const response = await request(app)
-      .post("/api/job-listings/apply-batch");
+      .post("/api/job-listings/apply-batch")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(202);
     expect(response.body.totalJobs).toBe(2);
@@ -432,7 +461,9 @@ describe("POST /api/job-listings/apply-batch", () => {
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
 
-    await request(app).post("/api/job-listings/apply-batch");
+    await request(app)
+      .post("/api/job-listings/apply-batch")
+      .send({ applicationProfileId: 1 });
 
     expect(prisma.jobListing.findMany).toHaveBeenCalledWith({
       where: { status: "init", application_url: { not: null } },
@@ -444,7 +475,8 @@ describe("POST /api/job-listings/apply-batch", () => {
     vi.mocked(prisma.jobListing.findMany).mockResolvedValue([]);
 
     const response = await request(app)
-      .post("/api/job-listings/apply-batch");
+      .post("/api/job-listings/apply-batch")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain("No job listings");
@@ -454,10 +486,31 @@ describe("POST /api/job-listings/apply-batch", () => {
     delete process.env["BROWSER_USE_PROFILE_ID"];
 
     const response = await request(app)
-      .post("/api/job-listings/apply-batch");
+      .post("/api/job-listings/apply-batch")
+      .send({ applicationProfileId: 1 });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain("BROWSER_USE_PROFILE_ID");
+  });
+
+  it("should return 400 when applicationProfileId is missing from the body", async () => {
+    const response = await request(app)
+      .post("/api/job-listings/apply-batch")
+      .send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/applicationProfileId/);
+  });
+
+  it("should return 400 when applicationProfileId points at a missing profile", async () => {
+    vi.mocked(prisma.applicationProfile.findUnique).mockResolvedValue(null);
+
+    const response = await request(app)
+      .post("/api/job-listings/apply-batch")
+      .send({ applicationProfileId: 999 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/not found/);
   });
 });
 
@@ -468,11 +521,13 @@ describe("POST /api/job-listings/apply-batch (batch already running)", () => {
     vi.mocked(applyToJob).mockReturnValue(new Promise(() => {}));
 
     const firstResponse = await request(app)
-      .post("/api/job-listings/apply-batch");
+      .post("/api/job-listings/apply-batch")
+      .send({ applicationProfileId: 1 });
     expect(firstResponse.status).toBe(202);
 
     const secondResponse = await request(app)
-      .post("/api/job-listings/apply-batch");
+      .post("/api/job-listings/apply-batch")
+      .send({ applicationProfileId: 1 });
 
     expect(secondResponse.status).toBe(409);
     expect(secondResponse.body.error).toContain("already running");
@@ -486,10 +541,30 @@ describe("POST /api/job-listings/apply-batch (batch already running)", () => {
   });
 });
 
+/**
+ * Builds a UserInfo fixture matching the shape jobApplicationService.ts expects
+ * (all optional fields nullable). Used in the runBatchApply integration tests.
+ */
+function buildTestUserInfo() {
+  return {
+    firstName: "Khalah",
+    middleName: "Ciskei",
+    lastName: "Jones-Golden",
+    email: "khasan222@gmail.com",
+    phone: "13479770736",
+    github: "https://github.com/panda01",
+    linkedin: "https://www.linkedin.com/in/khalahjonesgolden/",
+    website: "https://khalah.medium.com",
+    resumeUrl: "https://drive.google.com/file/d/test/view",
+    coverLetterUrl: null,
+    workAuthorization: null,
+    desiredSalaryMin: null,
+  };
+}
+
 describe("runBatchApply", () => {
   it("should call handleLiveUrlReady callback during batch apply", async () => {
     const { runBatchApply } = await import("./jobApplications.js");
-    const userInfo = JSON.parse(mockUserInfoJson);
 
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockImplementation(async (_url, _info, _profile, onLiveUrlReady) => {
@@ -500,7 +575,7 @@ describe("runBatchApply", () => {
     });
 
     const jobs = [{ id: 1, url: "https://linkedin.com/jobs/view/123", application_url: "https://acme.com/apply" }];
-    await runBatchApply(jobs, userInfo, "test-profile-id");
+    await runBatchApply(jobs, buildTestUserInfo(), "test-profile-id");
 
     expect(prisma.jobListing.update).toHaveBeenCalledWith({
       where: { id: 1 },
@@ -510,20 +585,18 @@ describe("runBatchApply", () => {
 
   it("drives applyToJob against the application_url, not the source url", async () => {
     const { runBatchApply } = await import("./jobApplications.js");
-    const userInfo = JSON.parse(mockUserInfoJson);
 
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
 
     const jobs = [{ id: 1, url: "https://linkedin.com/jobs/view/1", application_url: "https://acme.com/apply" }];
-    await runBatchApply(jobs, userInfo, "test-profile-id");
+    await runBatchApply(jobs, buildTestUserInfo(), "test-profile-id");
 
     expect(applyToJob).toHaveBeenCalledWith("https://acme.com/apply", expect.anything(), "test-profile-id", expect.any(Function), 1);
   });
 
   it("should set status to closed in batch when closedListing is true", async () => {
     const { runBatchApply, batchState } = await import("./jobApplications.js");
-    const userInfo = JSON.parse(mockUserInfoJson);
 
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockResolvedValue({ success: false, closedListing: true, message: "No longer accepting" });
@@ -534,7 +607,7 @@ describe("runBatchApply", () => {
     batchState.totalJobs = 1;
 
     const jobs = [{ id: 40, url: "https://linkedin.com/jobs/view/closed", application_url: "https://acme.com/closed" }];
-    await runBatchApply(jobs, userInfo, "test-profile-id");
+    await runBatchApply(jobs, buildTestUserInfo(), "test-profile-id");
 
     expect(prisma.jobListing.update).toHaveBeenCalledWith({
       where: { id: 40 },
@@ -545,7 +618,6 @@ describe("runBatchApply", () => {
 
   it("should push to errors when applyToJob returns failure", async () => {
     const { runBatchApply, batchState } = await import("./jobApplications.js");
-    const userInfo = JSON.parse(mockUserInfoJson);
 
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockResolvedValue({ success: false, message: "Task stopped" });
@@ -556,7 +628,7 @@ describe("runBatchApply", () => {
     batchState.totalJobs = 1;
 
     const jobs = [{ id: 10, url: "https://linkedin.com/jobs/view/999", application_url: "https://acme.com/999" }];
-    await runBatchApply(jobs, userInfo, "test-profile-id");
+    await runBatchApply(jobs, buildTestUserInfo(), "test-profile-id");
 
     expect(batchState.errors).toEqual([{ jobId: 10, error: "Task stopped" }]);
     expect(batchState.completed).toEqual([]);
@@ -569,7 +641,6 @@ describe("runBatchApply", () => {
 
   it("should catch errors thrown by applyToJob and push to errors", async () => {
     const { runBatchApply, batchState } = await import("./jobApplications.js");
-    const userInfo = JSON.parse(mockUserInfoJson);
 
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockRejectedValue(new Error("Network failure"));
@@ -580,7 +651,7 @@ describe("runBatchApply", () => {
     batchState.totalJobs = 1;
 
     const jobs = [{ id: 20, url: "https://linkedin.com/jobs/view/888", application_url: "https://acme.com/888" }];
-    await runBatchApply(jobs, userInfo, "test-profile-id");
+    await runBatchApply(jobs, buildTestUserInfo(), "test-profile-id");
 
     expect(batchState.errors).toEqual([{ jobId: 20, error: "Network failure" }]);
     expect(prisma.jobListing.update).toHaveBeenCalledWith({
@@ -591,7 +662,6 @@ describe("runBatchApply", () => {
 
   it("should handle non-Error thrown by applyToJob in catch block", async () => {
     const { runBatchApply, batchState } = await import("./jobApplications.js");
-    const userInfo = JSON.parse(mockUserInfoJson);
 
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockRejectedValue("string error");
@@ -602,7 +672,7 @@ describe("runBatchApply", () => {
     batchState.totalJobs = 1;
 
     const jobs = [{ id: 30, url: "https://linkedin.com/jobs/view/777", application_url: "https://acme.com/777" }];
-    await runBatchApply(jobs, userInfo, "test-profile-id");
+    await runBatchApply(jobs, buildTestUserInfo(), "test-profile-id");
 
     expect(batchState.errors).toEqual([{ jobId: 30, error: "string error" }]);
   });

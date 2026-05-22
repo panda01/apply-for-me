@@ -4,10 +4,29 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import ApplicationDashboardPage from "./ApplicationDashboardPage";
 
+/**
+ * Minimal in-memory localStorage stand-in. The configured jsdom environment
+ * does not expose a real Storage implementation, so we stub one onto window
+ * before the component under test is imported indirectly via React's render.
+ */
+const inMemoryStorage = new Map<string, string>();
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (key: string): string | null => inMemoryStorage.get(key) ?? null,
+    setItem: (key: string, value: string): void => { inMemoryStorage.set(key, value); },
+    removeItem: (key: string): void => { inMemoryStorage.delete(key); },
+    clear: (): void => { inMemoryStorage.clear(); },
+    key: (index: number): string | null => Array.from(inMemoryStorage.keys())[index] ?? null,
+    get length(): number { return inMemoryStorage.size; },
+  },
+});
+
 const mockGetJobListings = vi.fn();
 const mockApplyToJob = vi.fn();
 const mockStartBatchApply = vi.fn();
 const mockGetBatchApplyStatus = vi.fn();
+const mockListApplicationProfiles = vi.fn();
 
 vi.mock("../services/jobListingsApi", () => ({
   getJobListings: (...args: unknown[]) => mockGetJobListings(...args),
@@ -15,6 +34,35 @@ vi.mock("../services/jobListingsApi", () => ({
   startBatchApply: (...args: unknown[]) => mockStartBatchApply(...args),
   getBatchApplyStatus: (...args: unknown[]) => mockGetBatchApplyStatus(...args),
 }));
+
+vi.mock("../services/applicationProfilesApi", () => ({
+  listApplicationProfiles: (...args: unknown[]) => mockListApplicationProfiles(...args),
+  WORK_AUTHORIZATION_LABELS: {},
+}));
+
+/**
+ * Fixture for an ApplicationProfile row returned by listApplicationProfiles.
+ * Used to seed the picker so the Apply/Apply All buttons are enabled in tests
+ * that exercise the button flow.
+ */
+const mockProfile = {
+  id: 7,
+  name: "Default",
+  firstName: "Khalah",
+  middleName: null,
+  lastName: "Jones-Golden",
+  email: "khasan222@gmail.com",
+  phone: "13479770736",
+  github: null,
+  linkedin: null,
+  website: null,
+  resumeUrl: null,
+  coverLetterUrl: null,
+  workAuthorization: null,
+  desiredSalaryMin: null,
+  created_date: "2026-05-21T00:00:00.000Z",
+  updated_date: "2026-05-21T00:00:00.000Z",
+};
 
 const mockInitListing = {
   id: 1,
@@ -76,8 +124,10 @@ function renderDashboard() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  window.localStorage.clear();
   mockGetJobListings.mockResolvedValue([]);
   mockGetBatchApplyStatus.mockResolvedValue(mockBatchStatus);
+  mockListApplicationProfiles.mockResolvedValue([mockProfile]);
 });
 
 describe("ApplicationDashboardPage", () => {
@@ -168,7 +218,7 @@ describe("ApplicationDashboardPage", () => {
     });
   });
 
-  it("should call applyToJob when Apply button is clicked", async () => {
+  it("should call applyToJob with the selected profile when Apply button is clicked", async () => {
     mockGetJobListings.mockResolvedValue([mockInitListing]);
     mockApplyToJob.mockResolvedValue({ ...mockInitListing, status: "applying" });
     renderDashboard();
@@ -176,13 +226,17 @@ describe("ApplicationDashboardPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Apply")).toBeDefined();
     });
+    await waitFor(() => {
+      const applyButton = screen.getByText("Apply").closest("button");
+      expect(applyButton?.hasAttribute("disabled")).toBe(false);
+    });
 
     await userEvent.click(screen.getByText("Apply"));
 
-    expect(mockApplyToJob).toHaveBeenCalledWith(1);
+    expect(mockApplyToJob).toHaveBeenCalledWith(1, 7);
   });
 
-  it("should call startBatchApply when Apply to All is clicked", async () => {
+  it("should call startBatchApply with the selected profile when Apply to All is clicked", async () => {
     mockGetJobListings.mockResolvedValue([mockInitListing]);
     mockStartBatchApply.mockResolvedValue({ message: "Started", totalJobs: 1 });
     renderDashboard();
@@ -190,10 +244,14 @@ describe("ApplicationDashboardPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Apply to All")).toBeDefined();
     });
+    await waitFor(() => {
+      const applyAllButton = screen.getByText("Apply to All").closest("button");
+      expect(applyAllButton?.hasAttribute("disabled")).toBe(false);
+    });
 
     await userEvent.click(screen.getByText("Apply to All"));
 
-    expect(mockStartBatchApply).toHaveBeenCalled();
+    expect(mockStartBatchApply).toHaveBeenCalledWith(7);
   });
 
   it("should show batch progress bar when batch is running", async () => {
@@ -338,10 +396,100 @@ describe("ApplicationDashboardPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Retry")).toBeDefined();
     });
+    await waitFor(() => {
+      const retryButton = screen.getByText("Retry").closest("button");
+      expect(retryButton?.hasAttribute("disabled")).toBe(false);
+    });
 
     await userEvent.click(screen.getByText("Retry"));
 
-    expect(mockApplyToJob).toHaveBeenCalledWith(4);
+    expect(mockApplyToJob).toHaveBeenCalledWith(4, 7);
+  });
+
+  it("surfaces a fetch error when listApplicationProfiles rejects", async () => {
+    mockListApplicationProfiles.mockRejectedValue(new Error("Profiles backend down"));
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText("Profiles backend down")).toBeDefined();
+    });
+  });
+
+  it("surfaces a generic error when listApplicationProfiles rejects with a non-Error", async () => {
+    mockListApplicationProfiles.mockRejectedValue("string failure");
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText("Failed to load application profiles")).toBeDefined();
+    });
+  });
+
+  it("shows the empty-state CTA when there are no application profiles", async () => {
+    mockListApplicationProfiles.mockResolvedValue([]);
+    mockGetJobListings.mockResolvedValue([mockInitListing]);
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText("No application profiles yet.")).toBeDefined();
+      expect(screen.getByRole("link", { name: /Create application profile/ })).toBeDefined();
+    });
+  });
+
+  it("disables Apply and Apply to All while no profile is selected", async () => {
+    mockListApplicationProfiles.mockResolvedValue([]);
+    mockGetJobListings.mockResolvedValue([mockInitListing]);
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText("Apply to All")).toBeDefined();
+    });
+    const applyAllButton = screen.getByText("Apply to All").closest("button");
+    expect(applyAllButton?.hasAttribute("disabled")).toBe(true);
+
+    const applyButton = screen.getByText("Apply").closest("button");
+    expect(applyButton?.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("changes the selected profile when the user picks a different option", async () => {
+    const secondProfile = { ...mockProfile, id: 99, name: "Backup" };
+    mockListApplicationProfiles.mockResolvedValue([secondProfile, mockProfile]);
+    mockGetJobListings.mockResolvedValue([mockInitListing]);
+    mockApplyToJob.mockResolvedValue({ ...mockInitListing, status: "applying" });
+    renderDashboard();
+
+    // First profile in the list (id=99) is auto-selected as the initial value.
+    // Switch to the second (id=7) via the combobox to exercise the onChange handler.
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: /Application profile/ })).toBeDefined();
+    });
+    await userEvent.click(screen.getByRole("combobox", { name: /Application profile/ }));
+    await userEvent.click(screen.getByRole("option", { name: /Default/ }));
+
+    await waitFor(() => {
+      const applyButton = screen.getByText("Apply").closest("button");
+      expect(applyButton?.hasAttribute("disabled")).toBe(false);
+    });
+    await userEvent.click(screen.getByText("Apply"));
+    expect(mockApplyToJob).toHaveBeenCalledWith(1, 7);
+  });
+
+  it("restores the previously selected profile from localStorage", async () => {
+    const secondProfile = { ...mockProfile, id: 99, name: "Backup" };
+    mockListApplicationProfiles.mockResolvedValue([mockProfile, secondProfile]);
+    mockGetJobListings.mockResolvedValue([mockInitListing]);
+    window.localStorage.setItem("afm:selectedApplicationProfileId", "99");
+    mockApplyToJob.mockResolvedValue({ ...mockInitListing, status: "applying" });
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText("Apply")).toBeDefined();
+    });
+    await waitFor(() => {
+      const applyButton = screen.getByText("Apply").closest("button");
+      expect(applyButton?.hasAttribute("disabled")).toBe(false);
+    });
+    await userEvent.click(screen.getByText("Apply"));
+    expect(mockApplyToJob).toHaveBeenCalledWith(1, 99);
   });
 
   it("should show generic error when non-Error is thrown from startBatchApply", async () => {

@@ -222,10 +222,14 @@ describe("applyToJob", () => {
       json: () => Promise.resolve({ ...mockListing, status: "applying" }),
     }));
 
-    const result = await applyToJob(1);
+    const result = await applyToJob(1, 7);
 
     expect(result.status).toBe("applying");
-    expect(fetch).toHaveBeenCalledWith("/api/job-listings/1/apply", { method: "POST" });
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings/1/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ applicationProfileId: 7 }),
+    });
   });
 
   it("should throw on failure", async () => {
@@ -234,7 +238,7 @@ describe("applyToJob", () => {
       json: () => Promise.resolve({ error: "Job listing not found" }),
     }));
 
-    await expect(applyToJob(999)).rejects.toThrow("Job listing not found");
+    await expect(applyToJob(999, 7)).rejects.toThrow("Job listing not found");
   });
 
   it("should throw generic message when error body has no error field", async () => {
@@ -243,7 +247,7 @@ describe("applyToJob", () => {
       json: () => Promise.resolve({}),
     }));
 
-    await expect(applyToJob(1)).rejects.toThrow("Failed to start job application");
+    await expect(applyToJob(1, 7)).rejects.toThrow("Failed to start job application");
   });
 });
 
@@ -254,10 +258,14 @@ describe("startBatchApply", () => {
       json: () => Promise.resolve({ message: "Batch started", totalJobs: 5 }),
     }));
 
-    const result = await startBatchApply();
+    const result = await startBatchApply(7);
 
     expect(result.totalJobs).toBe(5);
-    expect(fetch).toHaveBeenCalledWith("/api/job-listings/apply-batch", { method: "POST" });
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings/apply-batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ applicationProfileId: 7 }),
+    });
   });
 
   it("should throw on failure", async () => {
@@ -266,7 +274,7 @@ describe("startBatchApply", () => {
       json: () => Promise.resolve({ error: "No job listings" }),
     }));
 
-    await expect(startBatchApply()).rejects.toThrow("No job listings");
+    await expect(startBatchApply(7)).rejects.toThrow("No job listings");
   });
 
   it("should throw generic message when error body has no error field", async () => {
@@ -275,7 +283,7 @@ describe("startBatchApply", () => {
       json: () => Promise.resolve({}),
     }));
 
-    await expect(startBatchApply()).rejects.toThrow("Failed to start batch application");
+    await expect(startBatchApply(7)).rejects.toThrow("Failed to start batch application");
   });
 });
 

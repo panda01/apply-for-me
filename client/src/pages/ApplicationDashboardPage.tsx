@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from "react";
+import { Link as RouterLink } from "react-router-dom";
 import {
   Container, Typography, CircularProgress, Alert, Box,
-  Paper, Chip, Button, List,
+  Paper, Chip, Button, List, MenuItem, TextField,
   Divider, LinearProgress,
 } from "@mui/material";
 import {
@@ -11,9 +12,19 @@ import {
   getJobListings, applyToJob, startBatchApply, getBatchApplyStatus,
   type JobListingResponse, type BatchApplyStatusResponse,
 } from "../services/jobListingsApi";
+import {
+  listApplicationProfiles,
+  type ApplicationProfileResponse,
+} from "../services/applicationProfilesApi";
 import JobRow from "../components/JobRow";
 import JobSection from "../components/JobSection";
 import LiveBrowserView from "../components/LiveBrowserView";
+
+/**
+ * localStorage key under which the last-used ApplicationProfile id is
+ * persisted, so users don't have to re-pick the same profile every visit.
+ */
+const SELECTED_PROFILE_STORAGE_KEY = "afm:selectedApplicationProfileId";
 
 /**
  * Dashboard page for managing and monitoring job applications.
@@ -28,6 +39,9 @@ function ApplicationDashboardPage() {
   const [actionErrorMessage, setActionErrorMessage] = useState("");
   const [isStartingBatch, setIsStartingBatch] = useState(false);
   const [applyingJobId, setApplyingJobId] = useState<number | null>(null);
+  const [profiles, setProfiles] = useState<ApplicationProfileResponse[]>([]);
+  const [isLoadingProfiles, setIsLoadingProfiles] = useState(true);
+  const [selectedProfileId, setSelectedProfileId] = useState<number | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchListings = useCallback(async () => {
@@ -52,10 +66,45 @@ function ApplicationDashboardPage() {
     }
   }, []);
 
+  // Loads the user's ApplicationProfiles and restores the last-used selection
+  // from localStorage when that profile still exists. Falls back to the first
+  // profile when the stored id is gone (e.g. profile was deleted).
+  const fetchProfiles = useCallback(async () => {
+    try {
+      const records = await listApplicationProfiles();
+      setProfiles(records);
+
+      const storedRaw = window.localStorage.getItem(SELECTED_PROFILE_STORAGE_KEY);
+      const storedId = storedRaw === null ? null : parseInt(storedRaw, 10);
+      const storedStillExists = storedId !== null && records.some((p) => p.id === storedId);
+
+      if (storedStillExists) {
+        setSelectedProfileId(storedId);
+      } else if (records.length > 0) {
+        setSelectedProfileId(records[0].id);
+      } else {
+        setSelectedProfileId(null);
+      }
+    } catch (err) {
+      const errorText = err instanceof Error ? err.message : "Failed to load application profiles";
+      setListErrorMessage(errorText);
+    } finally {
+      setIsLoadingProfiles(false);
+    }
+  }, []);
+
   useEffect(() => {
     fetchListings();
     fetchBatchStatus();
-  }, [fetchListings, fetchBatchStatus]);
+    fetchProfiles();
+  }, [fetchListings, fetchBatchStatus, fetchProfiles]);
+
+  // Persist the user's profile pick so it survives page reloads.
+  useEffect(() => {
+    if (selectedProfileId !== null) {
+      window.localStorage.setItem(SELECTED_PROFILE_STORAGE_KEY, String(selectedProfileId));
+    }
+  }, [selectedProfileId]);
 
   useEffect(() => {
     const hasActiveApplication = jobListings.some((listing) => listing.status === "applying");
@@ -83,11 +132,15 @@ function ApplicationDashboardPage() {
     };
   }, [jobListings, fetchListings, fetchBatchStatus]);
 
+  // The Apply / Retry / Apply All buttons are disabled when selectedProfileId
+  // is null, so by the time these handlers run we always have a non-null id.
+  // The non-null assertion is safe because of the gating on JobRow.action.disabled
+  // and Apply to All's `disabled` prop in the render block below.
   const handleApplyToJob = async (jobId: number) => {
     setApplyingJobId(jobId);
     setActionErrorMessage("");
     try {
-      await applyToJob(jobId);
+      await applyToJob(jobId, selectedProfileId!);
       await fetchListings();
     } catch (err) {
       const errorText = err instanceof Error ? err.message : "Failed to start application";
@@ -101,7 +154,7 @@ function ApplicationDashboardPage() {
     setIsStartingBatch(true);
     setActionErrorMessage("");
     try {
-      await startBatchApply();
+      await startBatchApply(selectedProfileId!);
       await fetchListings();
       await fetchBatchStatus();
     } catch (err) {
@@ -111,6 +164,9 @@ function ApplicationDashboardPage() {
       setIsStartingBatch(false);
     }
   };
+
+  const hasNoProfile = selectedProfileId === null;
+  const hasNoProfilesAtAll = !isLoadingProfiles && profiles.length === 0;
 
   const initJobs = jobListings.filter((listing) => listing.status === "init");
   const applyingJobs = jobListings.filter((listing) => listing.status === "applying");
@@ -156,6 +212,55 @@ function ApplicationDashboardPage() {
 
       {!isLoadingList && (
         <>
+          {/* Profile Picker */}
+          <Paper elevation={1} sx={{ p: 2, mb: 3 }} data-testid="profile-picker-panel">
+            {hasNoProfilesAtAll ? (
+              <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 1 }}>
+                <Typography variant="subtitle1">No application profiles yet.</Typography>
+                <Typography color="text.secondary" variant="body2">
+                  Create one to start applying. A profile holds the personal info used to fill out forms.
+                </Typography>
+                <Button
+                  variant="contained"
+                  component={RouterLink}
+                  to="/profiles"
+                  sx={{ mt: 1 }}
+                >
+                  Create application profile
+                </Button>
+              </Box>
+            ) : (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 2, flexWrap: "wrap" }} data-testid="profile-picker-select">
+                <TextField
+                  select
+                  label="Application profile"
+                  value={selectedProfileId === null ? "" : String(selectedProfileId)}
+                  onChange={(e) => {
+                    const parsed = parseInt(e.target.value, 10);
+                    setSelectedProfileId(Number.isNaN(parsed) ? null : parsed);
+                  }}
+                  disabled={isLoadingProfiles || applyingJobs.length > 0 || isStartingBatch}
+                  sx={{ minWidth: 320 }}
+                  helperText="Used to fill out every application started from this page."
+                >
+                  {profiles.map((profile) => (
+                    <MenuItem key={profile.id} value={String(profile.id)}>
+                      {profile.name} — {profile.firstName} {profile.lastName}
+                    </MenuItem>
+                  ))}
+                </TextField>
+                <Button
+                  variant="text"
+                  component={RouterLink}
+                  to="/profiles"
+                  size="small"
+                >
+                  Manage profiles
+                </Button>
+              </Box>
+            )}
+          </Paper>
+
           {/* Live Application View */}
           {currentlyApplyingJob && (
             <Paper elevation={2} sx={{ p: 3, mb: 3 }}>
@@ -201,7 +306,7 @@ function ApplicationDashboardPage() {
                 variant="contained"
                 startIcon={isStartingBatch ? <CircularProgress size={16} color="inherit" /> : <PlaylistPlayIcon />}
                 onClick={handleStartBatchApply}
-                disabled={isStartingBatch || initJobs.length === 0 || applyingJobs.length > 0}
+                disabled={isStartingBatch || initJobs.length === 0 || applyingJobs.length > 0 || hasNoProfile}
               >
                 Apply to All
               </Button>
@@ -221,7 +326,7 @@ function ApplicationDashboardPage() {
                   action={{
                     label: "Apply",
                     onClick: handleApplyToJob,
-                    disabled: applyingJobId !== null || applyingJobs.length > 0,
+                    disabled: applyingJobId !== null || applyingJobs.length > 0 || hasNoProfile,
                     isLoading: applyingJobId === listing.id,
                   }}
                 />
@@ -259,7 +364,7 @@ function ApplicationDashboardPage() {
                     label: "Retry",
                     color: "warning",
                     onClick: handleApplyToJob,
-                    disabled: applyingJobId !== null || applyingJobs.length > 0,
+                    disabled: applyingJobId !== null || applyingJobs.length > 0 || hasNoProfile,
                     isLoading: applyingJobId === listing.id,
                   }}
                 />

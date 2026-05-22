@@ -22,12 +22,13 @@ describe("NavMenu", () => {
     expect(screen.getByText("Apply For Me")).toBeDefined();
   });
 
-  it("should render navigation links for Add Job, Jobs List, Apply, and Containers", () => {
+  it("should render navigation links for Add Job, Jobs List, Apply, Profiles, and Containers", () => {
     renderNavMenu();
 
     expect(screen.getByRole("link", { name: /Add Job/ })).toBeDefined();
     expect(screen.getByRole("link", { name: /Jobs List/ })).toBeDefined();
     expect(screen.getByRole("link", { name: /Apply/ })).toBeDefined();
+    expect(screen.getByRole("link", { name: /Profiles/ })).toBeDefined();
     expect(screen.getByRole("link", { name: /Containers/ })).toBeDefined();
   });
 

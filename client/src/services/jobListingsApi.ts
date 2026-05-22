@@ -284,15 +284,24 @@ export async function bulkCreateJobListings(urls: string[]): Promise<{ count: nu
 }
 
 /**
- * Starts the application process for a single job listing.
+ * Starts the application process for a single job listing using the supplied
+ * ApplicationProfile to fill out the form.
  * @param {number} id - The ID of the job listing to apply to
+ * @param {number} applicationProfileId - The id of the ApplicationProfile to use
  * @returns {Promise<JobListingResponse>} The job listing with status "applying"
  * @throws {Error} If the API request fails
  */
-export async function applyToJob(id: number): Promise<JobListingResponse> {
+export async function applyToJob(
+  id: number,
+  applicationProfileId: number
+): Promise<JobListingResponse> {
   return requestJson<JobListingResponse>(
     `/api/job-listings/${String(id)}/apply`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ applicationProfileId }),
+    },
     "Failed to start job application"
   );
 }
@@ -310,14 +319,22 @@ export interface BatchApplyStatusResponse {
 }
 
 /**
- * Starts the batch application process for all eligible job listings.
+ * Starts the batch application process for all eligible job listings using
+ * the supplied ApplicationProfile for every job in the batch.
+ * @param {number} applicationProfileId - The id of the ApplicationProfile to use for the batch
  * @returns {Promise<{ message: string; totalJobs: number }>} Batch start confirmation
  * @throws {Error} If the API request fails
  */
-export async function startBatchApply(): Promise<{ message: string; totalJobs: number }> {
+export async function startBatchApply(
+  applicationProfileId: number
+): Promise<{ message: string; totalJobs: number }> {
   return requestJson<{ message: string; totalJobs: number }>(
     "/api/job-listings/apply-batch",
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ applicationProfileId }),
+    },
     "Failed to start batch application"
   );
 }

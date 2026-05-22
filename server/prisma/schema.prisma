@@ -10,6 +10,46 @@ datasource db {
   provider = "sqlite"
 }
 
+// Stored on ApplicationProfile.workAuthorization. US-only options since the
+// app currently scopes to US-based positions. Mapped to human-readable
+// strings by the prompt builder in jobApplicationService.ts.
+enum WorkAuthorization {
+  us_citizen
+  permanent_resident
+  authorized_no_sponsorship_needed
+  authorized_future_sponsorship_needed
+  sponsorship_required
+}
+
+// A reusable bundle of personal info used to fill out job-application forms.
+// One row per "identity" the user wants to apply with — e.g. "Default",
+// "Tech roles", "Contract work". The Apply flow loads the chosen row by id
+// and feeds it into the Browser-Use prompt.
+//
+// Optional fields are nullable in the DB and only injected into the prompt
+// when set, so users can leave them blank without polluting the agent's
+// instructions with empty values.
+model ApplicationProfile {
+  id                  Int                @id @default(autoincrement())
+  name                String             @unique // User-facing label, e.g. "Default"
+  firstName           String
+  middleName          String?
+  lastName            String
+  email               String
+  phone               String
+  github              String?
+  linkedin            String?
+  website             String?
+  resumeUrl           String?
+  coverLetterUrl      String? // Link to a hosted cover letter (Google Doc / PDF). Agent can open it for cover-letter prompts.
+  workAuthorization   WorkAuthorization?
+  desiredSalaryMin    Int? // USD, whole dollars; minimum acceptable salary, no max field by design.
+  created_date        DateTime           @default(now())
+  updated_date        DateTime           @updatedAt
+
+  @@map("application_profiles")
+}
+
 // Tracks the application lifecycle of a job listing.
 // Other lifecycle statuses (e.g. waiting_for_response, approved, rejected)
 // will be handled by separate services and added later.
@@ -51,16 +91,6 @@ model ApplicationAttemptLogs {
   @@map("application_attempt_logs")
 }
 
-// This model is used to store the email responses for each job listing
-model EmailResponses {
-  id             Int      @id @default(autoincrement())
-  job_listing_id Int
-  email          String
-  response       String?
-  created_date   DateTime @default(now())
-
-  @@map("email_responses")
-}
 
 // Possible verdicts the application-URL resolver can land on. Mirrors the
 // discriminated union ResolverOutcome in applicationUrlResolverService.ts so
