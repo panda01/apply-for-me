@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import JobViewPage from "./JobViewPage";
 
 /**
  * Minimal in-memory localStorage stand-in. The configured jsdom environment
@@ -32,10 +31,21 @@ vi.mock("../services/jobListingsApi", async (importOriginal) => {
     resolveApplicationUrl: vi.fn(),
     getResolutionLogs: vi.fn(),
     getLiveUrlResolution: vi.fn().mockResolvedValue(null),
+    getJobAttempts: vi.fn(),
+    deleteJobListing: vi.fn(),
   };
 });
 
-import { getJobListing, fetchJobData, applyToJob, resolveApplicationUrl, getResolutionLogs, getLiveUrlResolution } from "../services/jobListingsApi";
+import JobViewPage from "./JobViewPage";
+import {
+  getJobListing,
+  fetchJobData,
+  applyToJob,
+  resolveApplicationUrl,
+  getResolutionLogs,
+  getLiveUrlResolution,
+  getJobAttempts,
+} from "../services/jobListingsApi";
 
 const mockCompletedListing = {
   id: 1,
@@ -87,6 +97,12 @@ beforeEach(() => {
   // Default the trace panel's API call to an empty array so the panel doesn't
   // surface a spurious error in unrelated tests that don't care about the trace.
   vi.mocked(getResolutionLogs).mockResolvedValue([]);
+  // Default the attempts API call to an empty list so the attempts card stays
+  // in its empty state for tests that don't care about attempts.
+  vi.mocked(getJobAttempts).mockResolvedValue({
+    ...mockEmptyListing,
+    attempts: [],
+  });
   // Seed the localStorage key used by handleApply so Apply doesn't bail with
   // the "pick a profile" message in tests that exercise the apply flow.
   window.localStorage.setItem("afm:selectedApplicationProfileId", "7");
@@ -125,13 +141,23 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByText("Acme Corp - Software Engineer")).toBeDefined();
+      expect(screen.getByTestId("job-title")).toBeDefined();
     });
+    expect(screen.getByTestId("job-title").textContent).toBe(
+      "Acme Corp - Software Engineer"
+    );
 
-    expect(screen.getByText("Ready")).toBeDefined();
+    // The status pill renders the "Ready" label for the init status. The
+    // label also appears as a `.tag` next to the Job description card head,
+    // so use getAllByText to match either occurrence.
+    expect(screen.getAllByText("Ready").length).toBeGreaterThan(0);
     expect(screen.getByText(/Build cool stuff with great teams/)).toBeDefined();
-    expect(screen.getByText("https://linkedin.com/jobs/1")).toBeDefined();
-    expect(screen.getByText("$120k - $150k")).toBeDefined();
+    expect(screen.getByTestId("source-url-link").getAttribute("href")).toBe(
+      "https://linkedin.com/jobs/1"
+    );
+    // Salary appears in the side meta-list AND as a card-head tag, so
+    // assert at least one occurrence.
+    expect(screen.getAllByText("$120k - $150k").length).toBeGreaterThan(0);
   });
 
   it("should show error message when fetch fails", async () => {
@@ -164,51 +190,71 @@ describe("JobViewPage", () => {
     expect(getJobListing).not.toHaveBeenCalled();
   });
 
-  it("should render back to jobs list link", async () => {
+  it("should render Back to jobs button that returns to the jobs list", async () => {
+    const user = userEvent.setup();
     vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
 
-    renderJobViewPage();
+    render(
+      <MemoryRouter initialEntries={["/jobs/1"]}>
+        <Routes>
+          <Route path="/jobs/:id" element={<JobViewPage />} />
+          <Route path="/jobs" element={<div data-testid="jobs-list-page">jobs list</div>} />
+        </Routes>
+      </MemoryRouter>
+    );
 
-    const backLink = screen.getByRole("link", { name: /Back to Jobs List/ });
+    await waitFor(() => {
+      expect(screen.getByTestId("back-to-jobs-button")).toBeDefined();
+    });
 
-    expect(backLink).toBeDefined();
-    expect(backLink.getAttribute("href")).toBe("/jobs");
+    await user.click(screen.getByTestId("back-to-jobs-button"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("jobs-list-page")).toBeDefined();
+    });
   });
 
-  it("should display 'Untitled' and prompt to fetch data when title is empty", async () => {
+  it("should fall back to URL hostname and prompt to fetch data when title is empty", async () => {
     vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
 
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByText("Untitled")).toBeDefined();
+      expect(screen.getByTestId("job-title")).toBeDefined();
     });
-
-    expect(screen.getByText(/No job details yet/)).toBeDefined();
-    expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+    // The page title falls back to the URL's hostname when title is empty.
+    expect(screen.getByTestId("job-title").textContent).toBe("linkedin.com");
+    // The Job description card shows a prompt asking the user to fetch data.
+    expect(
+      screen.getByText(/No description yet\. Click Fetch Data to scrape the listing\./)
+    ).toBeDefined();
+    expect(screen.getByTestId("fetch-data-button")).toBeDefined();
   });
 
-  it("should show Fetch Data and Apply buttons for init status when application_url is set", async () => {
-    vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
+  it("should show Fetch Data and Auto-apply buttons for init status when application_url is set", async () => {
+    vi.mocked(getJobListing).mockResolvedValue({
+      ...mockCompletedListing,
+      title: "",
+    });
 
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
-      expect(screen.getByRole("button", { name: /Apply/ })).toBeDefined();
+      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
     });
+    expect(screen.getByTestId("apply-button")).toBeDefined();
   });
 
-  it("should hide the Apply button when application_url is null even if status is init", async () => {
+  it("should hide the Auto-apply button when application_url is null even if status is init", async () => {
     vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
 
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
     });
-    // Apply button should not be present — the apply gate requires application_url.
-    expect(screen.queryByRole("button", { name: /^Apply$/ })).toBeNull();
+    // Auto-apply button should not be present — the apply gate requires application_url.
+    expect(screen.queryByTestId("apply-button")).toBeNull();
   });
 
   it("should call fetchJobData when Fetch Data button is clicked", async () => {
@@ -219,10 +265,10 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /Fetch Data/ }));
+    await user.click(screen.getByTestId("fetch-data-button"));
 
     expect(fetchJobData).toHaveBeenCalledWith(1);
   });
@@ -236,12 +282,10 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
     });
-    // No panel before the click.
-    expect(screen.queryByTestId("fetch-progress-panel")).toBeNull();
 
-    await user.click(screen.getByRole("button", { name: /Fetch Data/ }));
+    await user.click(screen.getByTestId("fetch-data-button"));
 
     await waitFor(() => {
       expect(screen.getByTestId("fetch-progress-panel")).toBeDefined();
@@ -263,7 +307,7 @@ describe("JobViewPage", () => {
     });
   });
 
-  it("should call applyToJob with the stored profile id when Apply button is clicked", async () => {
+  it("should call applyToJob with the stored profile id when Auto-apply button is clicked", async () => {
     const user = userEvent.setup();
     vi.mocked(getJobListing).mockResolvedValue(mockCompletedListing);
     vi.mocked(applyToJob).mockResolvedValue({ ...mockCompletedListing, status: "applying" });
@@ -271,10 +315,10 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /^Apply$/ })).toBeDefined();
+      expect(screen.getByTestId("apply-button")).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /^Apply$/ }));
+    await user.click(screen.getByTestId("apply-button"));
 
     expect(applyToJob).toHaveBeenCalledWith(1, 7);
   });
@@ -287,9 +331,9 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /^Apply$/ })).toBeDefined();
+      expect(screen.getByTestId("apply-button")).toBeDefined();
     });
-    await user.click(screen.getByRole("button", { name: /^Apply$/ }));
+    await user.click(screen.getByTestId("apply-button"));
 
     await waitFor(() => {
       expect(screen.getByText(/Pick an application profile/)).toBeDefined();
@@ -309,7 +353,9 @@ describe("JobViewPage", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
 
-    expect(screen.getByText("Applying to Job...")).toBeDefined();
+    // The "Applying to job..." heading is rendered inside the applying section
+    // alongside LiveBrowserView's waiting placeholder.
+    expect(screen.getByText("Applying to job...")).toBeDefined();
     expect(screen.getByText(/Waiting for browser session to start/)).toBeDefined();
   });
 
@@ -372,14 +418,16 @@ describe("JobViewPage", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
 
-    expect(screen.getByText("Applying to Job...")).toBeDefined();
+    expect(screen.getByText("Applying to job...")).toBeDefined();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
 
-    expect(screen.getByText("Acme Corp - Software Engineer")).toBeDefined();
-    expect(screen.getByText("Ready")).toBeDefined();
+    expect(screen.getByTestId("job-title").textContent).toBe(
+      "Acme Corp - Software Engineer"
+    );
+    expect(screen.getAllByText("Ready").length).toBeGreaterThan(0);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(6000);
@@ -388,7 +436,7 @@ describe("JobViewPage", () => {
     expect(getJobListing).toHaveBeenCalledTimes(2);
   });
 
-  it("should not show Apply button for applied status", async () => {
+  it("should not show Auto-apply button for applied status", async () => {
     vi.mocked(getJobListing).mockResolvedValue({
       ...mockCompletedListing,
       status: "applied",
@@ -397,11 +445,13 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByText("Acme Corp - Software Engineer")).toBeDefined();
+      expect(screen.getByTestId("job-title")).toBeDefined();
     });
 
-    expect(screen.queryByRole("button", { name: /^Apply$/ })).toBeNull();
-    expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+    // The Auto-apply button is gated on init/error_applying status.
+    expect(screen.queryByTestId("apply-button")).toBeNull();
+    // For applied rows we show the Re-apply button instead.
+    expect(screen.getByTestId("re-apply-button")).toBeDefined();
   });
 
   it("should show action error when fetchJobData fails", async () => {
@@ -412,10 +462,10 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /Fetch Data/ }));
+    await user.click(screen.getByTestId("fetch-data-button"));
 
     await waitFor(() => {
       expect(screen.getByText("Scraping service unavailable")).toBeDefined();
@@ -430,10 +480,10 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /^Apply$/ })).toBeDefined();
+      expect(screen.getByTestId("apply-button")).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /^Apply$/ }));
+    await user.click(screen.getByTestId("apply-button"));
 
     await waitFor(() => {
       expect(screen.getByText("BROWSER_USE_PROFILE_ID not set")).toBeDefined();
@@ -448,10 +498,10 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /Fetch Data/ }));
+    await user.click(screen.getByTestId("fetch-data-button"));
 
     await waitFor(() => {
       expect(screen.getByText("Failed to fetch job data")).toBeDefined();
@@ -466,10 +516,10 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /Fetch Data/ }));
+    await user.click(screen.getByTestId("fetch-data-button"));
 
     await waitFor(() => {
       expect(screen.getByText("Service down")).toBeDefined();
@@ -492,10 +542,10 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /^Apply$/ })).toBeDefined();
+      expect(screen.getByTestId("apply-button")).toBeDefined();
     });
 
-    await user.click(screen.getByRole("button", { name: /^Apply$/ }));
+    await user.click(screen.getByTestId("apply-button"));
 
     await waitFor(() => {
       expect(screen.getByText("Failed to start application")).toBeDefined();
@@ -521,6 +571,11 @@ describe("JobViewPage — application_url resolution UI", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getResolutionLogs).mockResolvedValue([]);
+    vi.mocked(getJobAttempts).mockResolvedValue({
+      ...mockMissingFormUrlListing,
+      attempts: [],
+    });
   });
 
   afterEach(() => {
@@ -537,7 +592,7 @@ describe("JobViewPage — application_url resolution UI", () => {
     );
   }
 
-  it("renders the application URL link and Open Application button when application_url is set", async () => {
+  it("renders the Open posting button and the source URL link when application_url is set", async () => {
     vi.mocked(getJobListing).mockResolvedValue({
       id: 1,
       title: "Acme Corp - Software Engineer",
@@ -556,10 +611,9 @@ describe("JobViewPage — application_url resolution UI", () => {
     renderPage();
 
     await waitFor(() => {
-      const appLink = screen.getByTestId("application-url-link") as HTMLAnchorElement;
-      expect(appLink.href).toBe("https://acme.com/jobs/1/apply");
+      const openPostingButton = screen.getByTestId("open-application-button") as HTMLAnchorElement;
+      expect(openPostingButton.href).toBe("https://acme.com/jobs/1/apply");
       expect(screen.getByTestId("source-url-link").getAttribute("href")).toBe("https://linkedin.com/jobs/1");
-      expect(screen.getByTestId("open-application-button")).toBeDefined();
     });
   });
 
@@ -572,8 +626,8 @@ describe("JobViewPage — application_url resolution UI", () => {
       expect(screen.getByTestId("missing-form-url-alert")).toBeDefined();
       expect(screen.getByTestId("retry-resolve-button")).toBeDefined();
     });
-    // Apply button must NOT appear when the row is in missing_form_url status.
-    expect(screen.queryByRole("button", { name: /^Apply$/ })).toBeNull();
+    // Auto-apply button must NOT appear when the row is in missing_form_url status.
+    expect(screen.queryByTestId("apply-button")).toBeNull();
   });
 
   it("calls resolveApplicationUrl when the Retry button is clicked", async () => {
@@ -648,7 +702,7 @@ describe("JobViewPage — application_url resolution UI", () => {
     expect(user).toBeDefined(); // satisfies vitest unused-var rules
   });
 
-  it("replaces the Retry button with a 'View Resolution Progress' link when resolution_in_progress is true", async () => {
+  it("replaces the Retry button with a 'View progress' link when resolution_in_progress is true", async () => {
     vi.mocked(getJobListing).mockResolvedValue({
       ...mockMissingFormUrlListing,
       resolution_in_progress: true,

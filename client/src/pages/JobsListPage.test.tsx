@@ -1,13 +1,33 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import JobsListPage from "./JobsListPage";
+
+/**
+ * Minimal in-memory localStorage stand-in. The configured jsdom environment
+ * does not expose a real Storage implementation; the JobsListPage reads
+ * `afm:selectedApplicationProfileId` during the apply flow, so we stub one
+ * onto window BEFORE importing the page module.
+ */
+const inMemoryStorage = new Map<string, string>();
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: {
+    getItem: (key: string): string | null => inMemoryStorage.get(key) ?? null,
+    setItem: (key: string, value: string): void => { inMemoryStorage.set(key, value); },
+    removeItem: (key: string): void => { inMemoryStorage.delete(key); },
+    clear: (): void => { inMemoryStorage.clear(); },
+    key: (index: number): string | null => Array.from(inMemoryStorage.keys())[index] ?? null,
+    get length(): number { return inMemoryStorage.size; },
+  },
+});
 
 vi.mock("../services/jobListingsApi", () => ({
   getJobListings: vi.fn(),
   deleteJobListing: vi.fn(),
+  applyToJob: vi.fn(),
 }));
 
+import JobsListPage from "./JobsListPage";
 import { getJobListings } from "../services/jobListingsApi";
 
 beforeEach(() => {
@@ -35,7 +55,11 @@ describe("JobsListPage", () => {
 
     renderJobsListPage();
 
-    expect(screen.getByText("Job Listings")).toBeDefined();
+    // The page heading was renamed from "Job Listings" to "Jobs" in the UI
+    // rewrite, and is rendered as an <h1 class="page-title">.
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Jobs", level: 1 })).toBeDefined();
+    });
     await waitFor(() => {
       expect(getJobListings).toHaveBeenCalledOnce();
     });
@@ -99,8 +123,9 @@ describe("JobsListPage", () => {
 
     renderJobsListPage();
 
+    // Empty-state copy was updated to phrase it as a tab-filter outcome.
     await waitFor(() => {
-      expect(screen.getByText(/No job listings yet/)).toBeDefined();
+      expect(screen.getByText("No jobs match this filter.")).toBeDefined();
     });
   });
 

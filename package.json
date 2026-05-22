@@ -24,6 +24,8 @@
   "dependencies": {
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.1",
+    "@fontsource-variable/geist-mono": "^5.2.8",
+    "@fontsource/geist": "^5.2.9",
     "@mui/icons-material": "^7.3.9",
     "@mui/material": "^7.3.8",
     "@prisma/adapter-better-sqlite3": "^7.4.2",
