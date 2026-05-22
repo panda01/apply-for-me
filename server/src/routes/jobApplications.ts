@@ -1,7 +1,8 @@
 import { Router, Request, Response } from "express";
 import prisma from "../prismaClient.js";
 import { applyToJob } from "../services/jobApplicationService.js";
-import type { UserInfo, StepLog, WorkAuthorization } from "../services/jobApplicationService.js";
+import type { UserInfo, WorkAuthorization, ApplicationResult } from "../services/jobApplicationService.js";
+import type { ApplicationAttemptOutcome } from "../../prisma/generated/client/enums.js";
 import { findJobListingOrSend404 } from "./_helpers.js";
 
 const router = Router();
@@ -194,6 +195,10 @@ async function applyToSingleJob(
   userInfo: UserInfo,
   profileId: string,
 ): Promise<void> {
+  // Captured by the Phase-4 one-fire callback; stays null when Phase 4 was never reached
+  // (e.g. closed_listing detected early, agent went stuck/captcha, or the agent skipped review).
+  let submissionScreenshotPath: string | null = null;
+
   try {
     const handleLiveUrlReady = async (liveUrl: string) => {
       await prisma.jobListing.update({
@@ -201,8 +206,18 @@ async function applyToSingleJob(
         data: { live_url: liveUrl },
       });
     };
+    const handleSubmissionScreenshotSaved = (filePath: string) => {
+      submissionScreenshotPath = filePath;
+    };
 
-    const result = await applyToJob(jobUrl, userInfo, profileId, handleLiveUrlReady, jobId);
+    const result = await applyToJob(
+      jobUrl,
+      userInfo,
+      profileId,
+      handleLiveUrlReady,
+      jobId,
+      handleSubmissionScreenshotSaved,
+    );
 
     let finalStatus: "applied" | "error_applying" | "closed";
     if (result.closedListing) {
@@ -218,7 +233,7 @@ async function applyToSingleJob(
       data: { status: finalStatus, live_url: null },
     });
 
-    await saveAttemptLog(jobId, result);
+    await saveAttemptLog(jobId, result, submissionScreenshotPath);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.error(`[applicator:route] Application failed for job ${jobId}: ${errorMessage}`);
@@ -227,30 +242,75 @@ async function applyToSingleJob(
       data: { status: "error_applying", live_url: null },
     });
 
-    await saveAttemptLog(jobId, { message: errorMessage });
+    // Synthetic ApplicationResult so deriveAttemptOutcome can run consistently on the catch path.
+    const syntheticResult: ApplicationResult = {
+      success: false,
+      message: errorMessage,
+      stepLogs: [],
+    };
+    await saveAttemptLog(jobId, syntheticResult, submissionScreenshotPath);
   }
 }
 
 /**
- * Persists an application attempt log to the database.
- * Saves the step logs (if available) and the final response message.
+ * Maps an ApplicationResult to the terminal ApplicationAttemptOutcome enum value
+ * that gets persisted on the ApplicationAttemptLogs row.
+ *
+ * Precedence (first match wins): closed_listing > captcha_blocked > stuck > applied > failed.
+ * closed_listing is checked first because the agent stops early on closed listings —
+ * `success` will be false but the more-specific outcome is the useful signal.
+ * captcha and stuck are checked before applied because they take precedence over
+ * a self-reported success on the same run.
+ *
+ * @param {ApplicationResult} result - The application result from applyToJob (or a synthetic equivalent on the catch path)
+ * @returns {ApplicationAttemptOutcome} The terminal outcome enum value
+ */
+export function deriveAttemptOutcome(result: ApplicationResult): ApplicationAttemptOutcome {
+  if (result.closedListing === true) {
+    return "closed_listing";
+  }
+  const hasCaptcha = result.stepLogs?.some((step) => step.captchaDetected === true) === true;
+  if (hasCaptcha) {
+    return "captcha_blocked";
+  }
+  const hasStuck = result.stepLogs?.some((step) => step.stuckDetected === true) === true;
+  if (hasStuck) {
+    return "stuck";
+  }
+  if (result.success === true) {
+    return "applied";
+  }
+  return "failed";
+}
+
+/**
+ * Persists an application attempt log to the database. Derives the terminal
+ * outcome enum from the ApplicationResult and stores the canonical Phase-4
+ * screenshot path + the per-run logs directory so the UI can stream every
+ * step's PNG back to the client.
+ *
  * @param {number} jobId - The job listing ID
- * @param {object} result - The application result containing message and optional stepLogs
+ * @param {ApplicationResult} result - The application result (use a synthetic { success: false, message } on the catch path so derivation still runs)
+ * @param {string | null} submissionScreenshotPath - Absolute path returned by the Phase-4 one-fire callback; null when Phase 4 wasn't reached
  */
 async function saveAttemptLog(
   jobId: number,
-  result: { message: string; stepLogs?: StepLog[] },
+  result: ApplicationResult,
+  submissionScreenshotPath: string | null,
 ): Promise<void> {
   try {
     const logsJson = JSON.stringify(result.stepLogs ?? []);
+    const endResponse = deriveAttemptOutcome(result);
     await prisma.applicationAttemptLogs.create({
       data: {
         job_listing_id: jobId,
         logs: logsJson,
-        end_response: result.message,
+        end_response: endResponse,
+        submission_screenshot_path: submissionScreenshotPath,
+        log_directory: result.logDirectory ?? null,
       },
     });
-    console.log(`[applicator:route] Attempt log saved for job ${jobId}`);
+    console.log(`[applicator:route] Attempt log saved for job ${jobId} (outcome: ${endResponse})`);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.error(`[applicator:route] Failed to save attempt log for job ${jobId}: ${errorMessage}`);
@@ -337,6 +397,9 @@ async function runBatchApply(
       data: { status: "applying", live_url: null },
     });
 
+    // Per-iteration screenshot path; stays null when Phase 4 isn't reached on this job.
+    let submissionScreenshotPath: string | null = null;
+
     try {
       const handleLiveUrlReady = async (liveUrl: string) => {
         await prisma.jobListing.update({
@@ -344,11 +407,21 @@ async function runBatchApply(
           data: { live_url: liveUrl },
         });
       };
+      const handleSubmissionScreenshotSaved = (filePath: string) => {
+        submissionScreenshotPath = filePath;
+      };
 
       // Drive Browser-Use against the resolved application_url (the off-platform
       // form), not the original Indeed/LinkedIn job-details URL. The batch-eligible
       // filter above already ensures application_url is non-null.
-      const result = await applyToJob(job.application_url!, userInfo, profileId, handleLiveUrlReady, job.id);
+      const result = await applyToJob(
+        job.application_url!,
+        userInfo,
+        profileId,
+        handleLiveUrlReady,
+        job.id,
+        handleSubmissionScreenshotSaved,
+      );
 
       let finalStatus: "applied" | "error_applying" | "closed";
       if (result.closedListing) {
@@ -364,7 +437,7 @@ async function runBatchApply(
         data: { status: finalStatus, live_url: null },
       });
 
-      await saveAttemptLog(job.id, result);
+      await saveAttemptLog(job.id, result, submissionScreenshotPath);
 
       if (result.success) {
         batchState.completed.push(job.id);
@@ -378,7 +451,12 @@ async function runBatchApply(
         where: { id: job.id },
         data: { status: "error_applying", live_url: null },
       });
-      await saveAttemptLog(job.id, { message: errorMessage });
+      const syntheticResult: ApplicationResult = {
+        success: false,
+        message: errorMessage,
+        stepLogs: [],
+      };
+      await saveAttemptLog(job.id, syntheticResult, submissionScreenshotPath);
       batchState.errors.push({ jobId: job.id, error: errorMessage });
     }
   }

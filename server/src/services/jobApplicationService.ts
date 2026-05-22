@@ -7,7 +7,7 @@ import { resolve } from "node:path";
  * Uses a personal browser profile for persistent login state and flashMode: false
  * for careful, slow navigation during the application process.
  *
- * Logs real-time step-by-step progress, classifies steps into 4 phases,
+ * Logs real-time step-by-step progress, classifies steps into 5 phases,
  * detects captcha/stuck issues, and saves screenshots to a logs directory.
  */
 
@@ -57,9 +57,11 @@ export interface ApplicationResult {
 
 /**
  * Represents a classified phase of the application process.
+ * Phase 4 (Reviewing application) is the dedicated pre-submit pause used to
+ * capture the canonical "what was about to be submitted" screenshot.
  */
 export interface ApplicationPhase {
-  phase: 1 | 2 | 3 | 4;
+  phase: 1 | 2 | 3 | 4 | 5;
   label: string;
 }
 
@@ -83,13 +85,22 @@ export interface StepLog {
 
 const APPLY_KEYWORDS = /apply|easy\s*apply|submit\s*application|start\s*application/i;
 const FORM_KEYWORDS = /fill|input|type|select|enter|upload|attach|resume|cover\s*letter|phone|email|name|experience|education/i;
-const SUBMIT_KEYWORDS = /submit|confirm|send\s*application|review\s*application|finish/i;
+// Phase 4 — pre-submit review of the filled form (forced by the prompt nudge in buildApplicationPrompt).
+const REVIEW_KEYWORDS = /review|verify|double[-\s]?check|confirm\s*before\s*submit|check\s*that/i;
+// Phase 5 — actually clicking submit / send / finish. `review\s*application` removed so REVIEW wins when both words appear.
+const SUBMIT_KEYWORDS = /submit|confirm|send\s*application|finish/i;
 const CAPTCHA_KEYWORDS = /captcha|verify\s*you\s*are|robot|challenge|human\s*verification|are\s*you\s*a\s*human/i;
 const CLOSED_KEYWORDS = /no longer accepting|applications?\s*closed|position has been filled|job has been removed|listing has expired|no longer available|this job is closed/i;
 
 /**
- * Classifies a Browser Use step into one of the 4 application phases.
+ * Classifies a Browser Use step into one of the 5 application phases.
  * Phase only advances forward (never goes backward from the previous phase).
+ *
+ * Detection order is REVIEW > SUBMIT > FORM > APPLY so that a step containing
+ * both review and submit wording (e.g. "review the form before submit") wins
+ * Phase 4. This matters because the apply route uses the first Phase 4
+ * transition as the trigger to persist the canonical pre-submit screenshot.
+ *
  * @param {object} step - The step data from Browser Use (nextGoal, url, actions)
  * @param {string} jobUrl - The original job listing URL
  * @param {number} previousPhase - The phase of the previous step (minimum for this step)
@@ -104,28 +115,29 @@ export function classifyApplicationPhase(
 
   let detectedPhase = 1;
 
+  const isReviewStep = REVIEW_KEYWORDS.test(combinedText);
   const isSubmitStep = SUBMIT_KEYWORDS.test(combinedText);
-  if (isSubmitStep) {
+  const isFormStep = FORM_KEYWORDS.test(combinedText);
+  const isApplyStep = APPLY_KEYWORDS.test(combinedText);
+
+  if (isReviewStep) {
     detectedPhase = 4;
-  } else {
-    const isFormStep = FORM_KEYWORDS.test(combinedText);
-    if (isFormStep) {
-      detectedPhase = 3;
-    } else {
-      const isApplyStep = APPLY_KEYWORDS.test(combinedText);
-      if (isApplyStep) {
-        detectedPhase = 2;
-      }
-    }
+  } else if (isSubmitStep) {
+    detectedPhase = 5;
+  } else if (isFormStep) {
+    detectedPhase = 3;
+  } else if (isApplyStep) {
+    detectedPhase = 2;
   }
 
-  const phaseNeverGoesBackward = Math.max(detectedPhase, previousPhase) as 1 | 2 | 3 | 4;
+  const phaseNeverGoesBackward = Math.max(detectedPhase, previousPhase) as 1 | 2 | 3 | 4 | 5;
 
   const phaseLabels: Record<number, string> = {
     1: "Opening job URL",
     2: "Following apply links",
     3: "Filling out form",
-    4: "Submitting application",
+    4: "Reviewing application",
+    5: "Submitting application",
   };
 
   return {
@@ -191,26 +203,29 @@ export async function ensureLogDirectory(jobId: number | string): Promise<string
  * @param {string} screenshotUrl - The URL to download the screenshot from
  * @param {string} logDir - The directory to save the screenshot to
  * @param {number} stepNumber - The step number for the filename
+ * @returns {Promise<string | null>} The absolute path of the saved screenshot file, or null when the download or write failed
  */
 export async function saveStepScreenshot(
   screenshotUrl: string,
   logDir: string,
   stepNumber: number
-): Promise<void> {
+): Promise<string | null> {
   try {
     const response = await fetch(screenshotUrl);
     const isNotOk = !response.ok;
     if (isNotOk) {
       console.warn(`[applicator] Failed to download screenshot for step ${stepNumber}: HTTP ${response.status}`);
-      return;
+      return null;
     }
     const buffer = Buffer.from(await response.arrayBuffer());
     const filePath = resolve(logDir, `step-${stepNumber}.png`);
     await writeFile(filePath, buffer);
     console.log(`[applicator] Screenshot saved: step-${stepNumber}.png`);
+    return filePath;
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.error(`[applicator] Error saving screenshot for step ${stepNumber}: ${errorMessage}`);
+    return null;
   }
 }
 
@@ -365,7 +380,9 @@ If the form asks to upload a resume, upload the file from the provided resume UR
 
 If the job listing says it is no longer accepting applications, or the position is closed/filled/expired, stop immediately and report that the listing is closed.
 
-Proceed carefully through each step. After submitting the application, confirm that it was submitted successfully.`;
+Once the form is fully filled out, STOP and carefully review every field you entered to verify the information is correct before you click submit. After reviewing, submit the application and confirm it was submitted successfully.
+
+Proceed carefully through each step.`;
 }
 
 // ─── Live URL Notification ───────────────────────────────────────────────────
@@ -421,11 +438,12 @@ async function notifyLiveUrl(
  * an application on behalf of the user. Uses flashMode: false for careful/slow navigation
  * and a persistent browser profile for login state.
  *
- * Iterates through each agent step in real-time, classifying into 4 phases:
+ * Iterates through each agent step in real-time, classifying into 5 phases:
  *   1. Opening job URL
  *   2. Following apply links
  *   3. Filling out form
- *   4. Submitting application
+ *   4. Reviewing application (pre-submit pause — canonical screenshot captured here)
+ *   5. Submitting application
  *
  * Detects captcha and stuck conditions. Saves screenshots and a run summary to logs/.
  *
@@ -434,6 +452,7 @@ async function notifyLiveUrl(
  * @param {string} profileId - The Browser Use profile ID for persistent browser state
  * @param {((liveUrl: string) => void)} [onLiveUrlReady] - Optional callback invoked with the live view URL once the session starts
  * @param {number | string} [jobId] - Optional job ID used for naming the log directory
+ * @param {((filePath: string) => void | Promise<void>)} [onSubmissionScreenshotSaved] - Optional callback fired EXACTLY ONCE on the first Phase-4 step that produced a saved screenshot. Receives the absolute on-disk path. Subsequent Phase-4 steps do NOT re-fire. Never fires when Phase 4 is skipped entirely or when no Phase-4 step had a screenshotUrl.
  * @returns {Promise<ApplicationResult>} Whether the application was successful
  * @throws {Error} If the BROWSER_USE_API environment variable is missing or the application process fails
  */
@@ -442,7 +461,8 @@ export async function applyToJob(
   userInfo: UserInfo,
   profileId: string,
   onLiveUrlReady?: (liveUrl: string) => void,
-  jobId?: number | string
+  jobId?: number | string,
+  onSubmissionScreenshotSaved?: (filePath: string) => void | Promise<void>
 ): Promise<ApplicationResult> {
   console.log(`[applicator] ════════════════════════════════════════════════`);
   console.log(`[applicator] Starting application for job ${jobId ?? "unknown"}: ${jobUrl}`);
@@ -462,7 +482,7 @@ export async function applyToJob(
     logDir = await ensureLogDirectory(jobId ?? "unknown");
 
     const applicationPrompt = buildApplicationPrompt(jobUrl, userInfo);
-    console.log(`[applicator] [Phase 1/4] Opening job URL: ${jobUrl}`);
+    console.log(`[applicator] [Phase 1/5] Opening job URL: ${jobUrl}`);
 
     const applicationRun = client.run(applicationPrompt, {
       flashMode: false,
@@ -479,6 +499,11 @@ export async function applyToJob(
     let lastUrl = "";
     let idleSameUrlCount = 0;
     const stepLogs: StepLog[] = [];
+    // One-fire guard for the canonical Phase-4 ("Reviewing application") screenshot.
+    // The first Phase-4 step that produces a saved screenshot fires the callback
+    // exactly once; subsequent Phase-4 steps are ignored so the canonical pointer
+    // stays anchored to the earliest review-pause frame.
+    let didFireSubmissionCallback = false;
 
     for await (const step of applicationRun) {
       const phase = classifyApplicationPhase(step, jobUrl, currentPhase);
@@ -526,7 +551,7 @@ export async function applyToJob(
       const phaseChanged = phase.phase > currentPhase;
       if (phaseChanged) {
         console.log(`[applicator] ────────────────────────────────────────────`);
-        console.log(`[applicator] [Phase ${phase.phase}/4] ${phase.label}`);
+        console.log(`[applicator] [Phase ${phase.phase}/5] ${phase.label}`);
         console.log(`[applicator] ────────────────────────────────────────────`);
         const hasPhaseScreenshot = !!step.screenshotUrl;
         if (hasPhaseScreenshot) {
@@ -585,8 +610,23 @@ export async function applyToJob(
       }
 
       const hasScreenshot = !!step.screenshotUrl;
+      let savedScreenshotPath: string | null = null;
       if (hasScreenshot) {
-        await saveStepScreenshot(step.screenshotUrl!, logDir, step.number);
+        savedScreenshotPath = await saveStepScreenshot(step.screenshotUrl!, logDir, step.number);
+      }
+
+      // One-fire: capture the canonical pre-submit screenshot the first time the
+      // agent reaches Phase 4 ("Reviewing application") AND a screenshot landed
+      // on disk. Subsequent Phase-4 steps do not re-fire — the first review-pause
+      // frame stays the canonical one.
+      const isReviewPhase = phase.phase === 4;
+      const shouldFireSubmissionCallback =
+        isReviewPhase && savedScreenshotPath !== null && !didFireSubmissionCallback;
+      if (shouldFireSubmissionCallback) {
+        didFireSubmissionCallback = true;
+        if (onSubmissionScreenshotSaved) {
+          await onSubmissionScreenshotSaved(savedScreenshotPath!);
+        }
       }
 
       currentPhase = phase.phase;

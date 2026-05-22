@@ -22,9 +22,14 @@ vi.mock("../prismaClient.js", () => {
         findFirst: vi.fn(),
         update: vi.fn(),
       },
+      applicationAttemptLogs: {
+        findMany: vi.fn(),
+        findUnique: vi.fn(),
+      },
     },
   };
 });
+
 
 vi.mock("../services/smartProxyScraperService.js", () => {
   return {
@@ -74,7 +79,13 @@ import { scrapeJobViaContainer } from "../services/smartProxyScraperService.js";
 import { findOrSpawnRunningContainer, SpawnContainerError } from "../services/managedContainerService.js";
 import { resolveApplicationUrl } from "../services/applicationUrlResolverService.js";
 import type { ResolverOutcome, ResolutionTrace } from "../services/applicationUrlResolverService.js";
-import { splitFormattedTitle, parseResolutionLogRow } from "./jobListings.js";
+import { resolve as resolvePath } from "node:path";
+import { splitFormattedTitle, parseResolutionLogRow, parseAttemptLogRow } from "./jobListings.js";
+
+/** Absolute path of a tiny PNG fixture checked into claude_tmp/ for the streaming-route tests. */
+const FIXTURE_PNG_PATH = resolvePath(process.cwd(), "claude_tmp", "test-screenshot.png");
+/** Path that is guaranteed not to exist on disk (used for the file-missing 404 branch). */
+const MISSING_FILE_PATH = resolvePath(process.cwd(), "claude_tmp", "definitely-not-here.png");
 
 /**
  * Builds a complete ResolveApplicationUrlResult from just an outcome so tests
@@ -1186,5 +1197,216 @@ describe("DELETE /api/job-listings/:id", () => {
     const response = await request(app).delete("/api/job-listings/abc");
 
     expect(response.status).toBe(400);
+  });
+});
+
+/**
+ * Builds an ApplicationAttemptLogs-shaped row for the new-route tests.
+ * Mirrors the Prisma client's returned shape including the new enum field
+ * and the two nullable on-disk-path fields.
+ *
+ * @param {Partial<{ id: number; job_listing_id: number; logs: string; end_response: "applied" | "failed" | "closed_listing" | "captcha_blocked" | "stuck"; submission_screenshot_path: string | null; log_directory: string | null; created_date: Date }>} [overrides] - Field overrides
+ * @returns The mock attempt row
+ */
+function buildMockAttemptRow(overrides: Partial<{
+  id: number;
+  job_listing_id: number;
+  logs: string;
+  end_response: "applied" | "failed" | "closed_listing" | "captcha_blocked" | "stuck";
+  submission_screenshot_path: string | null;
+  log_directory: string | null;
+  created_date: Date;
+}> = {}) {
+  return {
+    id: 1,
+    job_listing_id: 1,
+    logs: "[]",
+    end_response: "applied" as const,
+    submission_screenshot_path: null as string | null,
+    log_directory: null as string | null,
+    created_date: new Date("2026-05-21T00:00:00.000Z"),
+    ...overrides,
+  };
+}
+
+describe("parseAttemptLogRow", () => {
+  it("parses well-formed step_logs JSON and derives has_submission_screenshot=true", () => {
+    const stepLogs = [
+      { stepNumber: 1, phase: 1, phaseLabel: "Opening job URL", url: "x", nextGoal: "x", actions: [], screenshotSaved: true, captchaDetected: false, stuckDetected: false, timestamp: "t" },
+    ];
+    const row = buildMockAttemptRow({ logs: JSON.stringify(stepLogs), submission_screenshot_path: "/abs/logs/1/step-4.png" });
+
+    const parsed = parseAttemptLogRow(row);
+
+    expect(parsed.step_logs).toHaveLength(1);
+    expect(parsed.step_logs[0].stepNumber).toBe(1);
+    expect(parsed.has_submission_screenshot).toBe(true);
+  });
+
+  it("derives has_submission_screenshot=false when submission_screenshot_path is null", () => {
+    const row = buildMockAttemptRow({ submission_screenshot_path: null });
+    expect(parseAttemptLogRow(row).has_submission_screenshot).toBe(false);
+  });
+
+  it("returns an empty step_logs array on malformed JSON", () => {
+    const row = buildMockAttemptRow({ logs: "{not-json}" });
+    expect(parseAttemptLogRow(row).step_logs).toEqual([]);
+  });
+
+  it("returns an empty step_logs array when the JSON parses to a non-array", () => {
+    const row = buildMockAttemptRow({ logs: "{}" });
+    expect(parseAttemptLogRow(row).step_logs).toEqual([]);
+  });
+});
+
+describe("GET /api/job-listings/:id/attempts", () => {
+  it("returns the job + parsed attempts ordered desc", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockCompletedJobListing);
+    vi.mocked(prisma.applicationAttemptLogs.findMany).mockResolvedValue([
+      buildMockAttemptRow({ id: 10, end_response: "applied", submission_screenshot_path: "/abs/x.png" }),
+      buildMockAttemptRow({ id: 9, end_response: "failed" }),
+    ] as never);
+
+    const response = await request(app).get("/api/job-listings/1/attempts");
+
+    expect(response.status).toBe(200);
+    expect(response.body.id).toBe(1);
+    expect(response.body.attempts).toHaveLength(2);
+    expect(response.body.attempts[0].id).toBe(10);
+    expect(response.body.attempts[0].has_submission_screenshot).toBe(true);
+    expect(response.body.attempts[1].has_submission_screenshot).toBe(false);
+    expect(prisma.applicationAttemptLogs.findMany).toHaveBeenCalledWith({
+      where: { job_listing_id: 1 },
+      orderBy: { created_date: "desc" },
+    });
+  });
+
+  it("returns the job with attempts: [] when none exist", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockCompletedJobListing);
+    vi.mocked(prisma.applicationAttemptLogs.findMany).mockResolvedValue([] as never);
+
+    const response = await request(app).get("/api/job-listings/1/attempts");
+
+    expect(response.status).toBe(200);
+    expect(response.body.attempts).toEqual([]);
+  });
+
+  it("returns 404 when the job is missing", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(null);
+    const response = await request(app).get("/api/job-listings/999/attempts");
+    expect(response.status).toBe(404);
+  });
+});
+
+describe("GET /api/job-listings/:jobId/attempts/:attemptId", () => {
+  it("returns the attempt plus parent job_listing block", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue({
+      ...buildMockAttemptRow({ id: 10, job_listing_id: 1, end_response: "applied", submission_screenshot_path: "/abs/x.png" }),
+      job_listing: { id: 1, title: "Acme - Engineer", url: "https://x" },
+    } as never);
+
+    const response = await request(app).get("/api/job-listings/1/attempts/10");
+
+    expect(response.status).toBe(200);
+    expect(response.body.id).toBe(10);
+    expect(response.body.has_submission_screenshot).toBe(true);
+    expect(response.body.job_listing.title).toBe("Acme - Engineer");
+  });
+
+  it("returns 400 on a non-integer attemptId", async () => {
+    const response = await request(app).get("/api/job-listings/1/attempts/abc");
+    expect(response.status).toBe(400);
+  });
+
+  it("returns 404 when the attempt is missing", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue(null);
+    const response = await request(app).get("/api/job-listings/1/attempts/999");
+    expect(response.status).toBe(404);
+  });
+
+  it("returns 404 when the attempt belongs to a different job", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue({
+      ...buildMockAttemptRow({ id: 10, job_listing_id: 7 }),
+      job_listing: { id: 7, title: "Other", url: "https://other" },
+    } as never);
+    const response = await request(app).get("/api/job-listings/1/attempts/10");
+    expect(response.status).toBe(404);
+  });
+});
+
+describe("GET /api/job-listings/:jobId/attempts/:attemptId/submission-screenshot", () => {
+  it("streams the PNG with image/png + no-store when the file exists", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue(
+      buildMockAttemptRow({ id: 10, job_listing_id: 1, submission_screenshot_path: FIXTURE_PNG_PATH }) as never,
+    );
+
+    const response = await request(app).get("/api/job-listings/1/attempts/10/submission-screenshot");
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe("image/png");
+    expect(response.headers["cache-control"]).toBe("private, no-store");
+  });
+
+  it("returns 404 when submission_screenshot_path is null", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue(
+      buildMockAttemptRow({ id: 10, job_listing_id: 1, submission_screenshot_path: null }) as never,
+    );
+
+    const response = await request(app).get("/api/job-listings/1/attempts/10/submission-screenshot");
+
+    expect(response.status).toBe(404);
+  });
+
+  it("returns 404 when the file is missing on disk", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue(
+      buildMockAttemptRow({ id: 10, job_listing_id: 1, submission_screenshot_path: MISSING_FILE_PATH }) as never,
+    );
+
+    const response = await request(app).get("/api/job-listings/1/attempts/10/submission-screenshot");
+
+    expect(response.status).toBe(404);
+  });
+
+  it("returns 404 when the attempt belongs to a different job", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue(
+      buildMockAttemptRow({ id: 10, job_listing_id: 7, submission_screenshot_path: FIXTURE_PNG_PATH }) as never,
+    );
+    const response = await request(app).get("/api/job-listings/1/attempts/10/submission-screenshot");
+    expect(response.status).toBe(404);
+  });
+});
+
+describe("GET /api/job-listings/:jobId/attempts/:attemptId/steps/:stepNumber/screenshot", () => {
+  it("streams the per-step PNG from log_directory when the file exists", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue(
+      buildMockAttemptRow({ id: 10, job_listing_id: 1, log_directory: resolvePath(process.cwd(), "claude_tmp") }) as never,
+    );
+
+    const response = await request(app).get("/api/job-listings/1/attempts/10/steps/4/screenshot");
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe("image/png");
+  });
+
+  it("returns 400 on a non-integer stepNumber", async () => {
+    const response = await request(app).get("/api/job-listings/1/attempts/10/steps/abc/screenshot");
+    expect(response.status).toBe(400);
+  });
+
+  it("returns 404 when log_directory is null", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue(
+      buildMockAttemptRow({ id: 10, job_listing_id: 1, log_directory: null }) as never,
+    );
+    const response = await request(app).get("/api/job-listings/1/attempts/10/steps/4/screenshot");
+    expect(response.status).toBe(404);
+  });
+
+  it("returns 404 when the per-step file is missing on disk", async () => {
+    vi.mocked(prisma.applicationAttemptLogs.findUnique).mockResolvedValue(
+      buildMockAttemptRow({ id: 10, job_listing_id: 1, log_directory: resolvePath(process.cwd(), "claude_tmp") }) as never,
+    );
+    // step-9999.png is not present in claude_tmp/, so the access check fails
+    const response = await request(app).get("/api/job-listings/1/attempts/10/steps/9999/screenshot");
+    expect(response.status).toBe(404);
   });
 });

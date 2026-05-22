@@ -1,6 +1,6 @@
-import { Box, Button, CircularProgress, ListItem, ListItemText, Typography } from "@mui/material";
+import { Box, Button, CircularProgress, ListItem, ListItemButton, ListItemText, Typography } from "@mui/material";
 import { OpenInNew as OpenInNewIcon, PlayArrow as PlayArrowIcon } from "@mui/icons-material";
-import type { ReactNode } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import type { JobListingResponse } from "../services/jobListingsApi";
 
 interface JobRowAction {
@@ -23,59 +23,78 @@ interface JobRowProps {
   statusChip?: ReactNode;
   /** Optional per-row button (Apply/Retry). When omitted, no button is rendered. */
   action?: JobRowAction;
+  /** Optional row-level click handler. When set, the row body becomes a MUI ListItemButton — used by the dashboard to navigate to the attempts list. The external-URL link and Apply button both stop propagation so they don't trigger this. */
+  onClick?: (id: number) => void;
 }
 
 /**
  * Renders a single job listing row used by the application dashboard sections.
  * Shows the title (or URL), the URL as an external link, an optional status chip,
- * and an optional per-row action button (e.g., Apply/Retry).
+ * and an optional per-row action button (e.g., Apply/Retry). When `onClick` is
+ * provided the entire row body becomes clickable; the external link and action
+ * button stop propagation so they keep their own behavior.
  * @param {JobRowProps} props
  * @param {JobListingResponse} props.listing - The job listing to display
  * @param {ReactNode | undefined} props.statusChip - Optional status chip alongside the title
  * @param {JobRowAction | undefined} props.action - Optional per-row action button
+ * @param {((id: number) => void) | undefined} props.onClick - Optional row-body click handler (navigates to attempts list in the dashboard)
  */
-function JobRow({ listing, statusChip, action }: JobRowProps) {
+function JobRow({ listing, statusChip, action, onClick }: JobRowProps) {
   const titleText = listing.title || listing.url;
+
+  const rowContent = (
+    <ListItemText
+      primary={
+        statusChip !== undefined ? (
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography component="span" noWrap>{titleText}</Typography>
+            {statusChip}
+          </Box>
+        ) : (
+          titleText
+        )
+      }
+      secondary={
+        <Typography
+          component="a"
+          href={listing.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          variant="body2"
+          color="primary"
+          onClick={(event: MouseEvent<HTMLAnchorElement>) => event.stopPropagation()}
+          sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, textDecoration: "none", "&:hover": { textDecoration: "underline" } }}
+          noWrap
+        >
+          {listing.url}
+          <OpenInNewIcon sx={{ fontSize: 14 }} />
+        </Typography>
+      }
+      primaryTypographyProps={{ noWrap: true }}
+    />
+  );
+
+  const isClickable = onClick !== undefined;
 
   return (
     <ListItem key={listing.id} disablePadding sx={{ mb: 0.5 }}>
-      <Box sx={{ px: 2, py: 1, flex: 1, minWidth: 0 }}>
-        <ListItemText
-          primary={
-            statusChip !== undefined ? (
-              <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                <Typography component="span" noWrap>{titleText}</Typography>
-                {statusChip}
-              </Box>
-            ) : (
-              titleText
-            )
-          }
-          secondary={
-            <Typography
-              component="a"
-              href={listing.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              variant="body2"
-              color="primary"
-              sx={{ display: "inline-flex", alignItems: "center", gap: 0.5, textDecoration: "none", "&:hover": { textDecoration: "underline" } }}
-              noWrap
-            >
-              {listing.url}
-              <OpenInNewIcon sx={{ fontSize: 14 }} />
-            </Typography>
-          }
-          primaryTypographyProps={{ noWrap: true }}
-        />
-      </Box>
+      {isClickable ? (
+        <ListItemButton onClick={() => onClick(listing.id)} sx={{ px: 2, py: 1, flex: 1, minWidth: 0 }}>
+          {rowContent}
+        </ListItemButton>
+      ) : (
+        <Box sx={{ px: 2, py: 1, flex: 1, minWidth: 0 }}>{rowContent}</Box>
+      )}
       {action && (
         <Button
           size="small"
           variant="outlined"
           color={action.color}
           startIcon={action.isLoading ? <CircularProgress size={14} /> : <PlayArrowIcon />}
-          onClick={() => action.onClick(listing.id)}
+          onClick={(event: MouseEvent<HTMLButtonElement>) => {
+            event.stopPropagation();
+            action.onClick(listing.id);
+          }}
           disabled={action.disabled}
           sx={{ ml: 1, minWidth: 100 }}
         >

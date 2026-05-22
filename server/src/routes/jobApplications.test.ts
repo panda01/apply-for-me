@@ -79,7 +79,13 @@ beforeEach(() => {
   process.env["BROWSER_USE_PROFILE_ID"] = "test-profile-id";
   vi.mocked(prisma.applicationProfile.findUnique).mockResolvedValue(mockApplicationProfile);
   vi.mocked(prisma.applicationAttemptLogs.create).mockResolvedValue({
-    id: 1, job_listing_id: 1, logs: "[]", end_response: "", created_date: new Date(),
+    id: 1,
+    job_listing_id: 1,
+    logs: "[]",
+    end_response: "failed",
+    submission_screenshot_path: null,
+    log_directory: null,
+    created_date: new Date(),
   });
 });
 
@@ -116,7 +122,8 @@ describe("POST /api/job-listings/:id/apply", () => {
         expect.objectContaining({ firstName: "Khalah", lastName: "Jones-Golden" }),
         "test-profile-id",
         expect.any(Function),
-        1
+        1,
+        expect.any(Function),
       );
     });
   });
@@ -317,13 +324,15 @@ describe("POST /api/job-listings/:id/apply", () => {
         data: {
           job_listing_id: 1,
           logs: expect.stringContaining("stepNumber"),
-          end_response: "Applied",
+          end_response: "applied",
+          submission_screenshot_path: null,
+          log_directory: null,
         },
       });
     });
   });
 
-  it("should save application attempt log on failure", async () => {
+  it("should save application attempt log on failure with derived enum", async () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
     vi.mocked(applyToJob).mockRejectedValue(new Error("Application error"));
@@ -337,7 +346,38 @@ describe("POST /api/job-listings/:id/apply", () => {
         data: {
           job_listing_id: 1,
           logs: "[]",
-          end_response: "Application error",
+          end_response: "failed",
+          submission_screenshot_path: null,
+          log_directory: null,
+        },
+      });
+    });
+  });
+
+  it("should persist submission_screenshot_path and log_directory when applyToJob fires the screenshot callback", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockImplementation(
+      async (_url, _info, _profile, _onLiveUrlReady, _jobId, onSubmissionScreenshotSaved) => {
+        if (onSubmissionScreenshotSaved) {
+          await onSubmissionScreenshotSaved("/abs/logs/1-2026-05-22/step-4.png");
+        }
+        return { success: true, message: "Applied", logDirectory: "/abs/logs/1-2026-05-22", stepLogs: [] };
+      },
+    );
+
+    await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
+
+    await vi.waitFor(() => {
+      expect(prisma.applicationAttemptLogs.create).toHaveBeenCalledWith({
+        data: {
+          job_listing_id: 1,
+          logs: "[]",
+          end_response: "applied",
+          submission_screenshot_path: "/abs/logs/1-2026-05-22/step-4.png",
+          log_directory: "/abs/logs/1-2026-05-22",
         },
       });
     });
@@ -592,7 +632,7 @@ describe("runBatchApply", () => {
     const jobs = [{ id: 1, url: "https://linkedin.com/jobs/view/1", application_url: "https://acme.com/apply" }];
     await runBatchApply(jobs, buildTestUserInfo(), "test-profile-id");
 
-    expect(applyToJob).toHaveBeenCalledWith("https://acme.com/apply", expect.anything(), "test-profile-id", expect.any(Function), 1);
+    expect(applyToJob).toHaveBeenCalledWith("https://acme.com/apply", expect.anything(), "test-profile-id", expect.any(Function), 1, expect.any(Function));
   });
 
   it("should set status to closed in batch when closedListing is true", async () => {
@@ -690,5 +730,70 @@ describe("GET /api/job-listings/apply-batch/status", () => {
     expect(response.body).toHaveProperty("errors");
     expect(response.body).toHaveProperty("totalJobs");
     expect(response.body).toHaveProperty("remaining");
+  });
+});
+
+describe("deriveAttemptOutcome", () => {
+  it("should return applied when success is true", async () => {
+    const { deriveAttemptOutcome } = await import("./jobApplications.js");
+    expect(deriveAttemptOutcome({ success: true, message: "ok", stepLogs: [] })).toBe("applied");
+  });
+
+  it("should return failed when success is false with no special flags", async () => {
+    const { deriveAttemptOutcome } = await import("./jobApplications.js");
+    expect(deriveAttemptOutcome({ success: false, message: "boom", stepLogs: [] })).toBe("failed");
+  });
+
+  it("should return closed_listing when closedListing is true (precedence over other flags)", async () => {
+    const { deriveAttemptOutcome } = await import("./jobApplications.js");
+    expect(
+      deriveAttemptOutcome({
+        success: false,
+        closedListing: true,
+        message: "Closed",
+        stepLogs: [
+          { stepNumber: 1, phase: 1, phaseLabel: "Opening", url: "x", nextGoal: "x", actions: [], screenshotSaved: false, captchaDetected: true, stuckDetected: true, timestamp: "t" },
+        ],
+      }),
+    ).toBe("closed_listing");
+  });
+
+  it("should return captcha_blocked when any step has captchaDetected", async () => {
+    const { deriveAttemptOutcome } = await import("./jobApplications.js");
+    expect(
+      deriveAttemptOutcome({
+        success: false,
+        message: "Failed",
+        stepLogs: [
+          { stepNumber: 1, phase: 3, phaseLabel: "Form", url: "x", nextGoal: "x", actions: [], screenshotSaved: false, captchaDetected: true, stuckDetected: false, timestamp: "t" },
+        ],
+      }),
+    ).toBe("captcha_blocked");
+  });
+
+  it("should return stuck when any step has stuckDetected and no captcha", async () => {
+    const { deriveAttemptOutcome } = await import("./jobApplications.js");
+    expect(
+      deriveAttemptOutcome({
+        success: false,
+        message: "Stuck",
+        stepLogs: [
+          { stepNumber: 1, phase: 3, phaseLabel: "Form", url: "x", nextGoal: "x", actions: [], screenshotSaved: false, captchaDetected: false, stuckDetected: true, timestamp: "t" },
+        ],
+      }),
+    ).toBe("stuck");
+  });
+
+  it("should prefer captcha_blocked over stuck when both flags are set", async () => {
+    const { deriveAttemptOutcome } = await import("./jobApplications.js");
+    expect(
+      deriveAttemptOutcome({
+        success: false,
+        message: "Both",
+        stepLogs: [
+          { stepNumber: 1, phase: 3, phaseLabel: "Form", url: "x", nextGoal: "x", actions: [], screenshotSaved: false, captchaDetected: true, stuckDetected: true, timestamp: "t" },
+        ],
+      }),
+    ).toBe("captcha_blocked");
   });
 });

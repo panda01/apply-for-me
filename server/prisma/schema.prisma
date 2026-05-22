@@ -78,16 +78,59 @@ model JobListing {
   // One row per resolver invocation for this listing — see ApplicationUrlResolutionLog.
   resolution_logs ApplicationUrlResolutionLog[]
 
+  // One row per apply-attempt for this listing — see ApplicationAttemptLogs.
+  application_attempt_logs ApplicationAttemptLogs[]
+
   @@map("jobs_listing")
 }
 
-model ApplicationAttemptLogs {
-  id             Int      @id @default(autoincrement())
-  job_listing_id Int
-  logs           String // Stores the logs from the application attempt, can be used for debugging and improving the application process
-  end_response   String
-  created_date   DateTime @default(now())
+// Terminal outcomes of one apply-attempt for a JobListing. Mirrors the
+// discriminated mapping in deriveAttemptOutcome() in jobApplications.ts so
+// queries against application_attempt_logs are type-safe end-to-end.
+//   applied         — Browser-Use reported isSuccess=true and the agent reached submission
+//   failed          — Generic failure (isSuccess=false, stopped status, or thrown error not covered below)
+//   closed_listing  — The listing was detected as no longer accepting applications
+//   captcha_blocked — A CAPTCHA was encountered during the run
+//   stuck           — The stuck-detector tripped (idle steps on the same URL exceeded threshold)
+enum ApplicationAttemptOutcome {
+  applied
+  failed
+  closed_listing
+  captcha_blocked
+  stuck
+}
 
+// One row per apply-attempt for a JobListing. Captures the step-by-step
+// run log (JSON-as-text mirroring StepLog[] from jobApplicationService),
+// the terminal outcome enum, and the on-disk paths of the canonical
+// pre-submit ("review") screenshot and the per-attempt log directory
+// (which holds every step's screenshot for debugging).
+//
+// Stored as a normal table (not an embedded JSON column on JobListing) so
+// retries accumulate rather than overwrite, and the per-job
+// /jobs/:id/attempts page can render an attempt history.
+//
+// `logs` is stored as JSON-in-text (SQLite has no first-class JSON column,
+// matching the ApplicationUrlResolutionLog convention below). The route
+// layer parses it before sending to the client.
+//
+// `submission_screenshot_path` is null when the agent never reached Phase 4
+// (e.g. closed_listing detected early, captcha blocked, stuck in earlier
+// phases, or the Phase-4 step had no screenshotUrl).
+//
+// `log_directory` points at the per-run logs folder so the per-step
+// screenshot streaming endpoint can locate `step-{n}.png` files.
+model ApplicationAttemptLogs {
+  id                         Int                       @id @default(autoincrement())
+  job_listing_id             Int // FK to JobListing.id; ON DELETE CASCADE so attempt history vanishes with its listing
+  job_listing                JobListing                @relation(fields: [job_listing_id], references: [id], onDelete: Cascade)
+  logs                       String // JSON-as-text of StepLog[]; parsed by the route layer
+  end_response               ApplicationAttemptOutcome // Terminal outcome — see ApplicationAttemptOutcome above
+  submission_screenshot_path String? // Absolute on-disk path to the first Phase-4 step screenshot; null when Phase 4 wasn't reached or had no screenshotUrl
+  log_directory              String? // Absolute on-disk path to the per-run logs folder (logs/{jobId}-{timestamp}); null on rows from before this column existed
+  created_date               DateTime                  @default(now())
+
+  @@index([job_listing_id, created_date])
   @@map("application_attempt_logs")
 }
 

@@ -1,10 +1,15 @@
 import { Router, Request, Response } from "express";
 import { parseDate } from "chrono-node";
+import { createReadStream } from "node:fs";
+import { access } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 import prisma from "../prismaClient.js";
 import { scrapeJobViaContainer } from "../services/smartProxyScraperService.js";
 import { findOrSpawnRunningContainer, SpawnContainerError } from "../services/managedContainerService.js";
 import { resolveApplicationUrl, createContainerProgressReporter } from "../services/applicationUrlResolverService.js";
 import type { ResolverOutcome, ResolutionTrace } from "../services/applicationUrlResolverService.js";
+import type { StepLog } from "../services/jobApplicationService.js";
+import type { ApplicationAttemptOutcome } from "../../prisma/generated/client/enums.js";
 import { findJobListingOrSend404 } from "./_helpers.js";
 
 const router = Router();
@@ -514,6 +519,239 @@ export function parseResolutionLogRow(row: ResolutionLogRow): ParsedResolutionLo
     created_date: row.created_date,
   };
 }
+
+/**
+ * Shape of an ApplicationAttemptLogs row after the `logs` JSON column has
+ * been parsed and a `has_submission_screenshot` boolean has been derived
+ * from `submission_screenshot_path`. The raw filesystem path is never sent
+ * over the wire — clients use the dedicated streaming endpoint to fetch
+ * the image.
+ */
+export interface ParsedApplicationAttempt {
+  id: number;
+  job_listing_id: number;
+  end_response: ApplicationAttemptOutcome;
+  has_submission_screenshot: boolean;
+  step_logs: StepLog[];
+  created_date: Date;
+}
+
+/**
+ * Type alias for a raw `ApplicationAttemptLogs` row as returned by
+ * `prisma.applicationAttemptLogs.findMany`. Derived rather than hand-rolled
+ * so it stays in sync with the generated client.
+ */
+type AttemptLogRow = Awaited<ReturnType<typeof prisma.applicationAttemptLogs.findMany>>[number];
+
+/**
+ * Parses the `logs` text-as-JSON column and derives the
+ * `has_submission_screenshot` boolean from a single attempt-log row.
+ * Tolerates malformed JSON by falling back to an empty array, so a single
+ * corrupted historical row never breaks the entire list response.
+ *
+ * @param {AttemptLogRow} row - The raw row from Prisma
+ * @returns {ParsedApplicationAttempt} The row with `step_logs` parsed and the path-derived boolean
+ */
+export function parseAttemptLogRow(row: AttemptLogRow): ParsedApplicationAttempt {
+  const safeParseStepLogs = (raw: string): StepLog[] => {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as StepLog[]) : [];
+    } catch {
+      return [];
+    }
+  };
+  return {
+    id: row.id,
+    job_listing_id: row.job_listing_id,
+    end_response: row.end_response,
+    has_submission_screenshot: row.submission_screenshot_path !== null,
+    step_logs: safeParseStepLogs(row.logs),
+    created_date: row.created_date,
+  };
+}
+
+/**
+ * Validates a path-param that should be a positive integer, sending a 400
+ * response when malformed. Express types path params as `string | string[]`,
+ * so we narrow to string before parsing. Returns the parsed integer or null
+ * when an error response has already been written.
+ *
+ * @param {unknown} raw - The raw param value from req.params
+ * @param {Response} res - The response (used to write 400 on error)
+ * @param {string} fieldName - The name to surface in the error message
+ * @returns {number | null} The parsed integer or null when invalid
+ */
+function parsePositiveIntegerParamOrSend400(raw: unknown, res: Response, fieldName: string): number | null {
+  const isString = typeof raw === "string";
+  const parsed = isString ? Number(raw) : NaN;
+  const isValid = Number.isInteger(parsed) && parsed > 0;
+  if (!isValid) {
+    res.status(400).json({ error: `Invalid ${fieldName} parameter — must be a positive integer` });
+    return null;
+  }
+  return parsed;
+}
+
+/**
+ * Streams a PNG file to the response with image/png + no-store headers and
+ * client-hangup cleanup. 404s when the file is missing on disk. Used by both
+ * the canonical submission-screenshot endpoint and the per-step screenshot
+ * endpoint so the streaming behavior stays in one place.
+ *
+ * @param {Request} req - The request (used to listen for client hangup)
+ * @param {Response} res - The response to stream into
+ * @param {string} filePath - Absolute path to the PNG file to stream
+ */
+async function streamScreenshotOrSend404(req: Request, res: Response, filePath: string): Promise<void> {
+  try {
+    await access(filePath);
+  } catch {
+    res.status(404).json({ error: "Screenshot file is missing on disk" });
+    return;
+  }
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Cache-Control", "private, no-store");
+  const stream = createReadStream(filePath);
+  req.on("close", () => stream.destroy());
+  stream.on("error", (err) => {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[jobListings] Stream error for ${filePath}: ${errorMessage}`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to stream screenshot" });
+    } else {
+      res.end();
+    }
+  });
+  stream.pipe(res);
+}
+
+/**
+ * GET /api/job-listings/:id/attempts
+ * Returns the JobListing row PLUS the array of all ApplicationAttemptLogs for
+ * the job (newest first). Each attempt has `step_logs` pre-parsed and a
+ * boolean `has_submission_screenshot` derived from the path column — the raw
+ * filesystem path is never exposed on the wire.
+ *
+ * @param {number} req.params.id - The ID of the job listing
+ * @returns {object} 200 - { ...jobListing, attempts: ParsedApplicationAttempt[] }
+ * @returns {object} 400 - Invalid id parameter
+ * @returns {object} 404 - Job listing not found
+ */
+router.get("/:id/attempts", async (req: Request, res: Response) => {
+  const jobListing = await findJobListingOrSend404(req, res);
+  if (jobListing === null) {
+    return;
+  }
+  const rows = await prisma.applicationAttemptLogs.findMany({
+    where: { job_listing_id: jobListing.id },
+    orderBy: { created_date: "desc" },
+  });
+  const attempts = rows.map(parseAttemptLogRow);
+  res.json({ ...jobListing, attempts });
+});
+
+/**
+ * GET /api/job-listings/:jobId/attempts/:attemptId
+ * Returns a single ApplicationAttemptLogs row with `step_logs` parsed and the
+ * derived `has_submission_screenshot` boolean, augmented with a small
+ * `job_listing` block (id, title, url) so the detail page can render a back
+ * link without a second round-trip. 404 when the attempt doesn't exist or
+ * doesn't belong to the supplied job.
+ *
+ * @param {number} req.params.jobId - The parent job listing ID
+ * @param {number} req.params.attemptId - The application attempt ID
+ * @returns {object} 200 - { ...ParsedApplicationAttempt, job_listing: { id, title, url } }
+ * @returns {object} 400 - Invalid id parameter
+ * @returns {object} 404 - Job listing not found, or attempt not found / not owned by the job
+ */
+router.get("/:jobId/attempts/:attemptId", async (req: Request, res: Response) => {
+  const jobId = parsePositiveIntegerParamOrSend400(req.params["jobId"], res, "jobId");
+  if (jobId === null) return;
+  const attemptId = parsePositiveIntegerParamOrSend400(req.params["attemptId"], res, "attemptId");
+  if (attemptId === null) return;
+
+  const attempt = await prisma.applicationAttemptLogs.findUnique({
+    where: { id: attemptId },
+    include: { job_listing: { select: { id: true, title: true, url: true } } },
+  });
+  if (attempt === null || attempt.job_listing_id !== jobId) {
+    res.status(404).json({ error: "Application attempt not found for this job" });
+    return;
+  }
+  const parsed = parseAttemptLogRow(attempt);
+  res.json({ ...parsed, job_listing: attempt.job_listing });
+});
+
+/**
+ * GET /api/job-listings/:jobId/attempts/:attemptId/submission-screenshot
+ * Streams the canonical Phase-4 ("Reviewing application") screenshot for an
+ * attempt with image/png + no-store cache headers. 404s when the attempt has
+ * no recorded path or when the file is missing on disk.
+ *
+ * @param {number} req.params.jobId - The parent job listing ID
+ * @param {number} req.params.attemptId - The application attempt ID
+ * @returns {Buffer} 200 - The PNG bytes
+ * @returns {object} 400 - Invalid id parameter
+ * @returns {object} 404 - Attempt not found, no submission screenshot recorded, or file missing
+ */
+router.get("/:jobId/attempts/:attemptId/submission-screenshot", async (req: Request, res: Response) => {
+  const jobId = parsePositiveIntegerParamOrSend400(req.params["jobId"], res, "jobId");
+  if (jobId === null) return;
+  const attemptId = parsePositiveIntegerParamOrSend400(req.params["attemptId"], res, "attemptId");
+  if (attemptId === null) return;
+
+  const attempt = await prisma.applicationAttemptLogs.findUnique({
+    where: { id: attemptId },
+    select: { id: true, job_listing_id: true, submission_screenshot_path: true },
+  });
+  if (attempt === null || attempt.job_listing_id !== jobId) {
+    res.status(404).json({ error: "Application attempt not found for this job" });
+    return;
+  }
+  if (attempt.submission_screenshot_path === null) {
+    res.status(404).json({ error: "Attempt has no submission screenshot recorded" });
+    return;
+  }
+  await streamScreenshotOrSend404(req, res, attempt.submission_screenshot_path);
+});
+
+/**
+ * GET /api/job-listings/:jobId/attempts/:attemptId/steps/:stepNumber/screenshot
+ * Streams the per-step screenshot for an attempt. Reads from
+ * `{log_directory}/step-{stepNumber}.png` — the log_directory column tells
+ * the route where the per-attempt PNG files live.
+ *
+ * @param {number} req.params.jobId - The parent job listing ID
+ * @param {number} req.params.attemptId - The application attempt ID
+ * @param {number} req.params.stepNumber - The Browser-Use step number (positive integer)
+ * @returns {Buffer} 200 - The PNG bytes
+ * @returns {object} 400 - Invalid id or stepNumber parameter
+ * @returns {object} 404 - Attempt not found, no log_directory recorded, or step PNG missing
+ */
+router.get("/:jobId/attempts/:attemptId/steps/:stepNumber/screenshot", async (req: Request, res: Response) => {
+  const jobId = parsePositiveIntegerParamOrSend400(req.params["jobId"], res, "jobId");
+  if (jobId === null) return;
+  const attemptId = parsePositiveIntegerParamOrSend400(req.params["attemptId"], res, "attemptId");
+  if (attemptId === null) return;
+  const stepNumber = parsePositiveIntegerParamOrSend400(req.params["stepNumber"], res, "stepNumber");
+  if (stepNumber === null) return;
+
+  const attempt = await prisma.applicationAttemptLogs.findUnique({
+    where: { id: attemptId },
+    select: { id: true, job_listing_id: true, log_directory: true },
+  });
+  if (attempt === null || attempt.job_listing_id !== jobId) {
+    res.status(404).json({ error: "Application attempt not found for this job" });
+    return;
+  }
+  if (attempt.log_directory === null) {
+    res.status(404).json({ error: "Attempt has no log_directory recorded" });
+    return;
+  }
+  const filePath = resolvePath(attempt.log_directory, `step-${String(stepNumber)}.png`);
+  await streamScreenshotOrSend404(req, res, filePath);
+});
 
 /**
  * Splits a stored "Company - Title" formatted title back into its parts so

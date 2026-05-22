@@ -52,6 +52,30 @@ export enum StepStatus {
   Skipped = "skipped",
 }
 
+/**
+ * User-facing prose labels for the {@link ResolutionPhase} enum. Consumed by the
+ * inline FetchProgressPanel on the job view page so the user sees readable
+ * progress text ("Searching the web") instead of raw enum identifiers
+ * ("brave_search"). Every enum member MUST have an entry — the
+ * `Record<ResolutionPhase, string>` type plus a unit test in
+ * jobListingsApi.test.ts enforce this.
+ */
+export const RESOLUTION_PHASE_LABELS: Record<ResolutionPhase, string> = {
+  [ResolutionPhase.DirectCheck]: "Checking direct application URL",
+  [ResolutionPhase.AcquireContainer]: "Acquiring browser container",
+  [ResolutionPhase.ApplyButtonScrape]: "Looking for an Apply button",
+  [ResolutionPhase.ApplyButtonDecision]: "Deciding on the Apply button",
+  [ResolutionPhase.BuildQuery]: "Building a search query",
+  [ResolutionPhase.BraveSearch]: "Searching the web",
+  [ResolutionPhase.AIPageClassify]: "Reading candidate pages with AI",
+  [ResolutionPhase.FuzzyRankDirectListings]: "Ranking direct listing matches",
+  [ResolutionPhase.FuzzyRankCareersPages]: "Ranking careers-page matches",
+  [ResolutionPhase.CareersPageHarvest]: "Harvesting careers-page links",
+  [ResolutionPhase.CandidateScrape]: "Scraping a candidate page",
+  [ResolutionPhase.CandidateEvaluate]: "Evaluating a candidate",
+  [ResolutionPhase.Finalize]: "Wrapping up",
+};
+
 /** Terminal outcomes of a resolver attempt. */
 export enum ApplicationUrlResolutionOutcome {
   Direct = "direct",
@@ -350,4 +374,128 @@ export async function getBatchApplyStatus(): Promise<BatchApplyStatusResponse> {
     undefined,
     "Failed to fetch batch apply status"
   );
+}
+
+/**
+ * Mirror of the server-side `ApplicationAttemptOutcome` enum (Prisma) in
+ * server/prisma/schema.prisma. Keep the string values byte-identical so the
+ * wire format round-trips cleanly.
+ */
+export enum ApplicationAttemptOutcome {
+  Applied = "applied",
+  Failed = "failed",
+  ClosedListing = "closed_listing",
+  CaptchaBlocked = "captcha_blocked",
+  Stuck = "stuck",
+}
+
+/**
+ * One step in the per-attempt log. Mirrors server StepLog from
+ * server/src/services/jobApplicationService.ts.
+ */
+export interface AttemptStepLog {
+  stepNumber: number;
+  phase: number;
+  phaseLabel: string;
+  url: string;
+  nextGoal: string;
+  actions: string[];
+  screenshotSaved: boolean;
+  captchaDetected: boolean;
+  stuckDetected: boolean;
+  timestamp: string;
+}
+
+/**
+ * Shape of one ApplicationAttemptLogs row as returned by the attempt routes.
+ * The raw screenshot path is never sent over the wire — instead the server
+ * derives `has_submission_screenshot` and clients build the streaming URL
+ * via buildSubmissionScreenshotUrl().
+ */
+export interface ApplicationAttemptSummary {
+  id: number;
+  job_listing_id: number;
+  end_response: ApplicationAttemptOutcome;
+  has_submission_screenshot: boolean;
+  step_logs: AttemptStepLog[];
+  created_date: string;
+}
+
+/**
+ * Response from GET /api/job-listings/:id/attempts — the job row plus all
+ * its attempts (newest first).
+ */
+export interface JobAttemptsResponse extends JobListingResponse {
+  attempts: ApplicationAttemptSummary[];
+}
+
+/**
+ * Response from GET /api/job-listings/:jobId/attempts/:attemptId — a single
+ * attempt with a minimal parent-job header so the detail page can render a
+ * back link without an extra round-trip.
+ */
+export interface ApplicationAttemptDetail extends ApplicationAttemptSummary {
+  job_listing: {
+    id: number;
+    title: string;
+    url: string;
+  };
+}
+
+/**
+ * Fetches the per-job attempts list including the job's own metadata.
+ * @param {number} jobId - The ID of the job listing
+ * @returns {Promise<JobAttemptsResponse>} The job row + attempts array (newest first)
+ * @throws {Error} If the API request fails
+ */
+export async function getJobAttempts(jobId: number): Promise<JobAttemptsResponse> {
+  return requestJson<JobAttemptsResponse>(
+    `/api/job-listings/${String(jobId)}/attempts`,
+    undefined,
+    "Failed to fetch job attempts"
+  );
+}
+
+/**
+ * Fetches a single application attempt with parsed step logs and the parent
+ * job's title/url for back-linking.
+ * @param {number} jobId - The parent job listing ID
+ * @param {number} attemptId - The application attempt ID
+ * @returns {Promise<ApplicationAttemptDetail>} The attempt detail
+ * @throws {Error} If the API request fails (e.g. 404 when the attempt isn't owned by the job)
+ */
+export async function getApplicationAttempt(
+  jobId: number,
+  attemptId: number
+): Promise<ApplicationAttemptDetail> {
+  return requestJson<ApplicationAttemptDetail>(
+    `/api/job-listings/${String(jobId)}/attempts/${String(attemptId)}`,
+    undefined,
+    "Failed to fetch application attempt"
+  );
+}
+
+/**
+ * Builds the URL for streaming the canonical Phase-4 submission screenshot
+ * for an attempt. Returned for direct use as an `<img src>`, NOT fetched as
+ * a Promise.
+ * @param {number} jobId - The parent job listing ID
+ * @param {number} attemptId - The application attempt ID
+ * @returns {string} The streaming-endpoint URL
+ */
+export function buildSubmissionScreenshotUrl(jobId: number, attemptId: number): string {
+  return `/api/job-listings/${String(jobId)}/attempts/${String(attemptId)}/submission-screenshot`;
+}
+
+/**
+ * Builds the URL for streaming a per-step screenshot from an attempt's log
+ * directory. Returned for direct use as an `<img src>`, NOT fetched as a
+ * Promise.
+ * @param {number} jobId - The parent job listing ID
+ * @param {number} attemptId - The application attempt ID
+ * @param {number} stepNumber - The Browser-Use step number
+ * @returns {string} The streaming-endpoint URL
+ */
+export function buildStepScreenshotUrl(jobId: number, attemptId: number, stepNumber: number): string {
+  return `/api/job-listings/${String(jobId)}/attempts/${String(attemptId)}/steps/${String(stepNumber)}/screenshot`;
 }

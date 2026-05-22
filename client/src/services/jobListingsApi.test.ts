@@ -437,3 +437,76 @@ describe("getLiveUrlResolution", () => {
     await expect(getLiveUrlResolution(42)).rejects.toBe("nope");
   });
 });
+
+describe("getJobAttempts", () => {
+  it("calls the per-job attempts endpoint and returns the typed body", async () => {
+    const { getJobAttempts } = await import("./jobListingsApi");
+    const body = { ...mockListing, attempts: [{ id: 1, job_listing_id: 1, end_response: "applied", has_submission_screenshot: true, step_logs: [], created_date: "2026-05-21T00:00:00.000Z" }] };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(body) }));
+
+    const result = await getJobAttempts(1);
+
+    expect(result.attempts).toHaveLength(1);
+    expect(result.attempts[0].end_response).toBe("applied");
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings/1/attempts");
+  });
+
+  it("throws on a non-ok response", async () => {
+    const { getJobAttempts } = await import("./jobListingsApi");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, json: () => Promise.resolve({ error: "Job listing not found" }) }));
+
+    await expect(getJobAttempts(999)).rejects.toThrow("Job listing not found");
+  });
+});
+
+describe("getApplicationAttempt", () => {
+  it("calls the per-attempt endpoint with both ids", async () => {
+    const { getApplicationAttempt } = await import("./jobListingsApi");
+    const body = {
+      id: 10,
+      job_listing_id: 1,
+      end_response: "applied",
+      has_submission_screenshot: true,
+      step_logs: [],
+      created_date: "2026-05-21T00:00:00.000Z",
+      job_listing: { id: 1, title: "Acme - Engineer", url: "https://x" },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(body) }));
+
+    const result = await getApplicationAttempt(1, 10);
+
+    expect(result.id).toBe(10);
+    expect(result.job_listing.title).toBe("Acme - Engineer");
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings/1/attempts/10");
+  });
+});
+
+describe("buildSubmissionScreenshotUrl + buildStepScreenshotUrl", () => {
+  it("builds the submission-screenshot streaming URL", async () => {
+    const { buildSubmissionScreenshotUrl } = await import("./jobListingsApi");
+    expect(buildSubmissionScreenshotUrl(7, 42)).toBe("/api/job-listings/7/attempts/42/submission-screenshot");
+  });
+
+  it("builds the per-step streaming URL", async () => {
+    const { buildStepScreenshotUrl } = await import("./jobListingsApi");
+    expect(buildStepScreenshotUrl(7, 42, 3)).toBe("/api/job-listings/7/attempts/42/steps/3/screenshot");
+  });
+});
+
+describe("RESOLUTION_PHASE_LABELS", () => {
+  it("has a non-empty label for every ResolutionPhase enum member", async () => {
+    const { ResolutionPhase, RESOLUTION_PHASE_LABELS } = await import("./jobListingsApi");
+    for (const phaseValue of Object.values(ResolutionPhase)) {
+      const label = RESOLUTION_PHASE_LABELS[phaseValue];
+      expect(typeof label).toBe("string");
+      expect(label.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("matches the spec'd human-readable labels", async () => {
+    const { ResolutionPhase, RESOLUTION_PHASE_LABELS } = await import("./jobListingsApi");
+    expect(RESOLUTION_PHASE_LABELS[ResolutionPhase.BraveSearch]).toBe("Searching the web");
+    expect(RESOLUTION_PHASE_LABELS[ResolutionPhase.AIPageClassify]).toBe("Reading candidate pages with AI");
+    expect(RESOLUTION_PHASE_LABELS[ResolutionPhase.Finalize]).toBe("Wrapping up");
+  });
+});

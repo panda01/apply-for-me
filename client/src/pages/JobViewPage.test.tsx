@@ -22,15 +22,20 @@ Object.defineProperty(window, "localStorage", {
   },
 });
 
-vi.mock("../services/jobListingsApi", () => ({
-  getJobListing: vi.fn(),
-  fetchJobData: vi.fn(),
-  applyToJob: vi.fn(),
-  resolveApplicationUrl: vi.fn(),
-  getResolutionLogs: vi.fn(),
-}));
+vi.mock("../services/jobListingsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/jobListingsApi")>();
+  return {
+    ...actual,
+    getJobListing: vi.fn(),
+    fetchJobData: vi.fn(),
+    applyToJob: vi.fn(),
+    resolveApplicationUrl: vi.fn(),
+    getResolutionLogs: vi.fn(),
+    getLiveUrlResolution: vi.fn().mockResolvedValue(null),
+  };
+});
 
-import { getJobListing, fetchJobData, applyToJob, resolveApplicationUrl, getResolutionLogs } from "../services/jobListingsApi";
+import { getJobListing, fetchJobData, applyToJob, resolveApplicationUrl, getResolutionLogs, getLiveUrlResolution } from "../services/jobListingsApi";
 
 const mockCompletedListing = {
   id: 1,
@@ -220,6 +225,42 @@ describe("JobViewPage", () => {
     await user.click(screen.getByRole("button", { name: /Fetch Data/ }));
 
     expect(fetchJobData).toHaveBeenCalledWith(1);
+  });
+
+  it("mounts the FetchProgressPanel when Fetch Data is clicked", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
+    vi.mocked(fetchJobData).mockResolvedValue(mockEmptyListing);
+    vi.mocked(getLiveUrlResolution).mockResolvedValue(null);
+
+    renderJobViewPage();
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Fetch Data/ })).toBeDefined();
+    });
+    // No panel before the click.
+    expect(screen.queryByTestId("fetch-progress-panel")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /Fetch Data/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("fetch-progress-panel")).toBeDefined();
+    });
+  });
+
+  it("mounts the FetchProgressPanel when the row loads with resolution_in_progress=true", async () => {
+    vi.mocked(getJobListing).mockResolvedValue({
+      ...mockEmptyListing,
+      resolution_in_progress: true,
+      latest_resolution_log_id: 5,
+    });
+    vi.mocked(getLiveUrlResolution).mockResolvedValue(null);
+
+    renderJobViewPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("fetch-progress-panel")).toBeDefined();
+    });
   });
 
   it("should call applyToJob with the stored profile id when Apply button is clicked", async () => {

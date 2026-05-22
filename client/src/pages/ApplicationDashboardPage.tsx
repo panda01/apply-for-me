@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { Link as RouterLink } from "react-router-dom";
+import { Link as RouterLink, useNavigate } from "react-router-dom";
 import {
   Container, Typography, CircularProgress, Alert, Box,
   Paper, Chip, Button, List, MenuItem, TextField,
@@ -32,6 +32,7 @@ const SELECTED_PROFILE_STORAGE_KEY = "afm:selectedApplicationProfileId";
  * a live iframe during application, and polling for status updates.
  */
 function ApplicationDashboardPage() {
+  const navigate = useNavigate();
   const [jobListings, setJobListings] = useState<JobListingResponse[]>([]);
   const [batchStatus, setBatchStatus] = useState<BatchApplyStatusResponse | null>(null);
   const [isLoadingList, setIsLoadingList] = useState(true);
@@ -149,6 +150,15 @@ function ApplicationDashboardPage() {
       setApplyingJobId(null);
     }
   };
+
+  // Row-body click on the dashboard navigates to the per-job attempts page,
+  // where the user can inspect the job's full attempt history (and screenshots).
+  const handleRowClick = useCallback(
+    (jobId: number) => {
+      navigate(`/jobs/${String(jobId)}/attempts`);
+    },
+    [navigate],
+  );
 
   const handleStartBatchApply = async () => {
     setIsStartingBatch(true);
@@ -323,6 +333,7 @@ function ApplicationDashboardPage() {
                 <JobRow
                   key={listing.id}
                   listing={listing}
+                  onClick={handleRowClick}
                   action={{
                     label: "Apply",
                     onClick: handleApplyToJob,
@@ -338,7 +349,7 @@ function ApplicationDashboardPage() {
           {appliedJobs.length > 0 && (
             <JobSection title="Applied" count={appliedJobs.length}>
               {appliedJobs.map((listing) => (
-                <JobRow key={listing.id} listing={listing} statusChip={getStatusChip(listing.status)} />
+                <JobRow key={listing.id} listing={listing} onClick={handleRowClick} statusChip={getStatusChip(listing.status)} />
               ))}
             </JobSection>
           )}
@@ -347,7 +358,7 @@ function ApplicationDashboardPage() {
           {closedJobs.length > 0 && (
             <JobSection title="Closed" count={closedJobs.length}>
               {closedJobs.map((listing) => (
-                <JobRow key={listing.id} listing={listing} statusChip={getStatusChip(listing.status)} />
+                <JobRow key={listing.id} listing={listing} onClick={handleRowClick} statusChip={getStatusChip(listing.status)} />
               ))}
             </JobSection>
           )}
@@ -359,6 +370,7 @@ function ApplicationDashboardPage() {
                 <JobRow
                   key={listing.id}
                   listing={listing}
+                  onClick={handleRowClick}
                   statusChip={getStatusChip(listing.status)}
                   action={{
                     label: "Retry",

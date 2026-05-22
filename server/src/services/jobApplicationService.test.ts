@@ -162,17 +162,54 @@ describe("classifyApplicationPhase", () => {
     expect(result.label).toBe("Filling out form");
   });
 
-  it("should classify step as Phase 4 when submit keywords found", () => {
-    const step = { nextGoal: "Submit the application", url: "https://example.com/apply", actions: [] };
+  it("should classify step as Phase 4 when review keywords found", () => {
+    const step = { nextGoal: "Review the application before submitting", url: "https://example.com/apply", actions: [] };
     const result = classifyApplicationPhase(step, "https://example.com/jobs/1", 3);
     expect(result.phase).toBe(4);
+    expect(result.label).toBe("Reviewing application");
+  });
+
+  it("should classify step as Phase 4 when verify keywords found", () => {
+    const step = { nextGoal: "Verify every field is correct", url: "https://example.com/apply", actions: [] };
+    const result = classifyApplicationPhase(step, "https://example.com/jobs/1", 3);
+    expect(result.phase).toBe(4);
+  });
+
+  it("should classify step as Phase 4 when double-check keywords found", () => {
+    const step = { nextGoal: "Double-check the email field", url: "https://example.com/apply", actions: [] };
+    const result = classifyApplicationPhase(step, "https://example.com/jobs/1", 3);
+    expect(result.phase).toBe(4);
+  });
+
+  it("should classify step as Phase 5 when submit keywords found", () => {
+    const step = { nextGoal: "Submit the application", url: "https://example.com/apply", actions: [] };
+    const result = classifyApplicationPhase(step, "https://example.com/jobs/1", 4);
+    expect(result.phase).toBe(5);
     expect(result.label).toBe("Submitting application");
+  });
+
+  it("should classify step as Phase 5 when send application keywords found", () => {
+    const step = { nextGoal: "Send application", url: "https://example.com/apply", actions: [] };
+    const result = classifyApplicationPhase(step, "https://example.com/jobs/1", 4);
+    expect(result.phase).toBe(5);
+  });
+
+  it("should classify combined review+submit step as Phase 4 (review wins ordering)", () => {
+    const step = { nextGoal: "Review the form before submit", url: "https://example.com/apply", actions: [] };
+    const result = classifyApplicationPhase(step, "https://example.com/jobs/1", 3);
+    expect(result.phase).toBe(4);
   });
 
   it("should never go backward from previous phase", () => {
     const step = { nextGoal: "Navigate to page", url: "https://example.com", actions: [] };
     const result = classifyApplicationPhase(step, "https://example.com", 3);
     expect(result.phase).toBe(3);
+  });
+
+  it("should never go backward from Phase 5 to Phase 4 even on review wording", () => {
+    const step = { nextGoal: "Review the receipt", url: "https://example.com/apply", actions: [] };
+    const result = classifyApplicationPhase(step, "https://example.com/jobs/1", 5);
+    expect(result.phase).toBe(5);
   });
 });
 
@@ -236,38 +273,42 @@ describe("ensureLogDirectory", () => {
 });
 
 describe("saveStepScreenshot", () => {
-  it("should download and save screenshot", async () => {
+  it("should download, save, and return the absolute file path", async () => {
     const mockBuffer = new ArrayBuffer(8);
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
       arrayBuffer: () => Promise.resolve(mockBuffer),
     }));
 
-    await saveStepScreenshot("https://screenshots.example.com/img.png", "/tmp/logs", 3);
+    const savedPath = await saveStepScreenshot("https://screenshots.example.com/img.png", "/tmp/logs", 3);
 
     expect(fetch).toHaveBeenCalledWith("https://screenshots.example.com/img.png");
     expect(mockWriteFile).toHaveBeenCalledWith(
       expect.stringContaining("step-3.png"),
       expect.any(Buffer)
     );
+    expect(savedPath).not.toBeNull();
+    expect(savedPath).toContain("step-3.png");
   });
 
-  it("should warn on download failure", async () => {
+  it("should return null on download failure and warn", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 }));
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    await saveStepScreenshot("https://screenshots.example.com/missing.png", "/tmp/logs", 5);
+    const savedPath = await saveStepScreenshot("https://screenshots.example.com/missing.png", "/tmp/logs", 5);
 
+    expect(savedPath).toBeNull();
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to download screenshot"));
     warnSpy.mockRestore();
   });
 
-  it("should log error on fetch exception", async () => {
+  it("should return null on fetch exception and log error", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Network error")));
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    await saveStepScreenshot("https://screenshots.example.com/err.png", "/tmp/logs", 1);
+    const savedPath = await saveStepScreenshot("https://screenshots.example.com/err.png", "/tmp/logs", 1);
 
+    expect(savedPath).toBeNull();
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Error saving screenshot"));
     errorSpy.mockRestore();
   });
@@ -1042,5 +1083,106 @@ describe("applyToJob", () => {
       expect.stringContaining("run-summary.json"),
       expect.stringContaining("task-summary")
     );
+  });
+
+  it("should fire onSubmissionScreenshotSaved exactly once on first Phase-4 step with a screenshot", async () => {
+    process.env["BROWSER_USE_API"] = "test-key";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+    }));
+
+    const steps = [
+      mockStep({ number: 1, nextGoal: "Navigate to job page", url: "https://example.com/jobs/1" }),
+      mockStep({ number: 2, nextGoal: "Click Easy Apply", url: "https://example.com/apply" }),
+      mockStep({ number: 3, nextGoal: "Fill in name field", url: "https://example.com/apply/form", actions: ["type name"] }),
+      // First Phase-4 step WITH a screenshot — should fire the callback
+      mockStep({ number: 4, nextGoal: "Review every field before submit", url: "https://example.com/apply/review", screenshotUrl: "https://shots.example.com/4.png" }),
+      // Second Phase-4 step with another screenshot — must NOT fire again
+      mockStep({ number: 5, nextGoal: "Review the form once more", url: "https://example.com/apply/review2", screenshotUrl: "https://shots.example.com/5.png" }),
+      // Phase-5 step — must not fire
+      mockStep({ number: 6, nextGoal: "Submit the application", url: "https://example.com/apply/submit" }),
+    ];
+    mockRun.mockReturnValue(createMockTaskRun({
+      id: "task-cb",
+      status: "finished",
+      output: "Submitted!",
+      sessionId: "session-1",
+      isSuccess: true,
+    }, "task-cb", steps));
+
+    const onSubmissionScreenshotSaved = vi.fn();
+    await applyToJob(
+      "https://example.com/jobs/1",
+      mockUserInfo,
+      mockProfileId,
+      undefined,
+      100,
+      onSubmissionScreenshotSaved,
+    );
+
+    expect(onSubmissionScreenshotSaved).toHaveBeenCalledTimes(1);
+    expect(onSubmissionScreenshotSaved.mock.calls[0][0]).toContain("step-4.png");
+  });
+
+  it("should NOT fire onSubmissionScreenshotSaved when Phase 4 is never reached", async () => {
+    process.env["BROWSER_USE_API"] = "test-key";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+    }));
+
+    const steps = [
+      mockStep({ number: 1, nextGoal: "Navigate to job page", url: "https://example.com/jobs/1", screenshotUrl: "https://shots.example.com/1.png" }),
+      mockStep({ number: 2, nextGoal: "Click Easy Apply", url: "https://example.com/apply", screenshotUrl: "https://shots.example.com/2.png" }),
+      mockStep({ number: 3, nextGoal: "Fill in name field", url: "https://example.com/apply/form", actions: ["type name"], screenshotUrl: "https://shots.example.com/3.png" }),
+    ];
+    mockRun.mockReturnValue(createMockTaskRun({
+      id: "task-no-phase4",
+      status: "finished",
+      output: "Done",
+      sessionId: "session-1",
+    }, "task-no-phase4", steps));
+
+    const onSubmissionScreenshotSaved = vi.fn();
+    await applyToJob(
+      "https://example.com/jobs/1",
+      mockUserInfo,
+      mockProfileId,
+      undefined,
+      101,
+      onSubmissionScreenshotSaved,
+    );
+
+    expect(onSubmissionScreenshotSaved).not.toHaveBeenCalled();
+  });
+
+  it("should NOT fire onSubmissionScreenshotSaved when Phase 4 happens without a screenshot", async () => {
+    process.env["BROWSER_USE_API"] = "test-key";
+
+    const steps = [
+      mockStep({ number: 1, nextGoal: "Navigate to job page", url: "https://example.com/jobs/1" }),
+      // Phase-4 step BUT no screenshotUrl — callback must not fire
+      mockStep({ number: 2, nextGoal: "Review the form", url: "https://example.com/apply/review" }),
+      mockStep({ number: 3, nextGoal: "Submit the application", url: "https://example.com/apply/submit" }),
+    ];
+    mockRun.mockReturnValue(createMockTaskRun({
+      id: "task-no-shot",
+      status: "finished",
+      output: "Done",
+      sessionId: "session-1",
+    }, "task-no-shot", steps));
+
+    const onSubmissionScreenshotSaved = vi.fn();
+    await applyToJob(
+      "https://example.com/jobs/1",
+      mockUserInfo,
+      mockProfileId,
+      undefined,
+      102,
+      onSubmissionScreenshotSaved,
+    );
+
+    expect(onSubmissionScreenshotSaved).not.toHaveBeenCalled();
   });
 });

@@ -17,10 +17,14 @@ import LoadingOrErrorPanel from "../components/LoadingOrErrorPanel";
 import LiveBrowserView from "../components/LiveBrowserView";
 import LabeledField from "../components/LabeledField";
 import ResolutionTracePanel from "../components/ResolutionTracePanel";
+import FetchProgressPanel from "../components/FetchProgressPanel";
 
 /**
  * Page that displays the full details of a single job listing.
  * Shows the saved URL with action buttons to fetch data or apply.
+ * When Fetch Data is running (or the user loaded the page mid-fetch), an inline
+ * {@link FetchProgressPanel} surfaces the resolver's current phase, message, step
+ * counter, elapsed time, and a crashed-state Alert with a Retry button.
  * When applying, shows a live browser view iframe and polls for updates.
  * When data has been fetched, shows the full job details including salary.
  */
@@ -35,6 +39,17 @@ function JobViewPage() {
   const [isRetryingResolve, setIsRetryingResolve] = useState(false);
   const [actionErrorMessage, setActionErrorMessage] = useState("");
   const [traceRefreshToken, setTraceRefreshToken] = useState(0);
+  // Incremented on every Fetch Data invocation. Passed as `key` to
+  // FetchProgressPanel so the panel fully remounts on retry — necessary
+  // because `isActive` can be permanently true (e.g. when `resolution_in_progress`
+  // is still set on a crashed row) and would otherwise prevent the panel's
+  // mount-time `useEffect` from resetting `progress` and restarting the poll.
+  const [fetchRetryKey, setFetchRetryKey] = useState(0);
+  // Snapshot of the latest resolution log id at the moment of the most recent
+  // Fetch Data click. Passed to FetchProgressPanel as `sinceLogId` so it
+  // ignores stale terminal payloads (the crashed log) until the background
+  // scraper inserts a fresh log row with a higher id.
+  const [fetchSinceLogId, setFetchSinceLogId] = useState<number | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   /**
@@ -65,10 +80,19 @@ function JobViewPage() {
     fetchJobListing();
   }, [fetchJobListing]);
 
-  /** Poll every 3 seconds while the job is applying, while data is being fetched, or while the resolver retry is in flight. */
+  /**
+   * Poll every 3 seconds while the job is applying, while data is being
+   * fetched, while a resolver retry is in flight, OR while the cached row
+   * still reports `resolution_in_progress=true`. The last case matters when
+   * the user lands on a page mid-fetch (without clicking Fetch Data
+   * themselves) — without it the FetchProgressPanel stays mounted forever
+   * because nothing ever re-fetches the row to observe the server flipping
+   * `resolution_in_progress` to false.
+   */
   useEffect(() => {
     const isApplying = jobListing?.status === "applying";
-    const shouldPoll = isApplying || isFetchingData || isRetryingResolve;
+    const isResolutionStillInProgress = jobListing?.resolution_in_progress === true;
+    const shouldPoll = isApplying || isFetchingData || isRetryingResolve || isResolutionStillInProgress;
 
     if (shouldPoll) {
       const hasNoExistingPoll = !pollIntervalRef.current;
@@ -88,7 +112,7 @@ function JobViewPage() {
         pollIntervalRef.current = null;
       }
     };
-  }, [jobListing, isFetchingData, fetchJobListing]);
+  }, [jobListing, isFetchingData, isRetryingResolve, fetchJobListing]);
 
   /** Stop the fetch-data polling once title has been populated */
   useEffect(() => {
@@ -121,10 +145,18 @@ function JobViewPage() {
   }, [jobListing?.title, isFetchingData]);
 
   /**
-   * Triggers background scraping for this job listing.
-   * Starts polling to show updated data once scraping completes.
+   * Triggers background scraping for this job listing. Starts polling to show
+   * updated data once scraping completes. Bumps `fetchRetryKey` so the
+   * FetchProgressPanel fully remounts — guarantees a fresh poll cycle even
+   * when its `isActive` prop was already true (e.g. coming off a crashed
+   * resolution that left `resolution_in_progress=true`).
    */
   const handleFetchData = async () => {
+    // Snapshot the prior log id BEFORE bumping the retry key. The panel reads
+    // this snapshot on its remount-time first poll and ignores any payload
+    // whose logId ≤ this value (stale crashed log).
+    setFetchSinceLogId(jobListing?.latest_resolution_log_id ?? null);
+    setFetchRetryKey((token) => token + 1);
     const parsedId = parseInt(id ?? "", 10);
     const isInvalidId = isNaN(parsedId);
     if (isInvalidId) return;
@@ -364,6 +396,15 @@ function JobViewPage() {
               )}
             </Box>
           </Paper>
+
+          {/* Inline Fetch Data progress — visible while the resolver is running OR the page is loaded mid-fetch */}
+          <FetchProgressPanel
+            key={fetchRetryKey}
+            jobId={parseInt(id ?? "", 10)}
+            isActive={isFetchingData || isResolutionInProgress}
+            sinceLogId={fetchSinceLogId}
+            onRetry={handleFetchData}
+          />
 
           {/* Live Application View — shown when applying */}
           {isApplying && (
