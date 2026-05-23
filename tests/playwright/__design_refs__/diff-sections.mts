@@ -110,7 +110,7 @@ interface SectionResult {
 function pixelsFromGeometry(geo: string): number {
   const m = /^(\d+)x(\d+)/.exec(geo);
   if (!m) return 0;
-  return parseInt(m[1]!, 10) * parseInt(m[2]!, 10);
+  return parseInt(m[1], 10) * parseInt(m[2], 10);
 }
 
 /**
@@ -163,7 +163,7 @@ function compareAE(refPath: string, implPath: string, sigma: number, diffOut: st
   const combined = (out.stdout || "") + (out.stderr || "");
   const m = /^\s*([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)/m.exec(combined);
   if (!m) return Number.NaN;
-  return parseFloat(m[1]!);
+  return parseFloat(m[1]);
 }
 
 function main(): void {
@@ -193,7 +193,7 @@ function main(): void {
 
       const aePerBlur: number[] = [];
       for (const sigma of BLUR_SIGMAS) {
-        const diffPath = resolve(surfaceDir, `${sec.name}__blur${sigma}.png`);
+        const diffPath = resolve(surfaceDir, `${sec.name}__blur${String(sigma)}.png`);
         const ae = compareAE(refCrop, implCrop, sigma, diffPath);
         aePerBlur.push(ae);
       }
@@ -232,17 +232,21 @@ function main(): void {
   lines.push("real backend, so content-area sections (`content`, `table`, `main-col`) reflect");
   lines.push("different *content*. Treat ⚠️ verdicts on those sections as expected.");
   lines.push("");
-  lines.push("| Surface | Section | Pixels | " + BLUR_SIGMAS.map((s) => `AE@σ${s}`).join(" | ") + " | Verdict |");
+  lines.push("| Surface | Section | Pixels | " + BLUR_SIGMAS.map((s) => `AE@σ${String(s)}`).join(" | ") + " | Verdict |");
   lines.push("|---|---|---:|" + BLUR_SIGMAS.map(() => "---:").join("|") + "|---|");
   for (const r of results) {
     if (r.ae.some((v) => Number.isNaN(v))) {
       const aeCols = r.ae.map((v) => Number.isNaN(v) ? "—" : v.toFixed(0)).join(" | ");
-      lines.push(`| ${r.surface} | ${r.section} | ${r.pixels} | ${aeCols} | ERROR |`);
+      lines.push(`| ${r.surface} | ${r.section} | ${String(r.pixels)} | ${aeCols} | ERROR |`);
       continue;
     }
-    const ae0 = r.ae[0]!;
-    const aeMax = r.ae[r.ae.length - 1]!;
-    const monotonicallyDown = r.ae.every((v, i) => i === 0 || v <= r.ae[i - 1]! * 1.05);
+    const ae0 = r.ae[0] ?? 0;
+    const aeMax = r.ae[r.ae.length - 1] ?? 0;
+    const monotonicallyDown = r.ae.every((v, i) => {
+      if (i === 0) return true;
+      const prev = r.ae[i - 1] ?? 0;
+      return v <= prev * 1.05;
+    });
     const settled = aeMax < r.pixels * 0.05;
     const ratio = aeMax / Math.max(ae0, 1);
     let verdict: string;
@@ -256,7 +260,7 @@ function main(): void {
       verdict = "⚠️ structure differs";
     }
     const aeCols = r.ae.map((v) => v.toFixed(0)).join(" | ");
-    lines.push(`| ${r.surface} | ${r.section} | ${r.pixels} | ${aeCols} | ${verdict} |`);
+    lines.push(`| ${r.surface} | ${r.section} | ${String(r.pixels)} | ${aeCols} | ${verdict} |`);
   }
   lines.push("");
   lines.push("Per-section ref/impl/diff crops live in `claude_tmp/diff/<surface>/`.");

@@ -28,7 +28,7 @@ If a command doesn't work or something doesn't go as expected, ask the user what
 - CRITICAL: When running `npm run dev` to check and see if the server is running, Always make sure that you try a the health check from the server, and you do a sniff test by trying to access the homepage
 - CRITICAL: For new features, or functionality, add a playwright test for them to the folder tests/playwright. This playwright test should essentially be all of the manual tests or checks you use.
 - CRITICAL: Never change config files to make tests or checks pass, unless the user explicitly asks you to.
-- When you need a temporary directory, or a temporary file that you need to place somewhere, always use the working directory for the project, and name the temporary folder claude_tmp. never create folders or files outside of the working directory for this project.
+- CRITICAL: When you need a temporary directory, or a temporary file that you need to place somewhere, always use the working directory for the project, and name the temporary folder claude_tmp. NEVER create folders or files outside of the working directory, the same directory this file is in.
 - use express and tsx for the backend
 - When using a database use the prisma ORM
 - Use MUI components were possible instead of elements with classnames.

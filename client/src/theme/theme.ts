@@ -290,6 +290,9 @@ export const theme = createTheme({
           fontSize: 12.5,
           fontWeight: 500,
           color: DESIGN_TOKENS.color.text,
+          "&.MuiInputLabel-outlined:not(.MuiInputLabel-shrink)": {
+            transform: "translate(11px, 8px) scale(1)",
+          },
         },
       },
     },

@@ -18,7 +18,7 @@ const __dirname = dirname(__filename);
 const PROJECT_ROOT = resolve(__dirname, "..", "..", "..");
 config({ path: resolve(PROJECT_ROOT, ".env") });
 
-const clientPort = process.env["CLIENT_PORT"];
+const clientPort = process.env.CLIENT_PORT;
 if (!clientPort) throw new Error("CLIENT_PORT not set");
 const BASE_URL = `http://localhost:${clientPort}`;
 const OUT_DIR = resolve(PROJECT_ROOT, "claude_tmp/impl_screenshots");
@@ -40,7 +40,9 @@ async function captureImpl(
   try {
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await context.newPage();
-    page.on("pageerror", (err) => console.log(`[browser:pageerror ${name}]`, err.message));
+    page.on("pageerror", (err) => {
+      console.log(`[browser:pageerror ${name}]`, err.message);
+    });
     await page.goto(`${BASE_URL}${route}`);
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
     // Give animations / fonts a moment to settle.

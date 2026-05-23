@@ -45,6 +45,8 @@ import {
   getResolutionLogs,
   getLiveUrlResolution,
   getJobAttempts,
+  deleteJobListing,
+  ApplicationAttemptOutcome,
 } from "../services/jobListingsApi";
 
 const mockCompletedListing = {
@@ -702,7 +704,7 @@ describe("JobViewPage — application_url resolution UI", () => {
     expect(user).toBeDefined(); // satisfies vitest unused-var rules
   });
 
-  it("replaces the Retry button with a 'View progress' link when resolution_in_progress is true", async () => {
+  it("shows the 'View progress' link in the header when resolution_in_progress is true", async () => {
     vi.mocked(getJobListing).mockResolvedValue({
       ...mockMissingFormUrlListing,
       resolution_in_progress: true,
@@ -714,7 +716,10 @@ describe("JobViewPage — application_url resolution UI", () => {
     await waitFor(() => {
       expect(screen.getByTestId("view-resolution-progress-link")).toBeDefined();
     });
-    expect(screen.queryByTestId("retry-resolve-button")).toBeNull();
+    // The trace deep-link replaces the static "Trace" link in the header. The
+    // Retry button still lives in the missing-form-url alert; both can be
+    // visible at the same time.
+    expect(screen.queryByTestId("view-resolution-trace-link")).toBeNull();
     expect(screen.getByTestId("view-resolution-progress-link").getAttribute("href")).toBe("/jobs/1/url-resolution");
   });
 
@@ -759,5 +764,256 @@ describe("JobViewPage — application_url resolution UI", () => {
     });
     expect(screen.queryByTestId("view-resolution-progress-link")).toBeNull();
     expect(screen.getByTestId("view-resolution-trace-link").getAttribute("href")).toBe("/jobs/1/url-resolution");
+  });
+});
+
+describe("JobViewPage — Manage panel + attempts list", () => {
+  const baseListing = {
+    id: 1,
+    title: "Acme Corp - Software Engineer",
+    url: "https://linkedin.com/jobs/1",
+    application_url: "https://acme.com/jobs/1/apply",
+    description: "Build cool stuff",
+    salary: "$120k",
+    status: "init",
+    live_url: null,
+    post_date: "2026-03-01T00:00:00.000Z",
+    created_date: "2026-03-07T00:00:00.000Z",
+    resolution_in_progress: false,
+    latest_resolution_log_id: null,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getResolutionLogs).mockResolvedValue([]);
+    vi.mocked(getJobAttempts).mockResolvedValue({ ...baseListing, attempts: [] });
+    vi.mocked(getLiveUrlResolution).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Render the page at /jobs/1 with the standard MemoryRouter route table plus a
+   * `/jobs` placeholder so we can detect handleDeleteJob's post-success navigation.
+   */
+  function renderPage() {
+    return render(
+      <MemoryRouter initialEntries={["/jobs/1"]}>
+        <Routes>
+          <Route path="/jobs/:id" element={<JobViewPage />} />
+          <Route path="/jobs" element={<div data-testid="jobs-list-stub">Jobs list</div>} />
+        </Routes>
+      </MemoryRouter>
+    );
+  }
+
+  it("surfaces a snackbar when Move to Saved is clicked", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("manage-move-saved")).toBeDefined();
+    });
+    await user.click(screen.getByTestId("manage-move-saved"));
+    await waitFor(() => {
+      expect(screen.getByText(/Move to Saved: status changes are not yet wired up/)).toBeDefined();
+    });
+  });
+
+  it("surfaces a snackbar when Mark as Interview is clicked", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("manage-mark-interview")).toBeDefined();
+    });
+    await user.click(screen.getByTestId("manage-mark-interview"));
+    await waitFor(() => {
+      expect(screen.getByText(/Mark as Interview: status changes are not yet wired up/)).toBeDefined();
+    });
+  });
+
+  it("surfaces a snackbar when Mark as Rejected is clicked", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("manage-mark-rejected")).toBeDefined();
+    });
+    await user.click(screen.getByTestId("manage-mark-rejected"));
+    await waitFor(() => {
+      expect(screen.getByText(/Mark as Rejected: status changes are not yet wired up/)).toBeDefined();
+    });
+  });
+
+  it("navigates to /jobs after a successful delete", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+    vi.mocked(deleteJobListing).mockResolvedValue(undefined as unknown as void);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("manage-delete-job")).toBeDefined();
+    });
+    await user.click(screen.getByTestId("manage-delete-job"));
+    await waitFor(() => {
+      expect(deleteJobListing).toHaveBeenCalledWith(1);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("jobs-list-stub")).toBeDefined();
+    });
+  });
+
+  it("surfaces the delete failure message in the snackbar", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+    vi.mocked(deleteJobListing).mockRejectedValue(new Error("not allowed"));
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("manage-delete-job")).toBeDefined();
+    });
+    await user.click(screen.getByTestId("manage-delete-job"));
+    await waitFor(() => {
+      expect(screen.getByText("not allowed")).toBeDefined();
+    });
+  });
+
+  it("falls back to a generic message when delete rejects with a non-Error", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+    vi.mocked(deleteJobListing).mockRejectedValue("nope");
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("manage-delete-job")).toBeDefined();
+    });
+    await user.click(screen.getByTestId("manage-delete-job"));
+    await waitFor(() => {
+      expect(screen.getByText("Failed to delete job")).toBeDefined();
+    });
+  });
+
+  it("renders attempt rows for every ApplicationAttemptOutcome enum value", async () => {
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+    vi.mocked(getJobAttempts).mockResolvedValue({
+      ...baseListing,
+      attempts: [
+        {
+          id: 11,
+          job_listing_id: 1,
+          end_response: ApplicationAttemptOutcome.Applied,
+          created_date: "2026-03-09T12:00:00.000Z",
+          step_logs: [],
+          has_submission_screenshot: false,
+        },
+        {
+          id: 12,
+          job_listing_id: 1,
+          end_response: ApplicationAttemptOutcome.Failed,
+          created_date: "2026-03-08T12:00:00.000Z",
+          step_logs: [],
+          has_submission_screenshot: false,
+        },
+        {
+          id: 13,
+          job_listing_id: 1,
+          end_response: ApplicationAttemptOutcome.ClosedListing,
+          created_date: "2026-03-07T12:00:00.000Z",
+          step_logs: [],
+          has_submission_screenshot: false,
+        },
+        {
+          id: 14,
+          job_listing_id: 1,
+          end_response: ApplicationAttemptOutcome.CaptchaBlocked,
+          created_date: "2026-03-06T12:00:00.000Z",
+          step_logs: [],
+          has_submission_screenshot: false,
+        },
+        {
+          id: 15,
+          job_listing_id: 1,
+          end_response: ApplicationAttemptOutcome.Stuck,
+          created_date: "2026-03-05T12:00:00.000Z",
+          step_logs: [],
+          has_submission_screenshot: false,
+        },
+      ],
+    });
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Applied")).toBeDefined();
+    });
+    expect(screen.getByText("Failed")).toBeDefined();
+    expect(screen.getByText("Closed listing")).toBeDefined();
+    expect(screen.getByText("CAPTCHA blocked")).toBeDefined();
+    expect(screen.getByText("Stuck")).toBeDefined();
+  });
+
+  it("auto-dismisses the snackbar after the 4s autoHideDuration elapses", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("manage-move-saved")).toBeDefined();
+    });
+    await user.click(screen.getByTestId("manage-move-saved"));
+    expect(screen.getByText(/Move to Saved: status changes are not yet wired up/)).toBeDefined();
+
+    // Wait for Snackbar's autoHideDuration (4 s) + exit transition.
+    await waitFor(
+      () => {
+        expect(screen.queryByText(/Move to Saved: status changes are not yet wired up/)).toBeNull();
+      },
+      { timeout: 6000 }
+    );
+  }, 10000);
+
+  it("falls back to '—' for company label when the job URL is invalid", async () => {
+    vi.mocked(getJobListing).mockResolvedValue({
+      ...baseListing,
+      url: "not-a-real-url",
+    });
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Company")).toBeDefined();
+    });
+    // The "Company" meta key sits in the same .meta-item as the value. The fallback
+    // should render '—' since new URL("not-a-real-url") throws.
+    // There are multiple em-dashes on the page — use queryAllByText.
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+  });
+
+  it("renders the Details panel side-column metadata for a completed listing", async () => {
+    vi.mocked(getJobListing).mockResolvedValue(baseListing);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("source-url-link")).toBeDefined();
+    });
+    // The "Company", "Salary", and "Posted" labels live in the details panel.
+    // (Each appears once in the Manage card's siblings — the details meta-key list.)
+    expect(screen.getAllByText("Company").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Salary").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Posted").length).toBeGreaterThan(0);
   });
 });

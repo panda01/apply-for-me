@@ -297,4 +297,26 @@ describe("ContainerViewPage", () => {
       expect(chip.className).toMatch(/colorError/);
     });
   });
+
+  it("renders '—' for WireGuard config when the record has no wgConfigName", async () => {
+    vi.mocked(getManagedContainer).mockResolvedValue({
+      ...mockContainer,
+      wgConfigName: null,
+    });
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("container-wg-config").textContent).toBe("—");
+    });
+  });
+
+  it("shows an Invalid container ID alert when the URL :id param is non-numeric", async () => {
+    renderPage("/containers/not-a-number");
+
+    await waitFor(() => {
+      expect(screen.getByText("Invalid container ID")).toBeDefined();
+    });
+    expect(getManagedContainer).not.toHaveBeenCalled();
+  });
 });

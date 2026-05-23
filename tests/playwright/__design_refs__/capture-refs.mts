@@ -30,8 +30,12 @@ async function captureRef(
   try {
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await context.newPage();
-    page.on("console", (msg) => console.log(`[browser:${msg.type()}]`, msg.text()));
-    page.on("pageerror", (err) => console.log("[browser:pageerror]", err.message));
+    page.on("console", (msg) => {
+      console.log(`[browser:${msg.type()}]`, msg.text());
+    });
+    page.on("pageerror", (err) => {
+      console.log("[browser:pageerror]", err.message);
+    });
     await page.goto(DESIGN_URL);
     // The prototype boots React via babel-standalone; wait for the root to fill in.
     await page.waitForSelector(".app", { timeout: 20_000 });
@@ -48,9 +52,10 @@ async function captureRef(
 
 async function main(): Promise<void> {
   // Shell + jobs landing (the prototype's default page is the dashboard, but jobs is one click away)
-  await captureRef("shell", async (page) => {
+  await captureRef("shell", (page) => {
     // Default landing — dashboard. Captures sidebar + topbar.
     void page;
+    return Promise.resolve();
   });
 
   await captureRef("sidebar-collapsed", async (page) => {

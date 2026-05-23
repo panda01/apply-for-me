@@ -2,16 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import ApplicationProfilesPage from "./ApplicationProfilesPage";
 
-// Disable userEvent's per-keystroke delay so this file's many .type() calls
-// don't bust the default 5s test timeout once v8 coverage instrumentation
-// is layered on top. Re-bound in beforeEach so it targets the fresh DOM.
+// Disable userEvent's per-keystroke delay so click flurries don't bust the
+// default 5s test timeout once v8 coverage instrumentation is layered on top.
 let user: ReturnType<typeof userEvent.setup>;
 
 const mockList = vi.fn();
-const mockCreate = vi.fn();
-const mockUpdate = vi.fn();
 const mockDelete = vi.fn();
 
 vi.mock("../services/applicationProfilesApi", async (importOriginal) => {
@@ -19,11 +15,25 @@ vi.mock("../services/applicationProfilesApi", async (importOriginal) => {
   return {
     ...actual,
     listApplicationProfiles: (...args: unknown[]) => mockList(...args),
-    createApplicationProfile: (...args: unknown[]) => mockCreate(...args),
-    updateApplicationProfile: (...args: unknown[]) => mockUpdate(...args),
     deleteApplicationProfile: (...args: unknown[]) => mockDelete(...args),
   };
 });
+
+/**
+ * The page now navigates to standalone create/edit pages via useNavigate
+ * instead of opening an MUI Dialog. Mock useNavigate so we can assert the
+ * exact route the page pushes onto history.
+ */
+const mockNavigate = vi.fn();
+vi.mock("react-router-dom", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react-router-dom")>();
+  return {
+    ...actual,
+    useNavigate: () => mockNavigate,
+  };
+});
+
+import ApplicationProfilesPage from "./ApplicationProfilesPage";
 
 const mockProfile = {
   id: 1,
@@ -44,6 +54,10 @@ const mockProfile = {
   updated_date: "2026-05-21T00:00:00.000Z",
 };
 
+/**
+ * Helper to render the ApplicationProfilesPage inside a MemoryRouter so
+ * `useNavigate` and `<Link>`/`<RouterLink>` children resolve correctly.
+ */
 function renderPage() {
   return render(
     <MemoryRouter>
@@ -64,15 +78,18 @@ describe("ApplicationProfilesPage", () => {
     expect(screen.getByRole("progressbar")).toBeDefined();
   });
 
-  it("lists existing profiles in a table", async () => {
+  it("lists existing profiles in a row card", async () => {
     mockList.mockResolvedValue([mockProfile]);
     renderPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("cell", { name: "Default" })).toBeDefined();
+      expect(screen.getByTestId(`profile-row-${String(mockProfile.id)}`)).toBeDefined();
     });
-    expect(screen.getByRole("cell", { name: "Khalah JG" })).toBeDefined();
-    expect(screen.getByRole("cell", { name: "k@example.com" })).toBeDefined();
+    // Profile label is rendered as the row's `.profile-row-label` span.
+    expect(screen.getByText("Default")).toBeDefined();
+    // The meta row concatenates name + email + phone with the design's "·" separator.
+    expect(screen.getByText(/Khalah JG/)).toBeDefined();
+    expect(screen.getByText(/k@example\.com/)).toBeDefined();
   });
 
   it("shows the empty-state CTA when no profiles exist", async () => {
@@ -80,9 +97,12 @@ describe("ApplicationProfilesPage", () => {
     renderPage();
 
     await waitFor(() => {
-      expect(screen.getByText("No application profiles yet.")).toBeDefined();
+      expect(screen.getByText("No profiles yet")).toBeDefined();
     });
-    expect(screen.getByRole("button", { name: /Create your first profile/ })).toBeDefined();
+    // The empty state explains what creating a profile gives you.
+    expect(
+      screen.getByText(/Create your first application profile to start auto-applying\./)
+    ).toBeDefined();
   });
 
   it("surfaces a fetch error", async () => {
@@ -103,118 +123,30 @@ describe("ApplicationProfilesPage", () => {
     });
   });
 
-  it("opens the create dialog and creates a profile end-to-end", { timeout: 15000 }, async () => {
+  it("navigates to /profiles/new when the New profile button is clicked", async () => {
     mockList.mockResolvedValue([]);
-    mockCreate.mockResolvedValue(mockProfile);
     renderPage();
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "New Profile" })).toBeDefined();
+      expect(screen.getByRole("button", { name: "New profile" })).toBeDefined();
     });
-    await user.click(screen.getByRole("button", { name: "New Profile" }));
 
-    await screen.findByRole("dialog", { name: /New application profile/ });
+    await user.click(screen.getByRole("button", { name: "New profile" }));
 
-    await user.type(screen.getByRole("textbox", { name: "Name" }), "New");
-    await user.type(screen.getByRole("textbox", { name: "First name" }), "A");
-    await user.type(screen.getByRole("textbox", { name: "Last name" }), "B");
-    await user.type(screen.getByRole("textbox", { name: "Email" }), "a@example.com");
-    await user.type(screen.getByRole("textbox", { name: "Phone" }), "5551234567");
-
-    // Re-mock list to return the new profile after create succeeds
-    mockList.mockResolvedValue([{ ...mockProfile, id: 2, name: "New" }]);
-    await user.click(screen.getByRole("button", { name: "Create profile" }));
-
-    await waitFor(() => {
-      expect(mockCreate).toHaveBeenCalledOnce();
-    });
-    // Dialog should close
-    await waitFor(() => {
-      expect(screen.queryByRole("dialog")).toBeNull();
-    });
+    expect(mockNavigate).toHaveBeenCalledWith("/profiles/new");
   });
 
-  it("opens the edit dialog with the profile's values pre-filled", async () => {
+  it("navigates to /profiles/:id/edit when a row's Edit button is clicked", async () => {
     mockList.mockResolvedValue([mockProfile]);
     renderPage();
 
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "edit Default" })).toBeDefined();
     });
+
     await user.click(screen.getByRole("button", { name: "edit Default" }));
 
-    await screen.findByRole("dialog", { name: /Edit profile: Default/ });
-    const nameInput = screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement;
-    expect(nameInput.value).toBe("Default");
-  });
-
-  it("surfaces a save error when the server returns a unique-name conflict", { timeout: 15000 }, async () => {
-    mockList.mockResolvedValue([]);
-    mockCreate.mockRejectedValue(new Error("A profile with name \"Default\" already exists"));
-    renderPage();
-
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "New Profile" })).toBeDefined();
-    });
-    await user.click(screen.getByRole("button", { name: "New Profile" }));
-    await screen.findByRole("dialog", { name: /New application profile/ });
-
-    await user.type(screen.getByRole("textbox", { name: "Name" }), "Default");
-    await user.type(screen.getByRole("textbox", { name: "First name" }), "A");
-    await user.type(screen.getByRole("textbox", { name: "Last name" }), "B");
-    await user.type(screen.getByRole("textbox", { name: "Email" }), "a@example.com");
-    await user.type(screen.getByRole("textbox", { name: "Phone" }), "5551234567");
-    await user.click(screen.getByRole("button", { name: "Create profile" }));
-
-    await waitFor(() => {
-      expect(screen.getByText(/already exists/)).toBeDefined();
-    });
-  });
-
-  it("surfaces a generic save error when create rejects with a non-Error", { timeout: 15000 }, async () => {
-    mockList.mockResolvedValue([]);
-    mockCreate.mockRejectedValue("non-error rejection");
-    renderPage();
-
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "New Profile" })).toBeDefined();
-    });
-    await user.click(screen.getByRole("button", { name: "New Profile" }));
-    await screen.findByRole("dialog", { name: /New application profile/ });
-
-    await user.type(screen.getByRole("textbox", { name: "Name" }), "Default");
-    await user.type(screen.getByRole("textbox", { name: "First name" }), "A");
-    await user.type(screen.getByRole("textbox", { name: "Last name" }), "B");
-    await user.type(screen.getByRole("textbox", { name: "Email" }), "a@example.com");
-    await user.type(screen.getByRole("textbox", { name: "Phone" }), "5551234567");
-    await user.click(screen.getByRole("button", { name: "Create profile" }));
-
-    await waitFor(() => {
-      expect(screen.getByText("Failed to save application profile")).toBeDefined();
-    });
-  });
-
-  it("updates the profile when the edit form is submitted", async () => {
-    mockList.mockResolvedValue([mockProfile]);
-    mockUpdate.mockResolvedValue({ ...mockProfile, name: "Renamed" });
-    renderPage();
-
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "edit Default" })).toBeDefined();
-    });
-    await user.click(screen.getByRole("button", { name: "edit Default" }));
-    await screen.findByRole("dialog", { name: /Edit profile: Default/ });
-
-    const nameInput = screen.getByRole("textbox", { name: "Name" });
-    await user.clear(nameInput);
-    await user.type(nameInput, "Renamed");
-
-    mockList.mockResolvedValue([{ ...mockProfile, name: "Renamed" }]);
-    await user.click(screen.getByRole("button", { name: "Save changes" }));
-
-    await waitFor(() => {
-      expect(mockUpdate).toHaveBeenCalledWith(1, expect.objectContaining({ name: "Renamed" }));
-    });
+    expect(mockNavigate).toHaveBeenCalledWith("/profiles/1/edit");
   });
 
   it("deletes a profile after the user confirms", async () => {
@@ -279,41 +211,6 @@ describe("ApplicationProfilesPage", () => {
     });
   });
 
-  it("surfaces a generic update error when update rejects with a non-Error", async () => {
-    mockList.mockResolvedValue([mockProfile]);
-    mockUpdate.mockRejectedValue("string failure");
-    renderPage();
-
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "edit Default" })).toBeDefined();
-    });
-    await user.click(screen.getByRole("button", { name: "edit Default" }));
-    await screen.findByRole("dialog", { name: /Edit profile: Default/ });
-
-    await user.click(screen.getByRole("button", { name: "Save changes" }));
-
-    await waitFor(() => {
-      expect(screen.getByText("Failed to save application profile")).toBeDefined();
-    });
-  });
-
-  it("closes the dialog when Cancel is clicked", async () => {
-    mockList.mockResolvedValue([mockProfile]);
-    renderPage();
-
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "New Profile" })).toBeDefined();
-    });
-    await user.click(screen.getByRole("button", { name: "New Profile" }));
-    await screen.findByRole("dialog", { name: /New application profile/ });
-
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
-
-    await waitFor(() => {
-      expect(screen.queryByRole("dialog")).toBeNull();
-    });
-  });
-
   it("clears the list-level error when the Close button on its alert is clicked", async () => {
     mockList.mockRejectedValue(new Error("Network down"));
     renderPage();
@@ -327,6 +224,40 @@ describe("ApplicationProfilesPage", () => {
 
     await waitFor(() => {
       expect(screen.queryByText("Network down")).toBeNull();
+    });
+  });
+
+  it("renders populated workAuthorization, salary, resume, and cover letter labels", async () => {
+    mockList.mockResolvedValue([
+      {
+        ...mockProfile,
+        middleName: "Q",
+        workAuthorization: "us_citizen",
+        desiredSalaryMin: 95000,
+        resumeUrl: "https://example.com/resume.pdf",
+        coverLetterUrl: "https://example.com/cover.pdf",
+      },
+    ]);
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByText(/Khalah Q JG/)).toBeDefined();
+    });
+    expect(screen.getByText("Resume")).toBeDefined();
+    expect(screen.getByText("Cover letter")).toBeDefined();
+    expect(screen.getByText(/Min \$95000/)).toBeDefined();
+    expect(screen.getByText(/US Citizen/i)).toBeDefined();
+  });
+
+  it("falls back to '?' initials when first and last names are both empty", async () => {
+    mockList.mockResolvedValue([
+      { ...mockProfile, firstName: "", lastName: "" },
+    ]);
+    renderPage();
+
+    await waitFor(() => {
+      const avatar = screen.getByTestId(`profile-row-${String(mockProfile.id)}`).querySelector(".profile-row-avatar");
+      expect(avatar?.textContent).toBe("?");
     });
   });
 });
