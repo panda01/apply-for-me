@@ -19,6 +19,8 @@ function buildListing(overrides: Partial<JobListingResponse> = {}): JobListingRe
     url: "https://linkedin.com/jobs/1",
     application_url: "https://acme.com/apply",
     description: "Cool job",
+    company: "Acme",
+    location: null,
     salary: null,
     status: "init",
     live_url: null,

@@ -3,6 +3,7 @@ import { parseDate } from "chrono-node";
 import { createReadStream } from "node:fs";
 import { access } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
+import { Prisma } from "../../prisma/generated/client/client.js";
 import prisma from "../prismaClient.js";
 import { scrapeJobViaContainer } from "../services/smartProxyScraperService.js";
 import { findOrSpawnRunningContainer, SpawnContainerError } from "../services/managedContainerService.js";
@@ -102,6 +103,11 @@ async function scrapeAndUpdateJobListing(
       where: { id: jobListingId },
       data: {
         title: formattedTitle,
+        // Also write the normalized company directly so the inbox-discovery dedup
+        // key (company + title) is available without re-parsing the formatted title.
+        // Empty string when the scraper didn't return a company so the row is excluded
+        // from dedup matching (see jobListingMatchService.findExistingJobListingByCompanyTitle).
+        company: scrapedData.company,
         description: scrapedData.description,
         salary: scrapedData.salary,
         post_date: scrapedData.post_date !== null ? parsePostDate(scrapedData.post_date) : new Date(),
@@ -775,13 +781,82 @@ export function splitFormattedTitle(formattedTitle: string): { company: string; 
 }
 
 /**
- * GET /api/job-listings
- * Retrieves all job listings from the database, ordered by created_date descending.
- * @returns {object[]} 200 - Array of all job listings
+ * Builds the Prisma `where` clause for the GET /api/job-listings search filter.
+ *
+ * When the trimmed query string is empty (or input is null/undefined), returns
+ * `undefined` so callers can omit the `where` key entirely and `findMany`
+ * returns every row. When non-empty, returns an OR-clause matching `contains`
+ * across the four user-visible text columns: title, description, url, and
+ * application_url.
+ *
+ * SQLite case-insensitivity caveat: this project's Prisma datasource is
+ * SQLite, and Prisma's `contains` operator on SQLite does NOT accept the
+ * `mode: 'insensitive'` flag — passing it throws at runtime. SQLite's default
+ * `LIKE` collation is ASCII case-insensitive (pragma `case_sensitive_like` is
+ * OFF by default), so a bare `{ contains: q }` already matches mixed-case
+ * input for ASCII characters, which is acceptable for this English-only
+ * project. That is why no `mode` flag is supplied below.
+ *
+ * `title` and `description` are nullable on the JobListing model; Prisma's
+ * `contains` correctly evaluates to false for NULL rows, so no extra
+ * null-handling is required here.
+ *
+ * @param {string | undefined} searchQuery - Raw query string from the request (may be undefined, empty, or whitespace).
+ * @returns {Prisma.JobListingWhereInput | undefined} The OR-filter when the trimmed query is non-empty; `undefined` to signal "no filter, return all rows" so the caller omits the `where` key on `findMany`.
  */
-router.get("/", async (_req: Request, res: Response) => {
+export function buildJobListingsWhereClause(
+  searchQuery: string | undefined
+): Prisma.JobListingWhereInput | undefined {
+  const isMissing = searchQuery === undefined || searchQuery === null;
+  if (isMissing) {
+    return undefined;
+  }
+  const trimmedQuery = searchQuery.trim();
+  const isEmptyAfterTrim = trimmedQuery.length === 0;
+  if (isEmptyAfterTrim) {
+    return undefined;
+  }
+  return {
+    OR: [
+      { title: { contains: trimmedQuery } },
+      { description: { contains: trimmedQuery } },
+      { url: { contains: trimmedQuery } },
+      { application_url: { contains: trimmedQuery } },
+    ],
+  };
+}
+
+/**
+ * GET /api/job-listings
+ * Retrieves job listings from the database, ordered by created_date descending.
+ *
+ * Supports an optional `q` query-string parameter for substring filtering.
+ * When `q` is omitted or trims to empty, every listing is returned (current
+ * behavior). When `q` is non-empty, the result is restricted to rows where
+ * the (trimmed) value appears as a substring in any of: `title`,
+ * `description`, `url`, or `application_url`.
+ *
+ * Matching is ASCII case-insensitive because this project uses SQLite and
+ * SQLite's default `LIKE` collation is case-insensitive for ASCII. The
+ * `mode: 'insensitive'` flag is intentionally NOT passed to Prisma — see
+ * {@link buildJobListingsWhereClause} for the full rationale (Prisma's
+ * SQLite driver throws when that flag is set).
+ *
+ * Array-valued `req.query.q` (e.g. `?q=a&q=b`) is coerced to undefined; only
+ * a single string value is honored.
+ *
+ * @param {string} [req.query.q] - Optional substring to filter by; matched against title, description, url, and application_url.
+ * @returns {object[]} 200 - Array of matching job listings, ordered by created_date desc.
+ */
+router.get("/", async (req: Request, res: Response) => {
+  const rawSearchQuery = req.query.q;
+  const isSingleStringQuery = typeof rawSearchQuery === "string";
+  const searchQuery = isSingleStringQuery ? rawSearchQuery : undefined;
+  const whereClause = buildJobListingsWhereClause(searchQuery);
+  const hasWhereClause = whereClause !== undefined;
   const jobListings = await prisma.jobListing.findMany({
     orderBy: { created_date: "desc" },
+    ...(hasWhereClause ? { where: whereClause } : {}),
   });
 
   res.json(jobListings);

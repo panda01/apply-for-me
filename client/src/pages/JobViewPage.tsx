@@ -115,14 +115,20 @@ function getAttemptPresentation(outcome: ApplicationAttemptOutcome): AttemptPres
 
 /**
  * Returns a single uppercase letter to render inside the `.company-logo`
- * placeholder div on the page header. The backend doesn't track a company
- * field yet, so the heuristic uses the URL's hostname's first character.
- * Returns "?" when no useful hostname can be derived.
+ * placeholder div on the page header. Prefers the persisted `company` field
+ * (populated by the inbox-discovery scanner and the scrape pipeline); falls
+ * back to the URL hostname's first character for legacy rows where company
+ * is null/empty. Returns "?" when neither yields a usable character.
  * @param {JobListingResponse | null} jobListing - The current job listing
  * @returns {string} A single character suitable for the logo placeholder
  */
 function deriveCompanyLogoLetter(jobListing: JobListingResponse | null): string {
   if (jobListing === null) return "?";
+  const persistedCompany = jobListing.company;
+  if (typeof persistedCompany === "string" && persistedCompany.trim().length > 0) {
+    const firstChar = persistedCompany.trim().charAt(0);
+    return firstChar.toUpperCase();
+  }
   const sourceUrl = jobListing.url;
   if (typeof sourceUrl !== "string" || sourceUrl === "") return "?";
   try {
@@ -136,15 +142,20 @@ function deriveCompanyLogoLetter(jobListing: JobListingResponse | null): string 
 }
 
 /**
- * Best-effort "company" string derived from the source URL hostname (with
- * `www.` stripped). The backend does not persist a company field yet — this
- * keeps the Details meta-list useful until that lands. Returns "—" when no
- * hostname is available.
+ * Returns the company name for the Details meta-list. Prefers the persisted
+ * `company` field; falls back to the URL hostname (with `www.` stripped) for
+ * legacy rows where company is null/empty. Returns "—" when neither yields
+ * a usable value.
  * @param {JobListingResponse | null} jobListing - The current job listing
- * @returns {string} A hostname-derived company label or the em-dash fallback
+ * @returns {string} The persisted company name, the URL hostname fallback,
+ *   or the em-dash for missing data
  */
 function deriveCompanyLabel(jobListing: JobListingResponse | null): string {
   if (jobListing === null) return "—";
+  const persistedCompany = jobListing.company;
+  if (typeof persistedCompany === "string" && persistedCompany.trim().length > 0) {
+    return persistedCompany.trim();
+  }
   const sourceUrl = jobListing.url;
   if (typeof sourceUrl !== "string" || sourceUrl === "") return "—";
   try {
@@ -565,6 +576,10 @@ function JobViewPage() {
   const displayTitle = deriveDisplayTitle(jobListing);
   const companyLogoLetter = deriveCompanyLogoLetter(jobListing);
   const companyLabel = deriveCompanyLabel(jobListing);
+  // Location is normalized on write (trim + collapse whitespace, empty → null)
+  // by the inbox-discovery import path, which is the only writer of this column.
+  // So `null` means unknown; otherwise the value is display-ready.
+  const locationLabel = jobListing?.location ?? "—";
   const salaryLabel = jobListing?.salary ?? "—";
   const postedLabel = jobListing?.post_date && jobListing.post_date !== ""
     ? new Date(jobListing.post_date).toLocaleDateString()
@@ -901,7 +916,7 @@ function JobViewPage() {
                   </div>
                   <div className="meta-item">
                     <span className="meta-key">Location</span>
-                    <span className="meta-val">{"—"}</span>
+                    <span className="meta-val">{locationLabel}</span>
                   </div>
                   <div className="meta-item">
                     <span className="meta-key">Salary</span>

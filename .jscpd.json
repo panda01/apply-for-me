@@ -13,6 +13,7 @@
     "dist/**",
     "dist-server/**",
     "coverage/**",
+    "claude_tmp/**",
     "**/*.d.ts",
     "package-lock.json"
   ],

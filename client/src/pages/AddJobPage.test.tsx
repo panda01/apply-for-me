@@ -31,7 +31,7 @@ describe("AddJobPage", () => {
     const user = userEvent.setup();
     vi.mocked(createJobListing).mockResolvedValue({
       id: 42, title: "", url: "https://linkedin.com/jobs/1",
-      description: "", application_url: null, salary: null, post_date: "", created_date: "", status: "init", live_url: null,
+      description: "", company: null, location: null, application_url: null, salary: null, post_date: "", created_date: "", status: "init", live_url: null,
       resolution_in_progress: false, latest_resolution_log_id: null,
     });
 

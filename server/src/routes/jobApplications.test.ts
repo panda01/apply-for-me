@@ -58,6 +58,7 @@ const mockApplicationProfile = {
 const mockInitJobListing = {
   id: 1,
   title: "Test Job",
+  company: null,
   url: "https://linkedin.com/jobs/view/123",
   application_url: "https://acme.com/jobs/123/apply",
   description: "Test description",

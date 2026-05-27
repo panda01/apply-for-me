@@ -6,6 +6,8 @@ import AddOutlined from "@mui/icons-material/AddOutlined";
 import PersonOutlineOutlined from "@mui/icons-material/PersonOutlineOutlined";
 import SettingsOutlined from "@mui/icons-material/SettingsOutlined";
 import ViewInArOutlined from "@mui/icons-material/ViewInArOutlined";
+import MailOutlineOutlined from "@mui/icons-material/MailOutlineOutlined";
+import LinkOutlined from "@mui/icons-material/LinkOutlined";
 import type { SvgIconComponent } from "@mui/icons-material";
 
 /**
@@ -77,8 +79,8 @@ function isNavItemActiveForPath(itemPath: string, pathname: string): boolean {
  * Left-hand application sidebar. Renders three labeled sections matching the
  * design package's structure:
  *
- *   Workspace — Dashboard (`/apply`), Jobs (`/jobs`), Add job (`/`)
- *   Library   — Profiles (`/profiles`), Settings (`/settings`)
+ *   Workspace — Dashboard (`/apply`), Inbox (`/inbox`), Jobs (`/jobs`), Add job (`/`)
+ *   Library   — Profiles (`/profiles`), Integrations (`/integrations`), Settings (`/settings`)
  *   Admin     — Containers (`/containers`)
  *
  * Items are rendered as `react-router-dom` `<Link>` so users can cmd-click to
@@ -98,12 +100,14 @@ function Sidebar(props: SidebarProps = {}): ReactElement {
 
   const workspaceItems: SidebarNavItem[] = [
     { id: "dashboard", label: "Dashboard", path: "/apply", Icon: SpaceDashboardOutlined },
+    { id: "inbox", label: "Inbox", path: "/inbox", Icon: MailOutlineOutlined },
     { id: "jobs", label: "Jobs", path: "/jobs", Icon: WorkOutlineOutlined, count: counts?.jobs },
     { id: "add", label: "Add job", path: "/", Icon: AddOutlined },
   ];
 
   const libraryItems: SidebarNavItem[] = [
     { id: "profiles", label: "Profiles", path: "/profiles", Icon: PersonOutlineOutlined, count: counts?.profiles },
+    { id: "integrations", label: "Integrations", path: "/integrations", Icon: LinkOutlined },
     { id: "settings", label: "Settings", path: "/settings", Icon: SettingsOutlined },
   ];
 

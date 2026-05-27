@@ -21,6 +21,8 @@ const baseJobListing: JobListingResponse = {
   url: "https://linkedin.com/jobs/1",
   application_url: null,
   description: "Build cool stuff",
+  company: null,
+  location: null,
   salary: null,
   status: "missing_form_url",
   live_url: null,

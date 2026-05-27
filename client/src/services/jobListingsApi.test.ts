@@ -11,6 +11,8 @@ const mockListing = {
   url: "https://linkedin.com/jobs/1",
   application_url: null,
   description: "Build cool stuff",
+  company: "Acme Corp",
+  location: "Remote",
   salary: null,
   status: "init",
   live_url: null,
@@ -35,6 +37,62 @@ describe("getJobListings", () => {
 
     expect(result).toEqual([mockListing]);
     expect(fetch).toHaveBeenCalledWith("/api/job-listings");
+  });
+
+  it("should call the unfiltered endpoint when called with no argument", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([]),
+    }));
+
+    await getJobListings();
+
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings");
+  });
+
+  it("should call the unfiltered endpoint when called with an empty string", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([]),
+    }));
+
+    await getJobListings("");
+
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings");
+  });
+
+  it("should call the unfiltered endpoint when called with whitespace only", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([]),
+    }));
+
+    await getJobListings("   ");
+
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings");
+  });
+
+  it("should call the filtered endpoint with a simple query", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([mockListing]),
+    }));
+
+    await getJobListings("react");
+
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings?q=react");
+  });
+
+  it("should URL-encode special characters in the search query", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([]),
+    }));
+
+    await getJobListings("a b & c");
+
+    // URLSearchParams encodes spaces as `+` and `&` as `%26`.
+    expect(fetch).toHaveBeenCalledWith("/api/job-listings?q=a+b+%26+c");
   });
 
   it("should throw on non-ok response", async () => {

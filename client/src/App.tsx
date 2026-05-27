@@ -3,6 +3,7 @@ import { ThemeProvider } from "@mui/material/styles";
 import CssBaseline from "@mui/material/CssBaseline";
 import theme from "./theme/theme";
 import AppGlobalStyles from "./theme/globalStyles";
+import { InboxGlobalStyles } from "./theme/inboxStyles";
 import AppShell from "./components/AppShell";
 import AddJobPage from "./pages/AddJobPage";
 import JobsListPage from "./pages/JobsListPage";
@@ -15,6 +16,8 @@ import ApplicationProfilesPage from "./pages/ApplicationProfilesPage";
 import ApplicationProfileEditPage from "./pages/ApplicationProfileEditPage";
 import JobAttemptsPage from "./pages/JobAttemptsPage";
 import ApplicationAttemptDetailPage from "./pages/ApplicationAttemptDetailPage";
+import IntegrationsPage from "./pages/IntegrationsPage";
+import InboxPage from "./pages/InboxPage";
 
 /**
  * Root application component that sets up routing and the navigation menu.
@@ -29,12 +32,15 @@ import ApplicationAttemptDetailPage from "./pages/ApplicationAttemptDetailPage";
  *   /profiles — CRUD UI for ApplicationProfile rows
  *   /containers — List + spawn managed Docker containers (create is inline)
  *   /containers/:id — View a single managed container with health-check ping
+ *   /integrations — Manage third-party connections (Gmail today)
+ *   /inbox — Browse jobs discovered from connected inboxes
  */
 function App() {
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
       <AppGlobalStyles />
+      <InboxGlobalStyles />
       <BrowserRouter>
         <AppShell>
           <Routes>
@@ -50,6 +56,8 @@ function App() {
             <Route path="/profiles/:id/edit" element={<ApplicationProfileEditPage />} />
             <Route path="/containers" element={<ContainersListPage />} />
             <Route path="/containers/:id" element={<ContainerViewPage />} />
+            <Route path="/integrations" element={<IntegrationsPage />} />
+            <Route path="/inbox" element={<InboxPage />} />
           </Routes>
         </AppShell>
       </BrowserRouter>

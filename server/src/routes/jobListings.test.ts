@@ -80,7 +80,12 @@ import { findOrSpawnRunningContainer, SpawnContainerError } from "../services/ma
 import { resolveApplicationUrl } from "../services/applicationUrlResolverService.js";
 import type { ResolverOutcome, ResolutionTrace } from "../services/applicationUrlResolverService.js";
 import { resolve as resolvePath } from "node:path";
-import { splitFormattedTitle, parseResolutionLogRow, parseAttemptLogRow } from "./jobListings.js";
+import {
+  splitFormattedTitle,
+  parseResolutionLogRow,
+  parseAttemptLogRow,
+  buildJobListingsWhereClause,
+} from "./jobListings.js";
 
 /** Absolute path of a tiny PNG fixture checked into claude_tmp/ for the streaming-route tests. */
 const FIXTURE_PNG_PATH = resolvePath(process.cwd(), "claude_tmp", "test-screenshot.png");
@@ -111,6 +116,7 @@ function resolverResult(outcome: ResolverOutcome, traceOverrides: Partial<Resolu
 const mockJobListing = {
   id: 1,
   title: "",
+  company: null,
   url: "https://linkedin.com/jobs/1",
   application_url: null,
   description: "",
@@ -125,6 +131,7 @@ const mockJobListing = {
 const mockCompletedJobListing = {
   id: 1,
   title: "Acme Corp - Software Engineer",
+  company: "Acme Corp",
   url: "https://linkedin.com/jobs/1",
   application_url: null,
   description: "Build cool stuff",
@@ -886,6 +893,140 @@ describe("GET /api/job-listings", () => {
     expect(response.body).toHaveLength(1);
     expect(prisma.jobListing.findMany).toHaveBeenCalledWith({
       orderBy: { created_date: "desc" },
+    });
+  });
+});
+
+describe("GET /api/job-listings (search filter)", () => {
+  /**
+   * Pulls the first positional argument out of the first findMany call. Used
+   * by the search-filter assertions below to inspect whether a `where` key was
+   * passed and what shape it has.
+   *
+   * @returns {Record<string, unknown>} The findMany call arg object.
+   */
+  function getFirstFindManyCallArg(): Record<string, unknown> {
+    const findManyMock = vi.mocked(prisma.jobListing.findMany);
+    const firstCall = findManyMock.mock.calls[0];
+    return firstCall[0] as unknown as Record<string, unknown>;
+  }
+
+  it("calls findMany without a where clause when q is not supplied", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
+
+    const response = await request(app).get("/api/job-listings");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toHaveLength(1);
+    const callArg = getFirstFindManyCallArg();
+    expect(callArg).toEqual({ orderBy: { created_date: "desc" } });
+    expect(callArg).not.toHaveProperty("where");
+  });
+
+  it("calls findMany without a where clause when q is an empty string", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
+
+    const response = await request(app).get("/api/job-listings?q=");
+
+    expect(response.status).toBe(200);
+    const callArg = getFirstFindManyCallArg();
+    expect(callArg).toEqual({ orderBy: { created_date: "desc" } });
+    expect(callArg).not.toHaveProperty("where");
+  });
+
+  it("calls findMany without a where clause when q is whitespace-only", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
+
+    // %20 is URL-encoded space; the route must trim before deciding to filter.
+    const response = await request(app).get("/api/job-listings?q=%20%20%20");
+
+    expect(response.status).toBe(200);
+    const callArg = getFirstFindManyCallArg();
+    expect(callArg).toEqual({ orderBy: { created_date: "desc" } });
+    expect(callArg).not.toHaveProperty("where");
+  });
+
+  it("passes an OR contains clause across title, description, url, and application_url when q is supplied", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
+
+    const response = await request(app).get("/api/job-listings?q=engineer");
+
+    expect(response.status).toBe(200);
+    const callArg = getFirstFindManyCallArg();
+    expect(callArg).toEqual({
+      orderBy: { created_date: "desc" },
+      where: {
+        OR: [
+          { title: { contains: "engineer" } },
+          { description: { contains: "engineer" } },
+          { url: { contains: "engineer" } },
+          { application_url: { contains: "engineer" } },
+        ],
+      },
+    });
+  });
+
+  it("does not normalize the casing of q — it is passed through verbatim so SQLite's case-insensitive LIKE handles matching", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
+
+    const response = await request(app).get("/api/job-listings?q=ENGINEER");
+
+    expect(response.status).toBe(200);
+    const callArg = getFirstFindManyCallArg();
+    // The literal "ENGINEER" should appear in every contains — the server must
+    // not toLowerCase() the input. SQLite's LIKE is ASCII case-insensitive by
+    // default, so this still matches "Software Engineer" rows at the DB layer.
+    expect(callArg).toEqual({
+      orderBy: { created_date: "desc" },
+      where: {
+        OR: [
+          { title: { contains: "ENGINEER" } },
+          { description: { contains: "ENGINEER" } },
+          { url: { contains: "ENGINEER" } },
+          { application_url: { contains: "ENGINEER" } },
+        ],
+      },
+    });
+  });
+});
+
+describe("buildJobListingsWhereClause", () => {
+  it("returns undefined when input is undefined", () => {
+    const result = buildJobListingsWhereClause(undefined);
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when input is an empty string", () => {
+    const result = buildJobListingsWhereClause("");
+    expect(result).toBeUndefined();
+  });
+
+  it("returns undefined when input is whitespace-only", () => {
+    const result = buildJobListingsWhereClause("   \t  \n ");
+    expect(result).toBeUndefined();
+  });
+
+  it("returns an OR clause across all four searchable columns for non-empty input", () => {
+    const result = buildJobListingsWhereClause("react");
+    expect(result).toEqual({
+      OR: [
+        { title: { contains: "react" } },
+        { description: { contains: "react" } },
+        { url: { contains: "react" } },
+        { application_url: { contains: "react" } },
+      ],
+    });
+  });
+
+  it("trims surrounding whitespace before composing the contains clause", () => {
+    const result = buildJobListingsWhereClause("  remote  ");
+    expect(result).toEqual({
+      OR: [
+        { title: { contains: "remote" } },
+        { description: { contains: "remote" } },
+        { url: { contains: "remote" } },
+        { application_url: { contains: "remote" } },
+      ],
     });
   });
 });

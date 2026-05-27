@@ -1,18 +1,21 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Alert,
   Box,
   Button,
   Checkbox,
   CircularProgress,
+  InputAdornment,
   Paper,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableRow,
+  TextField,
 } from "@mui/material";
+import Search from "@mui/icons-material/Search";
 import {
   applyToJob,
   getJobListings,
@@ -20,6 +23,7 @@ import {
 } from "../services/jobListingsApi";
 import StatusPill from "../components/StatusPill";
 import { KNOWN_STATUSES, getStatusMeta } from "../lib/jobStatus";
+import { useDebouncedValue } from "../lib/useDebouncedValue";
 
 /**
  * Tries to extract the hostname portion of a URL string for display.
@@ -46,6 +50,7 @@ function extractHostname(rawUrl: string): string {
  */
 function JobsListPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [jobListings, setJobListings] = useState<JobListingResponse[]>([]);
   const [isLoadingList, setIsLoadingList] = useState(true);
@@ -54,15 +59,24 @@ function JobsListPage() {
   const [activeTab, setActiveTab] = useState<string>("all");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
 
+  // Search input is initialised from the URL `?q=` param so deep links and
+  // back-navigation restore the previous search context.
+  const [searchInputValue, setSearchInputValue] = useState<string>(
+    () => searchParams.get("q") ?? ""
+  );
+  // Debounce typing so the server isn't pelted with one request per keystroke.
+  const debouncedSearchQuery = useDebouncedValue(searchInputValue, 300);
+
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   /**
    * Fetches the current job listings from the server and updates state.
-   * Surfaces errors via the {@link listErrorMessage} alert.
+   * Passes the debounced search query to the API so filtering happens
+   * server-side. Surfaces errors via the {@link listErrorMessage} alert.
    */
   const fetchListings = useCallback(async () => {
     try {
-      const listings = await getJobListings();
+      const listings = await getJobListings(debouncedSearchQuery);
       setJobListings(listings);
       setListErrorMessage("");
     } catch (err) {
@@ -71,11 +85,36 @@ function JobsListPage() {
     } finally {
       setIsLoadingList(false);
     }
-  }, []);
+  }, [debouncedSearchQuery]);
 
   useEffect(() => {
     fetchListings();
   }, [fetchListings]);
+
+  /**
+   * Syncs the debounced search query into the URL `?q=` param using
+   * `{ replace: true }` so each keystroke doesn't push a new history entry.
+   * Removes the param entirely when the query is empty so the URL stays
+   * tidy.
+   */
+  useEffect(() => {
+    const trimmedQuery = debouncedSearchQuery.trim();
+    const currentQueryParam = searchParams.get("q") ?? "";
+
+    if (trimmedQuery === currentQueryParam) {
+      // Already in sync — skip the setSearchParams call to avoid noisy
+      // history/render churn.
+      return;
+    }
+
+    const nextSearchParams = new URLSearchParams(searchParams);
+    if (trimmedQuery.length === 0) {
+      nextSearchParams.delete("q");
+    } else {
+      nextSearchParams.set("q", trimmedQuery);
+    }
+    setSearchParams(nextSearchParams, { replace: true });
+  }, [debouncedSearchQuery, searchParams, setSearchParams]);
 
   useEffect(() => {
     const hasApplyingListings = jobListings.some((listing) => listing.status === "applying");
@@ -307,6 +346,24 @@ function JobsListPage() {
           </p>
         </div>
         <Box sx={{ display: "flex", gap: 1 }}>
+          <TextField
+            size="small"
+            placeholder="Search title, description, or URL"
+            value={searchInputValue}
+            onChange={(event) => setSearchInputValue(event.target.value)}
+            slotProps={{
+              input: {
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <Search fontSize="small" />
+                  </InputAdornment>
+                ),
+              },
+              htmlInput: {
+                "aria-label": "Search jobs",
+              },
+            }}
+          />
           <Button variant="outlined" size="small" disabled>
             Filters
           </Button>
@@ -392,7 +449,24 @@ function JobsListPage() {
                   colSpan={8}
                   sx={{ py: 4, textAlign: "center", color: "var(--text-muted)" }}
                 >
-                  No jobs match this filter.
+                  {debouncedSearchQuery.trim().length > 0 ? (
+                    <>
+                      <div>
+                        {`No jobs match "${debouncedSearchQuery.trim()}" in this tab.`}
+                      </div>
+                      <Box sx={{ mt: 1 }}>
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => setSearchInputValue("")}
+                        >
+                          Clear search
+                        </Button>
+                      </Box>
+                    </>
+                  ) : (
+                    "No jobs match this filter."
+                  )}
                 </TableCell>
               </TableRow>
             ) : (
@@ -401,7 +475,22 @@ function JobsListPage() {
                 const hostnameForUrl = extractHostname(listing.url);
                 const titleHasNotLoadedYet = !listing.title || listing.title.trim().length === 0;
                 const titleText = titleHasNotLoadedYet ? hostnameForUrl : listing.title;
-                const subLineText = titleHasNotLoadedYet ? "" : hostnameForUrl;
+                // Sub-line under the title shows the company. The URL hostname
+                // is only a fallback for legacy rows where `company` is null /
+                // empty — without that fallback rows like LinkedIn alerts
+                // would just display the host every time they pre-date the
+                // company-column backfill.
+                const companyText = listing.company !== null && listing.company.trim().length > 0
+                  ? listing.company
+                  : "";
+                const subLineText = titleHasNotLoadedYet
+                  ? ""
+                  : companyText.length > 0
+                    ? companyText
+                    : hostnameForUrl;
+                const locationText = listing.location !== null && listing.location.trim().length > 0
+                  ? listing.location
+                  : "—";
                 const addedDateText = new Date(listing.created_date).toLocaleDateString();
 
                 return (
@@ -428,7 +517,7 @@ function JobsListPage() {
                     <TableCell>
                       <StatusPill status={listing.status} />
                     </TableCell>
-                    <TableCell className="col-co">—</TableCell>
+                    <TableCell className="col-co">{locationText}</TableCell>
                     <TableCell className="mono">{listing.salary ?? "—"}</TableCell>
                     <TableCell
                       sx={{

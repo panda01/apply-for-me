@@ -65,6 +65,7 @@ enum JobStatus {
 model JobListing {
   id              Int       @id @default(autoincrement())
   title           String?
+  company         String? // Normalized company name. Used together with `title` as the (case-insensitive, whitespace-collapsed) dedup key for the inbox-discovery feature. Nullable on legacy rows until the backfill in jobListingCompanyBackfill.ts populates them.
   url             String
   application_url String? // Off-platform URL where the actual application form lives. Null until the resolver succeeds (or when status=missing_form_url after a failed resolve).
   description     String?
@@ -80,6 +81,13 @@ model JobListing {
 
   // One row per apply-attempt for this listing — see ApplicationAttemptLogs.
   application_attempt_logs ApplicationAttemptLogs[]
+
+  // Inbox discoveries that resulted in this JobListing being created (i.e. user clicked Import).
+  imported_discoveries  DiscoveredJob[] @relation("DiscoveryImports")
+
+  // Inbox discoveries that matched this JobListing's (company, title) at scan time and were
+  // therefore marked as duplicates so the UI can render the "Already saved as …" link.
+  duplicate_discoveries DiscoveredJob[] @relation("DiscoveryDuplicates")
 
   @@map("jobs_listing")
 }
@@ -184,6 +192,125 @@ enum ManagedContainerStatus {
   running
   stopped
   error
+}
+
+// Lifecycle of an inbox-discovered job candidate. A DiscoveredJob row is created
+// by the inbox scanner when Claude extracts a posting from an email; it stays
+// `pending` until the user takes action on it.
+//   pending    — Default. Eligible for import or dismiss.
+//   imported   — User clicked Import. `imported_job_listing_id` points at the new JobListing row.
+//   duplicate  — Scan found a JobListing already exists with matching (company, title). `duplicate_of_job_id` points at the pre-existing row; the user cannot import this row (already saved). Distinct from `imported` because the user did not act on THIS row directly.
+//   dismissed  — User clicked Dismiss. Hidden from the default filter on the inbox page.
+enum DiscoveredJobStatus {
+  pending
+  imported
+  duplicate
+  dismissed
+}
+
+// One row per (email × extracted-job) returned by the inbox scanner. One Gmail
+// message can yield 0..N rows depending on what Claude finds in the body — a
+// "5 jobs matching your search" digest email produces 5 rows, a single-pitch
+// recruiter email produces 1, an unrelated newsletter that matched the
+// keyword search produces 0.
+//
+// The `@@unique([gmail_connection_id, email_message_id, company, title, location])`
+// makes re-scanning idempotent regardless of URL drift: LinkedIn job-alert
+// URLs embed a rotating `trackingId` query parameter, so if `job_url` were
+// part of the key, the same email re-scanned tomorrow would create a brand-
+// new row. The (company, title, location) triple is the identity of the
+// posting; a digest email listing five jobs produces five rows because each
+// triple differs, while a re-scan of any one of those emails refreshes the
+// existing row in place. Including `location` distinguishes the same role
+// posted in multiple cities (e.g. "Engineer @ Acme — Remote" vs "Engineer
+// @ Acme — NYC"). Uniqueness is case-insensitive via a `COLLATE NOCASE`
+// index applied as raw SQL after `prisma db push` (Prisma's SQLite driver
+// doesn't expose collation on @@unique). The index also wraps `location` in
+// `COALESCE(location, '')` so NULL-location rows collapse rather than
+// inserting duplicates (SQLite treats NULL as distinct in unique indexes
+// unless instructed otherwise).
+//
+// `duplicate_of_job_id` is set at scan time when a JobListing with case-
+// insensitive matching (company, title, location) already exists; in that
+// case the row is also born with `status="duplicate"` so the UI can render
+// it as already-saved and the import endpoint refuses to act on it. At
+// import time, sibling discoveries with matching (company, title, location)
+// get flipped to `status="duplicate"` + this FK in the same transaction
+// that creates the new JobListing.
+//
+// `imported_job_listing_id` is set when the user clicks Import, atomically
+// within the same transaction that creates the JobListing row.
+model DiscoveredJob {
+  id                      Int                  @id @default(autoincrement())
+  gmail_connection_id     Int
+  gmail_connection        GmailConnection      @relation(fields: [gmail_connection_id], references: [id], onDelete: Cascade)
+
+  // Source email metadata — enough to render the design's `.email-tag` and
+  // `.disc-group-head` plus deep-link back to Gmail.
+  email_message_id        String
+  email_thread_id         String?
+  email_from_name         String
+  email_from_address      String
+  email_subject           String
+  email_snippet           String?
+  email_received_at       DateTime
+  email_label_color       String? // Hex string derived from sender domain via senderColorPalette.ts; nullable for unknown senders.
+
+  // Extracted job fields. `company` and `title` are the dedup identity
+  // (normalized at compare time, stored as Claude returned them).
+  title                   String
+  company                 String
+  job_url                 String
+  location                String?
+  salary                  String?
+  description             String?
+
+  // Lifecycle
+  status                  DiscoveredJobStatus  @default(pending)
+  imported_job_listing_id Int?
+  imported_job_listing    JobListing?          @relation("DiscoveryImports", fields: [imported_job_listing_id], references: [id], onDelete: SetNull)
+  duplicate_of_job_id     Int?
+  duplicate_of_job        JobListing?          @relation("DiscoveryDuplicates", fields: [duplicate_of_job_id], references: [id], onDelete: SetNull)
+
+  confidence              Float // 0..1 self-reported by the extractor.
+  created_date            DateTime             @default(now())
+  updated_date            DateTime             @updatedAt
+
+  @@unique([gmail_connection_id, email_message_id, company, title, location], map: "discovered_jobs_dedupe_key")
+  @@index([gmail_connection_id, status, email_received_at])
+  @@map("discovered_jobs")
+}
+
+// One row per Google account that has granted this app `gmail.readonly` (and
+// the openid/email identity scopes used to derive `google_email`). Tokens are
+// stored in plaintext for now — same security posture as DATABASE_URL on disk
+// — and replaced atomically by the refresh-on-expiry path in
+// gmailConnectionService.getValidAccessToken().
+//
+// `google_email` is UNIQUE so re-running the OAuth dance for an already-
+// connected inbox upserts onto the same row instead of duplicating it.
+//
+// `access_token_expires_at` is the absolute expiry returned by Google
+// (`Date.now() + expires_in * 1000`); callers consult it with a small
+// negative skew (~60s) before deciding whether to refresh.
+//
+// `scopes` is the space-separated grant string returned by Google; storing it
+// lets us detect when a future feature requires a scope the user hasn't
+// granted yet and prompt for re-consent.
+model GmailConnection {
+  id                      Int      @id @default(autoincrement())
+  google_email            String   @unique
+  refresh_token           String
+  access_token            String
+  access_token_expires_at DateTime
+  scopes                  String
+  created_date            DateTime @default(now())
+  updated_date            DateTime @updatedAt
+
+  // Inbox-discovered job candidates extracted from this Gmail account's messages.
+  discovered_jobs         DiscoveredJob[]
+
+  @@map("gmail_connections")
 }
 
 // Records each Docker container spawned through the managed-containers API.

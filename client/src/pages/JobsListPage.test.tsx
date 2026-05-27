@@ -43,6 +43,8 @@ function makeListing(overrides: Partial<{
   url: string;
   application_url: string | null;
   description: string;
+  company: string | null;
+  location: string | null;
   salary: string | null;
   post_date: string;
   created_date: string;
@@ -57,6 +59,8 @@ function makeListing(overrides: Partial<{
     url: "https://linkedin.com/jobs/1",
     application_url: null,
     description: "Build cool stuff",
+    company: "Acme Corp",
+    location: "Remote",
     salary: null,
     post_date: "2026-03-01T00:00:00.000Z",
     created_date: "2026-03-07T00:00:00.000Z",
@@ -78,10 +82,27 @@ afterEach(() => {
 
 /**
  * Helper to render JobsListPage inside a MemoryRouter.
+ *
+ * @returns The render result from `@testing-library/react`.
  */
 function renderJobsListPage() {
   return render(
     <MemoryRouter>
+      <JobsListPage />
+    </MemoryRouter>
+  );
+}
+
+/**
+ * Helper to render JobsListPage inside a MemoryRouter seeded with an initial
+ * URL entry — needed to verify the page reads `?q=` on first mount.
+ *
+ * @param initialUrl The URL (including search string) to seed the router with.
+ * @returns The render result from `@testing-library/react`.
+ */
+function renderJobsListPageAt(initialUrl: string) {
+  return render(
+    <MemoryRouter initialEntries={[initialUrl]}>
       <JobsListPage />
     </MemoryRouter>
   );
@@ -111,6 +132,8 @@ describe("JobsListPage", () => {
         url: "https://linkedin.com/jobs/1",
         application_url: null,
         description: "Build cool stuff",
+        company: null,
+        location: null,
         salary: null,
         post_date: "2026-03-01T00:00:00.000Z",
         created_date: "2026-03-07T00:00:00.000Z",
@@ -176,6 +199,8 @@ describe("JobsListPage", () => {
       url: "https://linkedin.com/jobs/1",
       application_url: null,
       description: "",
+      company: null,
+      location: null,
       salary: null,
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
@@ -220,6 +245,8 @@ describe("JobsListPage", () => {
       url: "https://linkedin.com/jobs/1",
       application_url: null,
       description: "",
+      company: null,
+      location: null,
       salary: null,
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
@@ -271,6 +298,8 @@ describe("JobsListPage", () => {
       url: "https://linkedin.com/jobs/1",
       application_url: null,
       description: "Build stuff",
+      company: null,
+      location: null,
       salary: null,
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
@@ -464,7 +493,7 @@ describe("JobsListPage", () => {
 
   it("calls applyToJob and refreshes the list when a profile is stored", async () => {
     window.localStorage.setItem("afm:selectedApplicationProfileId", "5");
-    vi.mocked(applyToJob).mockResolvedValue(undefined as unknown as void);
+    vi.mocked(applyToJob).mockResolvedValue(makeListing({ id: 1, status: "applying" }));
     vi.mocked(getJobListings).mockResolvedValue([
       makeListing({ id: 1, status: "init", title: "Apply Target" }),
     ]);
@@ -526,7 +555,7 @@ describe("JobsListPage", () => {
 
   it("auto-applies to every selected init row in the bulk bar", async () => {
     window.localStorage.setItem("afm:selectedApplicationProfileId", "5");
-    vi.mocked(applyToJob).mockResolvedValue(undefined as unknown as void);
+    vi.mocked(applyToJob).mockResolvedValue(makeListing({ id: 1, status: "applying" }));
     vi.mocked(getJobListings).mockResolvedValue([
       makeListing({ id: 1, status: "init", title: "Init A" }),
       makeListing({ id: 2, status: "init", title: "Init B" }),
@@ -661,5 +690,87 @@ describe("JobsListPage", () => {
         screen.getByText("Pick an application profile on the Apply dashboard before applying.")
       ).toBeDefined();
     });
+  });
+
+  it("fires getJobListings with the typed value after the 300ms debounce", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({ id: 1, title: "Anything" }),
+    ]);
+
+    await act(async () => {
+      renderJobsListPage();
+    });
+    // Drain the mount-time fetch.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(getJobListings).toHaveBeenLastCalledWith("");
+    expect(getJobListings).toHaveBeenCalledTimes(1);
+
+    const searchInput = screen.getByRole("textbox", { name: "Search jobs" });
+    await act(async () => {
+      fireEvent.change(searchInput, { target: { value: "react" } });
+    });
+
+    // Before the debounce fires, no new call should have been issued.
+    expect(getJobListings).toHaveBeenCalledTimes(1);
+
+    // Advance past the 300ms debounce window — the debounced value updates,
+    // fetchListings is re-memoised, and the mount effect re-runs.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(350);
+    });
+
+    expect(getJobListings).toHaveBeenLastCalledWith("react");
+  });
+
+  it("pre-fills the search input and fires a filtered fetch when the URL has ?q=", async () => {
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({ id: 1, title: "Anything" }),
+    ]);
+
+    renderJobsListPageAt("/jobs?q=foo");
+
+    const searchInput = await screen.findByRole("textbox", { name: "Search jobs" });
+    expect((searchInput as HTMLInputElement).value).toBe("foo");
+    await waitFor(() => {
+      expect(getJobListings).toHaveBeenCalledWith("foo");
+    });
+  });
+
+  it("shows the active-query empty-state copy and a Clear search button when nothing matches", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getJobListings).mockResolvedValue([]);
+
+    await act(async () => {
+      renderJobsListPageAt("/jobs?q=zzz");
+    });
+    // Drain the mount-time fetch.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(
+      screen.getByText('No jobs match "zzz" in this tab.')
+    ).toBeDefined();
+
+    const clearSearchButton = screen.getByRole("button", { name: "Clear search" });
+    expect(clearSearchButton).toBeDefined();
+
+    // Clicking Clear search empties the input synchronously; after the debounce
+    // window passes, the next getJobListings call should be with "".
+    await act(async () => {
+      fireEvent.click(clearSearchButton);
+    });
+
+    const searchInput = screen.getByRole("textbox", { name: "Search jobs" });
+    expect((searchInput as HTMLInputElement).value).toBe("");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(350);
+    });
+
+    expect(getJobListings).toHaveBeenLastCalledWith("");
   });
 });

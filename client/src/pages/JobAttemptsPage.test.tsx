@@ -20,6 +20,8 @@ const baseJob = {
   url: "https://linkedin.com/jobs/1",
   application_url: "https://acme.com/apply",
   description: "Build cool stuff",
+  company: null,
+  location: null,
   salary: null,
   status: "applied" as const,
   live_url: null,

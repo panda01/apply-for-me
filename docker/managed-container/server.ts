@@ -311,7 +311,7 @@ function collectAnchorsForExtractLinks(): { href: string; text: string; accessib
       typeof href === "string" &&
       (href.startsWith("http://") || href.startsWith("https://"));
     if (!isAbsoluteHttpHref) continue;
-    const text = (anchor.textContent ?? "").trim().replace(/\s+/g, " ");
+    const text = anchor.textContent.trim().replace(/\s+/g, " ");
     const ariaLabel = (anchor.getAttribute("aria-label") ?? "").trim();
     const title = (anchor.getAttribute("title") ?? "").trim();
     const accessibleName = ariaLabel.length > 0 ? ariaLabel : title;

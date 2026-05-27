@@ -9,6 +9,13 @@ export interface JobListingResponse {
   url: string;
   application_url: string | null;
   description: string;
+  // Normalized company name extracted at scrape/inbox-discovery time. Empty
+  // string when no company could be determined; null on legacy rows that
+  // pre-date the column (the server's backfill clears most of these).
+  company: string | null;
+  // Job location ("Remote", "United States", "San Francisco, CA", etc.) as
+  // captured by the scraper or inbox extractor. Null when unknown.
+  location: string | null;
   salary: string | null;
   status: string;
   live_url: string | null;
@@ -117,13 +124,35 @@ export interface LiveProgress {
 }
 
 /**
- * Fetches all job listings from the API, ordered by created_date descending.
+ * Fetches job listings from the API, ordered by created_date descending.
+ *
+ * When a non-empty `searchQuery` is supplied, the server filters by a
+ * substring match against title, description, and URL — the trimmed value
+ * is passed in the `q` URL search parameter via {@link URLSearchParams} so
+ * special characters (spaces, ampersands, etc.) are encoded safely. When
+ * `searchQuery` is undefined, empty, or whitespace-only, the call falls
+ * back to the unfiltered endpoint (no query string).
+ *
+ * @param {string} [searchQuery] - Optional substring filter. Whitespace-only
+ *   and empty strings are treated identically to `undefined` and skip the
+ *   filter entirely.
  * @returns {Promise<JobListingResponse[]>} Array of job listing objects
  * @throws {Error} If the API request fails
  */
-export async function getJobListings(): Promise<JobListingResponse[]> {
+export async function getJobListings(
+  searchQuery?: string
+): Promise<JobListingResponse[]> {
+  const trimmedSearchQuery = (searchQuery ?? "").trim();
+  const hasSearchFilter = trimmedSearchQuery.length > 0;
+
+  let requestUrl = "/api/job-listings";
+  if (hasSearchFilter) {
+    const queryParams = new URLSearchParams({ q: trimmedSearchQuery });
+    requestUrl = `/api/job-listings?${queryParams.toString()}`;
+  }
+
   return requestJson<JobListingResponse[]>(
-    "/api/job-listings",
+    requestUrl,
     undefined,
     "Failed to fetch job listings"
   );

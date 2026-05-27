@@ -565,7 +565,7 @@ export async function resolveApplicationUrl(input: ResolverInput): Promise<Resol
 
     const harvestStepIndex = await safeStartStep(reporter, ResolutionPhase.CareersPageHarvest, `Harvesting careers page ${String(careersPagesHarvestedCount)}: ${careersResult.url}`, { url: careersResult.url, careersPageNumber: careersPagesHarvestedCount });
     const harvestStartedAt = Date.now();
-    let topHrefs: { href: string; text: string; accessibleName: string; score: number }[] = [];
+    let topHrefs: { href: string; text: string; accessibleName: string; score: number }[];
     try {
       const harvestResult = await harvestCareersPage(container.hostPort, careersResult.url, input.originalTitle);
       topHrefs = harvestResult.topHrefs;
