@@ -3,6 +3,7 @@ import type { Server } from "node:http";
 import { app } from "./app.js";
 import prisma from "./prismaClient.js";
 import { cleanupAllManagedContainers } from "./services/managedContainerCleanup.js";
+import { markStaleRunningAsFailed } from "./services/gmailSyncSessionService.js";
 
 const serverPort = process.env["SERVER_PORT"];
 const isMissingServerPort = !serverPort;
@@ -74,6 +75,11 @@ async function gracefulShutdown(httpServer: Server, signal: string): Promise<voi
 }
 
 verifyDatabaseConnection().then(async () => {
+  // Reconcile any GmailSyncSession rows that were left in `running` because
+  // the previous process died mid-scan. Runs BEFORE app.listen so the very
+  // first /api/inbox/scan/active request after boot is already consistent.
+  await markStaleRunningAsFailed();
+
   const httpServer = app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });

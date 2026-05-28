@@ -7,6 +7,11 @@ export default defineConfig({
   schema: "server/prisma/schema.prisma",
   migrations: {
     path: "server/prisma/migrations",
+    // `npx prisma db seed` and `prisma migrate reset` invoke this command;
+    // npm run db:push also chains it after `prisma db push` so every schema
+    // push restores the custom raw-SQL indexes Prisma's @@unique can't
+    // express (see server/prisma/seed.ts).
+    seed: "tsx server/prisma/seed.ts",
   },
   datasource: {
     url: process.env["DATABASE_URL"],

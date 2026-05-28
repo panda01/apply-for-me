@@ -11,6 +11,9 @@ const mockScanInbox = vi.fn();
 const mockImportDiscoveries = vi.fn();
 const mockDismissDiscovery = vi.fn();
 const mockRestoreDiscovery = vi.fn();
+const mockGetActiveScanSession = vi.fn();
+const mockGetScanSession = vi.fn();
+const mockGetLastScanSession = vi.fn();
 
 vi.mock("../services/inboxApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/inboxApi")>();
@@ -21,6 +24,9 @@ vi.mock("../services/inboxApi", async (importOriginal) => {
     importInboxDiscoveries: (...args: unknown[]) => mockImportDiscoveries(...args),
     dismissInboxDiscovery: (...args: unknown[]) => mockDismissDiscovery(...args),
     restoreInboxDiscovery: (...args: unknown[]) => mockRestoreDiscovery(...args),
+    getActiveScanSession: (...args: unknown[]) => mockGetActiveScanSession(...args),
+    getScanSession: (...args: unknown[]) => mockGetScanSession(...args),
+    getLastScanSession: (...args: unknown[]) => mockGetLastScanSession(...args),
   };
 });
 
@@ -93,11 +99,37 @@ function renderPage(initialEntries: string[] = ["/inbox"]): void {
   );
 }
 
+/**
+ * Builds a GmailSyncSessionResponse-shaped fixture. Tests pass overrides for
+ * the fields they care about (status, currentStep, result, etc).
+ *
+ * @param {Record<string, unknown>} overrides - Fields to override
+ * @returns {Record<string, unknown>} A session-shaped object
+ */
+function buildSyncSession(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 1,
+    gmailConnectionId: 1,
+    status: "running",
+    currentStep: null,
+    startedAt: "2026-05-27T12:00:00.000Z",
+    finishedAt: null,
+    daysRequested: 14,
+    lastError: null,
+    result: null,
+    logs: [],
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   user = userEvent.setup({ delay: null });
   vi.spyOn(window, "confirm").mockReturnValue(true);
   mockListGmailConnections.mockResolvedValue([sampleConnection]);
+  // Default: no scan in flight on mount. Individual tests override.
+  mockGetActiveScanSession.mockResolvedValue(null);
+  mockGetLastScanSession.mockResolvedValue(null);
 });
 
 describe("InboxPage", () => {
@@ -193,9 +225,26 @@ describe("InboxPage", () => {
     expect(screen.getByText("Already Have")).toBeDefined();
   });
 
-  it("calls scanInbox and refetches discoveries when the Re-scan button is clicked", async () => {
+  it("kicks off a scan via the hook, polls the session, and surfaces 'Found N new' on success", async () => {
     mockListDiscoveries.mockResolvedValue([]);
-    mockScanInbox.mockResolvedValue({ scanned: 5, found: 2, newDiscoveries: 2 });
+    // POST /scan returns a sessionId immediately.
+    mockScanInbox.mockResolvedValue({ sessionId: 1, status: "running", reused: false });
+    // The hook then reads the session: first response is running, next is succeeded.
+    const runningSession = buildSyncSession({
+      id: 1,
+      status: "running",
+      currentStep: "fetching_emails",
+    });
+    const succeededSession = buildSyncSession({
+      id: 1,
+      status: "succeeded",
+      currentStep: null,
+      result: { scanned: 5, found: 2, newDiscoveries: 2 },
+      finishedAt: "2026-05-27T12:00:30.000Z",
+    });
+    mockGetScanSession
+      .mockResolvedValueOnce(runningSession)
+      .mockResolvedValue(succeededSession);
 
     renderPage();
 
@@ -203,19 +252,182 @@ describe("InboxPage", () => {
       expect(screen.getByText(/no jobs in this view/i)).toBeDefined();
     });
 
-    const initialListCallCount = mockListDiscoveries.mock.calls.length;
-
     await user.click(screen.getByRole("button", { name: /re-scan inbox/i }));
 
     await waitFor(() => {
       expect(mockScanInbox).toHaveBeenCalledWith(14);
     });
-    await waitFor(() => {
-      expect(mockListDiscoveries.mock.calls.length).toBeGreaterThan(initialListCallCount);
+    // Polling cadence is 1500ms, so extend timeout past it. The hook reads
+    // the session once on start (returns running) then polls; the second
+    // poll resolves to succeeded.
+    await waitFor(
+      () => {
+        expect(screen.getByText(/found 2 new/i)).toBeDefined();
+      },
+      { timeout: 4000 }
+    );
+  });
+
+  it("refetches discoveries after a click-Rescan session transitions running → succeeded", async () => {
+    mockListDiscoveries.mockResolvedValue([]);
+    mockScanInbox.mockResolvedValue({ sessionId: 2, status: "running", reused: false });
+    const runningSession = buildSyncSession({
+      id: 2,
+      status: "running",
+      currentStep: "fetching_emails",
     });
-    await waitFor(() => {
-      expect(screen.getByText(/found 2 new/i)).toBeDefined();
+    const succeededSession = buildSyncSession({
+      id: 2,
+      status: "succeeded",
+      currentStep: null,
+      result: { scanned: 3, found: 1, newDiscoveries: 1 },
+      finishedAt: "2026-05-27T12:00:30.000Z",
     });
+    mockGetScanSession
+      .mockResolvedValueOnce(runningSession)
+      .mockResolvedValue(succeededSession);
+
+    renderPage();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /re-scan inbox/i })).toBeDefined();
+    });
+    const callsBeforeClick = mockListDiscoveries.mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: /re-scan inbox/i }));
+
+    await waitFor(
+      () => {
+        expect(mockListDiscoveries.mock.calls.length).toBeGreaterThan(callsBeforeClick);
+      },
+      { timeout: 4000 }
+    );
+  });
+
+  it("refetches discoveries exactly once per settled session (dedup on repeated renders)", async () => {
+    mockListDiscoveries.mockResolvedValue([]);
+    const succeededSession = buildSyncSession({
+      id: 3,
+      status: "succeeded",
+      currentStep: null,
+      result: { scanned: 1, found: 0, newDiscoveries: 0 },
+      finishedAt: "2026-05-27T12:00:30.000Z",
+    });
+    // Mount sees an already-running session, then polling immediately
+    // resolves to succeeded; subsequent state changes should not cause
+    // additional refetches.
+    const runningSession = buildSyncSession({
+      id: 3,
+      status: "running",
+      currentStep: "saving_jobs",
+    });
+    mockGetActiveScanSession.mockResolvedValue(runningSession);
+    mockGetScanSession.mockResolvedValue(succeededSession);
+
+    renderPage();
+
+    await waitFor(
+      () => {
+        // Initial mount fetch + one refetch on settle = at least 2.
+        expect(mockListDiscoveries.mock.calls.length).toBeGreaterThanOrEqual(2);
+      },
+      { timeout: 4000 }
+    );
+    const callsAfterSettle = mockListDiscoveries.mock.calls.length;
+
+    // Wait an extra cycle to be sure no extra refetches happen for the
+    // same session id (the ref-based dedup guards against multiple effect
+    // runs for the same session).
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(mockListDiscoveries.mock.calls.length).toBe(callsAfterSettle);
+  });
+
+  it("refetches discoveries after a polled session transitions running → succeeded (mount path)", async () => {
+    mockListDiscoveries.mockResolvedValue([]);
+    const runningSession = buildSyncSession({
+      id: 9,
+      status: "running",
+      currentStep: "finding_jobs",
+    });
+    const succeededSession = buildSyncSession({
+      id: 9,
+      status: "succeeded",
+      currentStep: null,
+      result: { scanned: 5, found: 2, newDiscoveries: 2 },
+      finishedAt: "2026-05-27T12:00:30.000Z",
+    });
+    mockGetActiveScanSession.mockResolvedValue(runningSession);
+    // First poll returns running, second poll returns succeeded.
+    mockGetScanSession
+      .mockResolvedValueOnce(runningSession)
+      .mockResolvedValue(succeededSession);
+
+    renderPage();
+
+    // Mount fires the initial listInboxDiscoveries.
+    await waitFor(() => {
+      expect(mockListDiscoveries).toHaveBeenCalled();
+    });
+    const callsAfterMount = mockListDiscoveries.mock.calls.length;
+
+    // Wait long enough for two poll ticks (default 1500ms each).
+    await waitFor(
+      () => {
+        expect(mockListDiscoveries.mock.calls.length).toBeGreaterThan(callsAfterMount);
+      },
+      { timeout: 5000 }
+    );
+  });
+
+  it("reflects an in-progress scan in the button + step indicator on page mount (survives reload)", async () => {
+    mockListDiscoveries.mockResolvedValue([]);
+    // On mount, getActiveScanSession returns a running session.
+    const runningSession = buildSyncSession({
+      id: 7,
+      status: "running",
+      currentStep: "finding_jobs",
+    });
+    mockGetActiveScanSession.mockResolvedValue(runningSession);
+    mockGetScanSession.mockResolvedValue(runningSession);
+
+    renderPage();
+
+    await waitFor(() => {
+      // Button is disabled and shows the "Processing Gmail…" label.
+      const button = screen.getByRole("button", { name: /processing gmail/i });
+      expect(button).toBeDefined();
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    });
+    // The step indicator is rendered with the current step highlighted.
+    expect(screen.getByTestId("sync-step-indicator")).toBeDefined();
+    const findingJobsChip = screen.getByTestId("sync-step-finding_jobs");
+    expect(findingJobsChip.getAttribute("data-state")).toBe("active");
+  });
+
+  it("transparently joins an existing scan when start() races into a 409", async () => {
+    mockListDiscoveries.mockResolvedValue([]);
+    const { ScanAlreadyRunningError } = await import("../services/inboxApi");
+    mockScanInbox.mockRejectedValue(new ScanAlreadyRunningError(42));
+    const existingSession = buildSyncSession({
+      id: 42,
+      status: "running",
+      currentStep: "fetching_emails",
+    });
+    mockGetScanSession.mockResolvedValue(existingSession);
+
+    renderPage();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /re-scan inbox/i })).toBeDefined();
+    });
+
+    await user.click(screen.getByRole("button", { name: /re-scan inbox/i }));
+
+    await waitFor(() => {
+      // Button flipped to disabled even though the POST 409'd — we're now
+      // watching the existing session id 42.
+      const button = screen.getByRole("button", { name: /processing gmail/i });
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    });
+    expect(mockGetScanSession).toHaveBeenCalledWith(42);
   });
 
   it("imports the currently selected ids and shows a success snackbar", async () => {
@@ -626,22 +838,35 @@ describe("InboxPage", () => {
 
   it("dismisses the snackbar when its close button is clicked", async () => {
     mockListDiscoveries.mockResolvedValue([]);
+    // Trigger a snackbar via the new async re-scan flow: start succeeds,
+    // hook polls a session that settles to succeeded with zero discoveries.
+    mockScanInbox.mockResolvedValue({ sessionId: 1, status: "running", reused: false });
+    const succeededSession = buildSyncSession({
+      id: 1,
+      status: "succeeded",
+      currentStep: null,
+      result: { scanned: 0, found: 0, newDiscoveries: 0 },
+      finishedAt: "2026-05-27T12:00:30.000Z",
+    });
+    mockGetScanSession
+      .mockResolvedValueOnce(buildSyncSession({ id: 1, status: "running" }))
+      .mockResolvedValue(succeededSession);
 
     renderPage(["/inbox?connected=user@example.com"]);
 
-    // Trigger a snackbar via Re-scan success path
-    mockScanInbox.mockResolvedValue({ scanned: 0, found: 0, newDiscoveries: 0 });
     await waitFor(() => {
       expect(screen.getByRole("button", { name: /re-scan inbox/i })).toBeDefined();
     });
     await user.click(screen.getByRole("button", { name: /re-scan inbox/i }));
 
-    // Wait for snackbar to appear
-    await waitFor(() => {
-      // Snackbar contains text about the scan result; find the close button
-      const closeButtons = screen.queryAllByRole("button", { name: /close/i });
-      expect(closeButtons.length).toBeGreaterThan(0);
-    });
+    // Wait for snackbar to appear (polling cadence is 1500ms).
+    await waitFor(
+      () => {
+        const closeButtons = screen.queryAllByRole("button", { name: /close/i });
+        expect(closeButtons.length).toBeGreaterThan(0);
+      },
+      { timeout: 4000 }
+    );
 
     const closeButtons = screen.queryAllByRole("button", { name: /close/i });
     await user.click(closeButtons[0] as HTMLElement);
@@ -808,7 +1033,8 @@ describe("InboxPage", () => {
     });
   });
 
-  // Covers line 396 cond-expr path 1: non-Error rejection in handleRescan.
+  // Hook handles non-Error rejections by falling back to "Failed to start scan",
+  // which the page surfaces via the listError effect.
   it("surfaces a generic message when scanInbox rejects with a non-Error value", async () => {
     mockListDiscoveries.mockResolvedValue([]);
     mockScanInbox.mockRejectedValue({ random: "object" });
@@ -821,7 +1047,7 @@ describe("InboxPage", () => {
     await user.click(screen.getByRole("button", { name: /re-scan inbox/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/Failed to scan inbox/i)).toBeDefined();
+      expect(screen.getByText(/Failed to start scan/i)).toBeDefined();
     });
   });
 

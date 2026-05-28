@@ -1,5 +1,149 @@
 # AI Journal
 
+## 2026-05-27 22:03 EDT: Oldest-first message iteration + backfill semantics for wider user-picked windows
+
+**Intent:** Two related changes so a "Last month" scan after a 3-day-old session actually fetches a month of mail (today it'd only fetch 3 days), and so partial progress on a crashed scan covers the older end of the window rather than the newer end.
+
+**Change 1 — `min` instead of `max` for sinceDate (`gmailSyncWorker.ts`).** When a previous succeeded session exists, anchor `sinceDate` to whichever of `(periodSinceDate, lastSucceeded.startedAt)` is **earlier** instead of the more recent one. New three-way decision matrix:
+
+| Condition | strategy | sinceDate |
+|---|---|---|
+| No prior succeeded scan | `period_window` | `periodSinceDate` |
+| `periodSinceDate >= lastSucceeded.startedAt` (period narrower than gap to last scan) | `incremental` | `lastSucceeded.startedAt` |
+| `periodSinceDate < lastSucceeded.startedAt` (user picked a wider window) | `backfill` | `periodSinceDate` |
+
+The `syncStrategy` union widens to include `"backfill"`. The existing `Fetching emails after <ISO> (strategy=<label>)` log line carries the new label automatically — no format change. The `processSingleMessage` guard (`gmailMessage.findFirst`) makes the backfill case cheap: messages within the overlap region (between `periodSinceDate` and `lastSucceeded.startedAt`) short-circuit with a sub-100ms SQLite lookup since they already have a GmailMessage row from the prior scan.
+
+**Change 2 — Oldest-first iteration (`discoveredJobsService.ts`).** Gmail's `messages.list` returns IDs newest-first. `runScanWorkInline` now reverses an immutable copy before passing to `processWithConcurrency`, so the oldest matching email is processed first. JSDoc updated to make the order explicit. With `SCAN_CONCURRENCY_CAP=1`, partial progress on a crashed scan now covers the OLDER end of the window — and the next run's incremental `sinceDate` naturally moves forward from where this one left off (the newest emails get picked up on the retry).
+
+**Files touched (four-way parallel fan-out, then sequential gates):**
+- `server/src/services/gmailSyncWorker.ts` — Unit A: min decision + backfill label.
+- `server/src/services/discoveredJobsService.ts` — Unit B: `[...messageIds].reverse()` before concurrency dispatch; JSDoc updates.
+- `server/src/services/gmailSyncWorker.test.ts` — Unit C: rewrote two tests (the user-wider-window case now asserts `strategy="backfill"` + sinceDate≈periodSinceDate; the prior-scan-older case now asserts `strategy="incremental"` + sinceDate=lastSucceeded.startedAt); kept the `period_window` no-prior test untouched; kept the log-format test untouched; added an explicit positive backfill test (periodSinceDate=30d, lastStarted=3d).
+- `server/src/services/discoveredJobsService.test.ts` — Unit D: new test "processes message ids oldest-first" — mocks `listMsgsMock` to return `["msg-newest","msg-middle","msg-oldest"]` and asserts `fetchMsgMock` is called in `["msg-oldest","msg-middle","msg-newest"]` order.
+
+**Verification:**
+- `npm run test` → 1227 / 1227 passing.
+- `npm run lint` → clean.
+- `npm run tsc` → no errors in any modified file.
+- `npm run test:coverage` → 97.67% stmts / **93.08%** branches / 97.85% funcs / 98.2% lines — above the 93% threshold.
+
+**No schema change, no UI change, no API contract change.** Period selector still maxes at "Last month" per user direction.
+
+## 2026-05-27 21:40 EDT: New GmailMessage table; DiscoveredJob loses denormalized email_* fields
+
+**Intent:** Move email metadata to a dedicated `GmailMessage` table so re-scans can short-circuit on EVERY previously-seen email (including ones that produced zero discoveries). DiscoveredJob now just points at its source message via a NOT NULL FK; the 8 denormalized `email_*` columns it used to carry are gone.
+
+**Migration approach (per user direction):** Backed up `server/prisma/dev.db` to `dev.db.backup-20260527-213101`, deleted the live DB, pushed the new schema clean. No backfill needed since we restart from empty. User re-OAuths Gmail at `/integrations` and the next scan repopulates everything via the new code path.
+
+**Schema changes (`server/prisma/schema.prisma`):**
+- **New** `GmailMessage` model — `id`, `gmail_connection_id` FK (Cascade), `email_message_id`, `email_thread_id`, `email_from_name`, `email_from_address`, `email_subject`, `email_snippet`, `email_received_at`, `email_label_color`, `scanned_at`, audit dates. `@@unique([gmail_connection_id, email_message_id])`. `@@index([gmail_connection_id, email_received_at])`. Back-relation `discovered_jobs DiscoveredJob[]`.
+- **`GmailConnection`** — added back-relation `gmail_messages GmailMessage[]`.
+- **`DiscoveredJob`** — removed the 8 `email_*` columns. Added `gmail_message_id Int` (NOT NULL) + `gmail_message GmailMessage @relation(onDelete: Cascade)`. Dedupe key changed from `(gmail_connection_id, email_message_id, company, title, location)` to `(gmail_message_id, company, title, location)` — `gmail_message_id` implies the connection. Replaced `@@index([gmail_connection_id, status, email_received_at])` with `@@index([gmail_connection_id, status])`; date-range queries now sort/filter via the relation.
+
+**Seed change (`server/prisma/seed.ts`):** Updated the raw-SQL `discovered_jobs_dedupe_key` index to use `gmail_message_id` instead of `gmail_connection_id, email_message_id`.
+
+**Service changes (`server/src/services/discoveredJobsService.ts`):**
+- **`processSingleMessage`** — guard now checks `gmailMessage.findFirst` (was `discoveredJob.findFirst`). After `fetchMessage` + before extraction, `gmailMessage.create` persists the message row UP FRONT so even crash-mid-extraction won't re-scan on the next pass. Each `discoveredJob.create` sets `gmail_message_id` to the freshly-created GmailMessage id. Within-email dedup `findMany` now filters by `gmail_message_id` (was `(connection_id, email_message_id)`). The update branch no longer needs to refresh `email_label_color` (the GmailMessage row owns that).
+- **`mapDiscoveredJobRowToPublic`** — reads `email_*` from `row.gmail_message.email_*`. Public `email: {...}` projection shape on the wire is UNCHANGED, so no API contract break.
+- **`listDiscoveries`** — `include: { gmail_message: true, ... }`. `where` filters via `gmail_message: { email_received_at: { gte: sinceDate } }`. `orderBy: { gmail_message: { email_received_at: "desc" } }`.
+- **`importDiscoveries`** — `findUnique({include: { gmail_message: true }})` so `post_date` can read `discoveryRow.gmail_message.email_received_at`.
+
+**Test changes (`server/src/services/discoveredJobsService.test.ts`):**
+- Added `gmailMessage: { findFirst, findUnique, create }` to the prisma mock.
+- New `buildGmailMessageRow` fixture. `buildDiscoveredJobRow` now embeds a `gmail_message` relation by default (takes an optional second arg for message overrides) so importDiscoveries/listDiscoveries paths work without extra setup. `buildDiscoveredJobRowWithMessage` retained as an alias.
+- `beforeEach` defaults: `gmailMessage.findFirst → null` and `gmailMessage.create → buildGmailMessageRow()`.
+- Rewrote the "already-extracted guard" describe as "already-scanned guard". Five tests cover: skip when GmailMessage exists; skip log line; fall-through when no GmailMessage; **GmailMessage persisted on zero-job extraction** (the actual win); newly-created DiscoveredJob rows link to the right `gmail_message_id` FK.
+- Updated `listDiscoveries` test to assert the new include + orderBy shape (`gmail_message: true`, `orderBy: { gmail_message: { email_received_at: "desc" } }`).
+
+**Verification:**
+- `sqlite3` confirms new schema: `gmail_messages` table created with both indices; `discovered_jobs` shape matches plan; custom `COLLATE NOCASE + COALESCE` dedupe key restored with the new column set.
+- `npm run test` → 1225 / 1225 passing.
+- `npm run lint` → clean.
+- `npm run tsc` → only the pre-existing `JobViewPage.test.tsx:872` error remains (untouched).
+- `npm run test:coverage` → 97.67% stmts / **93.08%** branches / 97.85% funcs / 98.2% lines — above 93% threshold.
+
+**Manual step deferred to user:** Re-connect Gmail OAuth at `/integrations` (the new DB has no GmailConnection row). Then run a scan — first scan repopulates both `gmail_messages` and `discovered_jobs` from scratch. All subsequent scans hit the GmailMessage guard for both job-yielding AND zero-job-yielding messages.
+
+## 2026-05-27 15:12 EDT: Skip Claude for already-extracted Gmail messages
+
+**Intent:** Cut scan runtime by avoiding redundant Claude API calls. Gmail messages are immutable, so any (gmail_connection_id, email_message_id) pair we already extracted from has a stable result — calling Claude again just pays the latency tax for the same answer. The biggest win is on incremental re-scans where most messages in the Gmail listing window have already been processed.
+
+**Change:** Added a guard at the top of `processSingleMessage` (`server/src/services/discoveredJobsService.ts`): a `prisma.discoveredJob.findFirst` query checks if any DiscoveredJob row exists for the (connection, message) pair. If yes, skip both `fetchMessage` (Gmail body fetch, ~200-500ms) and `extractFromMessage` (Claude tool-use call, 2-10s). Logs `Skipped already-extracted message <id>` through the SyncLogger when provided.
+
+**Caveat captured in the JSDoc:** messages whose previous Claude pass returned zero jobs aren't recorded anywhere, so they'll be re-extracted on every scan. A future enhancement could persist a "scanned but empty" marker to close that gap.
+
+**Files changed:**
+- `server/src/services/discoveredJobsService.ts` — added the `findFirst`-based guard and the skip log line at the top of `processSingleMessage`. JSDoc updated to describe the new behavior + caveat.
+- `server/src/services/discoveredJobsService.test.ts` — added `findFirst: vi.fn()` to the prisma mock; added default `findFirst.mockResolvedValue(null)` in beforeEach so existing tests fall through; new describe block `processSingleMessage — already-extracted guard` with three tests: skip when row exists, skip log line is emitted when logger is provided, fall-through to Claude when no row exists.
+
+**Verification:** 1223/1223 tests passing. Coverage: 97.66% stmts / 93.08% branches / 97.85% funcs / 98.2% lines — above 93% threshold. Lint clean.
+
+## 2026-05-27 14:52 EDT: Reactive discoveries refetch on sync settle (replaces callback chain)
+
+**Intent:** User reported the discoveries table was not refreshing after a sync completed — they had to reload the page to see new rows. The original implementation relied on a callback chain (`pollOnce → maybeFireSettled → onSettled → handleSyncSettled → void fetchDiscoveries()`) where `pollOnce` was captured by a `setInterval` closure inside the polling hook. That capture is a known staleness hazard. Even though a jsdom test showed the refetch firing, the same path could miss in the browser due to closure drift or tab throttling.
+
+**Change:** Replaced the callback-based refetch with a deps-based `useEffect` on `InboxPage` that watches `sync.session` and fires `fetchDiscoveries()` when the session transitions out of `running`. A `useRef` dedupe key (`refetchedForSessionIdRef`) ensures each settled session id triggers exactly one refetch even if the effect re-runs for the same session. The new effect always uses the LATEST `fetchDiscoveries` closure (with the LATEST `periodDays`), so any closure staleness in the polling interval no longer affects table freshness.
+
+**Files changed:**
+- `client/src/pages/InboxPage.tsx` — added `useRef` import; introduced `refetchedForSessionIdRef`; added the reactive `useEffect`; removed `void fetchDiscoveries()` from `handleSyncSettled` (snackbar logic stays put); emptied `handleSyncSettled`'s useCallback deps since it no longer references `fetchDiscoveries`.
+- `client/src/pages/InboxPage.test.tsx` — added "refetches discoveries after a click-Rescan session transitions running → succeeded" and "refetches discoveries exactly once per settled session (dedup on repeated renders)"; the existing "mount path" refetch test still covers the come-back-to-running-session case.
+
+**Verification:** 1220/1220 tests passing. Coverage: 97.66% stmts / 93.07% branches / 97.85% funcs / 98.2% lines — above the 93% threshold. Lint clean. (One run flaked once under coverage instrumentation due to timing; re-run was green.)
+
+## 2026-05-27 14:26 EDT: Incremental Gmail scan + visible "Fetching emails after …" log line
+
+**Intent:** Stop re-fetching emails the previous successful scan already covered. Anchor `sinceDate` to the last `succeeded` session's `started_at` so a quick re-scan only pulls the delta. Surface the effective since-date directly in the log line ("Fetching emails after &lt;ISO&gt; (strategy=incremental|period_window)") so debugging a slow scan shows immediately how far back the worker went.
+
+**Strategy:** `sinceDate = max(lastSucceededStartedAt, now - days * day)`. The user's period selector still caps the maximum lookback — picking "Last day" while the last successful scan was 30 days ago fetches just the last day, not the full 30-day gap. When no prior succeeded session exists (fresh inbox or first-time scan), strategy falls back to the period window.
+
+**Files changed:**
+- `server/src/services/gmailSyncSessionService.ts` — added `getLastSucceededSession(connectionId)` returning the most recent `status="succeeded"` session, or null.
+- `server/src/services/gmailSyncWorker.ts` — imports `getLastSucceededSession`; computes `periodSinceDate` then `sinceDate = max(previousSucceeded.startedAt, periodSinceDate)`; tags each fetching_emails log entry with `syncStrategy` (`"incremental"` or `"period_window"`) and `previousSucceededSessionId`. New log message: `Fetching emails after &lt;ISO&gt; (strategy=…)`.
+- `server/src/services/gmailSyncWorker.test.ts` — new describe `startScanWorker — incremental sinceDate` with four tests: period-window fallback when no prior succeeded, incremental anchor when prior was more recent than the period, period-window fallback when prior was older than the period, and human-readable log-line format assertion.
+- `server/src/services/gmailSyncSessionService.test.ts` — new describe for `getLastSucceededSession` (returns the most recent succeeded session; null when none).
+
+**Verification:** 1217/1217 tests passing. Coverage 93.09% branches (above 93% threshold), 97.68% statements / 97.85% functions / 98.22% lines. Lint clean. (One unrelated pre-existing unhandled error in ContainerViewPage tests — not from this change.)
+
+## 2026-05-27 14:14 EDT: Persistent Gmail sync sessions + step indicator + structured per-step logging
+
+**Intent:** Make the Gmail "Re-scan inbox" sync state survive page reloads, add a visible three-step phase indicator next to the button (Fetching emails → Finding jobs in emails → Saving jobs), and add structured stdout + DB-persisted logs per step so a slow/stuck scan can be debugged after the fact. Today clicking the button puts it in a local component-scoped `scanning` state that gets wiped on reload; the user wants the in-flight scan to remain visible across reloads, joins, and crashes.
+
+**Architecture:** New `GmailSyncSession` Prisma table tracks the scan (status, current_step, days_requested, last_error, logs JSON, result JSON). `POST /api/inbox/scan` now creates a session row, fires `void startScanWorker(...)`, and returns the sessionId immediately; the route returns 409 with the existing sessionId when a scan is already running for the connection. New `GET /api/inbox/scan/active` (running-only, null otherwise), `GET /api/inbox/scan/last` (most recent regardless of status), and `GET /api/inbox/scan/:sessionId`. The new `useGmailSyncSession` client hook fetches /active on mount and polls /:id every 1500ms while running; on 409 from start() it adopts the conflicting sessionId so two tabs join the same scan. On server boot, `markStaleRunningAsFailed()` reconciles any sessions left in `running` by a previous crash to `failed` with `last_error="server restart"`.
+
+**Files changed:**
+- `server/prisma/schema.prisma` — added `GmailSyncSession` model + `GmailSyncSessionStatus` enum + `GmailSyncStep` enum + back-relation on `GmailConnection`. Indices on `(gmail_connection_id, status)` and `(gmail_connection_id, started_at)`.
+- `server/prisma/seed.ts` (new) — `runSeed()` / `applyCustomIndexes()` / `createSeedPrismaClient()` — idempotently DROPs + recreates `discovered_jobs_dedupe_key` with `COLLATE NOCASE` + `COALESCE(location, '')` so every `db push` restores the custom raw-SQL index.
+- `prisma.config.ts` — wired `migrations.seed = "tsx server/prisma/seed.ts"`.
+- `package.json` — added `db:push` (push + accept-data-loss + seed) and `db:seed` scripts.
+- `server/src/services/gmailSyncTypes.ts` (new) — `SyncStep`, `SyncSessionStatus`, `SyncLogEntry`, `SyncSessionResult`, `PublicGmailSyncSession`.
+- `server/src/services/syncLogger.ts` (new) — `SyncLogger` interface, `createSyncLogger(sessionId)`, internal `formatConsoleLine` + `appendLogEntryToSession` (read-modify-write inside `$transaction`).
+- `server/src/services/gmailSyncSessionService.ts` (new) — `createSession`, `transitionStep`, `finishSucceeded`, `finishFailed`, `getActiveSession`, `getLastSession`, `getSessionById`, `markStaleRunningAsFailed`, `projectSessionRow`.
+- `server/src/services/gmailSyncWorker.ts` (new) — `startScanWorker(sessionId, days)` — fire-and-forget orchestrator that transitions through the three steps and catches all errors to `finishFailed`.
+- `server/src/services/discoveredJobsService.ts` — extracted `runScanWorkInline(args)` from `scanInbox`'s body so the worker can call it; `scanInbox` now delegates to it. `processSingleMessage` accepts an optional `SyncLogger` and emits a per-message `finding_jobs` log line when one is provided.
+- `server/src/index.ts` — calls `markStaleRunningAsFailed()` after `verifyDatabaseConnection()` and before `app.listen`.
+- `server/src/routes/inbox.ts` — POST `/scan` no longer awaits the work: returns `{sessionId, status, reused}` immediately, 409 on conflict, 503 on no-gmail, 500 otherwise. New GET `/scan/active`, GET `/scan/last`, GET `/scan/:sessionId`.
+- `client/src/services/inboxApi.ts` — added `SyncStep`, `SyncSessionStatus`, `SyncLogEntry`, `GmailSyncSessionResponse`, `StartScanResponse`, `ScanAlreadyRunningError`. Rewrote `scanInbox` to do raw `fetch` (so 409 body can be parsed); added `getActiveScanSession`, `getLastScanSession`, `getScanSession`.
+- `client/src/hooks/useGmailSyncSession.ts` (new) — polling hook with `start(days)`, `refresh()`, `session`, `isRunning`, `isLoading`, `error`. Catches `ScanAlreadyRunningError` and adopts the conflicting sessionId.
+- `client/src/components/SyncStepIndicator.tsx` (new) — three-chip indicator (Fetching emails / Finding jobs in emails / Saving jobs) with active/done/pending/failed states, MUI icons + CircularProgress for active, `role=status` + `aria-live=polite`.
+- `client/src/pages/InboxPage.tsx` — removed local `scanning` state; wired `useGmailSyncSession`; button shows `Processing Gmail…` + spinner + disabled when running (including on mount if a session is already active); `SyncStepIndicator` rendered next to the button; `onSettled` fires the snackbar with the count from `result.newDiscoveries` (success) or `lastError` (failure); a `useEffect` surfaces `sync.error` into `listError`.
+
+**Tests added/updated:**
+- New: `server/src/services/syncLogger.test.ts`, `gmailSyncSessionService.test.ts`, `gmailSyncWorker.test.ts`.
+- Updated: `server/src/routes/inbox.test.ts` — new scan happy path (200 sessionId), 409 conflict, /active, /last, /:sessionId, 500 + non-Error rejection branches; `server/src/services/discoveredJobsService.test.ts` — new `runScanWorkInline` describe covering both with-logger and without-logger branches.
+- New: `client/src/components/SyncStepIndicator.test.tsx`, `client/src/hooks/useGmailSyncSession.test.ts`.
+- Updated: `client/src/services/inboxApi.test.ts` — updated scanInbox tests for new return shape + 409 + ScanAlreadyRunningError + malformed-409-body fallback; added tests for `getActiveScanSession`, `getLastScanSession`, `getScanSession`. `client/src/pages/InboxPage.test.tsx` — added mount-time active-session reflection test, 409-join test, updated existing rescan flow tests to new async hook-driven flow.
+
+**Verification:**
+- `npm run test` → 1208 / 1208 passing across 64 files.
+- `npm run lint` → clean (no rule disables, no config changes).
+- `npm run tsc` → no errors in any modified file (only pre-existing errors in unrelated files remain).
+- `npm run test:coverage` → 97.67% statements, 93.07% branches, 97.84% functions, 98.21% lines — all above 93% threshold.
+- `npm run check:duplication` → exit 0, no new clones introduced.
+- Schema push verified via `sqlite3` — `gmail_sync_sessions` table exists with both indices; `discovered_jobs_dedupe_key` restored with `COLLATE NOCASE` + `COALESCE(location, '')`.
+
+**Manual verification deferred to user** for the OAuth-required scenarios (mid-scan reload, two-tab race, server-kill stale recovery, log line audit) because Google OAuth can't run inside a Playwright session.
+
 ## 2026-05-27 10:46 EDT: Location in dedup key + JobView display + parallel fan-out orchestration
 
 ### Intent

@@ -5,9 +5,14 @@ import {
   importInboxDiscoveries,
   dismissInboxDiscovery,
   restoreInboxDiscovery,
+  getActiveScanSession,
+  getLastScanSession,
+  getScanSession,
+  ScanAlreadyRunningError,
   type DiscoveredJobResponse,
-  type ScanResultResponse,
   type ImportResultResponse,
+  type StartScanResponse,
+  type GmailSyncSessionResponse,
 } from "./inboxApi";
 
 /**
@@ -95,12 +100,16 @@ describe("listInboxDiscoveries", () => {
 });
 
 describe("scanInbox", () => {
-  it("POSTs /api/inbox/scan with the days body and returns counters", async () => {
-    const responseBody: ScanResultResponse = { scanned: 12, found: 5, newDiscoveries: 3 };
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve(responseBody),
-    }));
+  it("POSTs /api/inbox/scan and returns { sessionId, status, reused } on 200", async () => {
+    const responseBody: StartScanResponse = { sessionId: 7, status: "running", reused: false };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(responseBody),
+      })
+    );
 
     const result = await scanInbox(7);
 
@@ -112,13 +121,144 @@ describe("scanInbox", () => {
     });
   });
 
-  it("throws with the server-provided error message on a non-2xx response", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
-      ok: false,
-      json: () => Promise.resolve({ error: "scan failed" }),
-    }));
+  it("throws ScanAlreadyRunningError with the existing sessionId on a 409", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        json: () => Promise.resolve({ error: "scan_already_running", sessionId: 77 }),
+      })
+    );
 
-    await expect(scanInbox(7)).rejects.toThrow("scan failed");
+    await expect(scanInbox(7)).rejects.toBeInstanceOf(ScanAlreadyRunningError);
+  });
+
+  it("sets sessionId=0 on the error when the 409 body is malformed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        json: () => Promise.reject(new Error("not json")),
+      })
+    );
+
+    try {
+      await scanInbox(7);
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ScanAlreadyRunningError);
+      expect((err as ScanAlreadyRunningError).sessionId).toBe(0);
+    }
+  });
+
+  it("throws a generic Error with the server's error field on non-409 non-2xx", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: () => Promise.resolve({ error: "No Gmail account connected" }),
+      })
+    );
+
+    await expect(scanInbox(7)).rejects.toThrow(/No Gmail account connected/);
+  });
+
+  it("falls back to the default error message on non-2xx with no JSON body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        json: () => Promise.reject(new Error("not json")),
+      })
+    );
+
+    await expect(scanInbox(7)).rejects.toThrow("Failed to scan inbox");
+  });
+});
+
+describe("getActiveScanSession", () => {
+  it("returns the session when one is running", async () => {
+    const session = { id: 1, status: "running" } as unknown as GmailSyncSessionResponse;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ session }),
+      })
+    );
+
+    const result = await getActiveScanSession();
+
+    expect(result).toEqual(session);
+    expect(fetch).toHaveBeenCalledWith("/api/inbox/scan/active");
+  });
+
+  it("returns null when no scan is running", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ session: null }),
+      })
+    );
+
+    const result = await getActiveScanSession();
+    expect(result).toBeNull();
+  });
+});
+
+describe("getLastScanSession", () => {
+  it("returns the most recent session regardless of status", async () => {
+    const session = { id: 9, status: "succeeded" } as unknown as GmailSyncSessionResponse;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ session }),
+      })
+    );
+
+    const result = await getLastScanSession();
+    expect(result).toEqual(session);
+    expect(fetch).toHaveBeenCalledWith("/api/inbox/scan/last");
+  });
+});
+
+describe("getScanSession", () => {
+  it("returns the session by id", async () => {
+    const session = { id: 33, status: "running" } as unknown as GmailSyncSessionResponse;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ session }),
+      })
+    );
+
+    const result = await getScanSession(33);
+    expect(result).toEqual(session);
+    expect(fetch).toHaveBeenCalledWith("/api/inbox/scan/33");
+  });
+
+  it("throws on 404", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({ error: "session not found" }),
+      })
+    );
+
+    await expect(getScanSession(999)).rejects.toThrow(/session not found/);
   });
 });
 

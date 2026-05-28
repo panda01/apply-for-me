@@ -13,29 +13,54 @@ vi.mock("../prismaClient.js", () => ({
     applicationProfile: { create: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), delete: vi.fn() },
     gmailConnection: { upsert: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), delete: vi.fn() },
     discoveredJob: { create: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn(), delete: vi.fn() },
+    gmailSyncSession: { create: vi.fn(), findFirst: vi.fn(), findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   },
 }));
 
 const {
-  scanInboxMock,
   listDiscoveriesMock,
   importDiscoveriesMock,
   dismissDiscoveryMock,
   restoreDiscoveryMock,
+  createSessionMock,
+  getActiveSessionMock,
+  getLastSessionMock,
+  getSessionByIdMock,
+  startScanWorkerMock,
+  getFirstConnectionIdMock,
 } = vi.hoisted(() => ({
-  scanInboxMock: vi.fn(),
   listDiscoveriesMock: vi.fn(),
   importDiscoveriesMock: vi.fn(),
   dismissDiscoveryMock: vi.fn(),
   restoreDiscoveryMock: vi.fn(),
+  createSessionMock: vi.fn(),
+  getActiveSessionMock: vi.fn(),
+  getLastSessionMock: vi.fn(),
+  getSessionByIdMock: vi.fn(),
+  startScanWorkerMock: vi.fn(),
+  getFirstConnectionIdMock: vi.fn(),
 }));
 
 vi.mock("../services/discoveredJobsService.js", () => ({
-  scanInbox: scanInboxMock,
   listDiscoveries: listDiscoveriesMock,
   importDiscoveries: importDiscoveriesMock,
   dismissDiscovery: dismissDiscoveryMock,
   restoreDiscovery: restoreDiscoveryMock,
+}));
+
+vi.mock("../services/gmailSyncSessionService.js", () => ({
+  createSession: createSessionMock,
+  getActiveSession: getActiveSessionMock,
+  getLastSession: getLastSessionMock,
+  getSessionById: getSessionByIdMock,
+}));
+
+vi.mock("../services/gmailSyncWorker.js", () => ({
+  startScanWorker: startScanWorkerMock,
+}));
+
+vi.mock("../services/gmailMessageReaderService.js", () => ({
+  getFirstConnectionId: getFirstConnectionIdMock,
 }));
 
 import { app } from "../app.js";
@@ -144,51 +169,233 @@ describe("GET /api/inbox/discoveries", () => {
   });
 });
 
+/**
+ * Builds a PublicGmailSyncSession-shaped object for use as a mock return.
+ * Centralized so individual tests can override just the fields they care
+ * about without restating the rest of the shape.
+ */
+function makeSession(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 100,
+    gmailConnectionId: 1,
+    status: "running",
+    currentStep: null,
+    startedAt: new Date("2026-05-27T12:00:00.000Z").toISOString(),
+    finishedAt: null,
+    daysRequested: 14,
+    lastError: null,
+    result: null,
+    logs: [],
+    ...overrides,
+  };
+}
+
 describe("POST /api/inbox/scan", () => {
-  it("returns the ScanResult on the happy path", async () => {
-    const scanResult = { scanned: 12, found: 8, newDiscoveries: 5 };
-    scanInboxMock.mockResolvedValue(scanResult);
+  it("starts a worker and returns sessionId on the happy path", async () => {
+    getFirstConnectionIdMock.mockResolvedValue(1);
+    getActiveSessionMock.mockResolvedValue(null);
+    createSessionMock.mockResolvedValue({ sessionId: 42 });
+    startScanWorkerMock.mockResolvedValue(undefined);
 
     const response = await request(app).post("/api/inbox/scan").send({ days: 14 });
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual(scanResult);
-    expect(scanInboxMock).toHaveBeenCalledWith({ days: 14 });
+    expect(response.body).toEqual({ sessionId: 42, status: "running", reused: false });
+    expect(createSessionMock).toHaveBeenCalledWith({
+      gmailConnectionId: 1,
+      daysRequested: 14,
+    });
+    expect(startScanWorkerMock).toHaveBeenCalledWith(42, 14);
+  });
+
+  it("returns 409 with the existing session id when a scan is already running", async () => {
+    getFirstConnectionIdMock.mockResolvedValue(1);
+    getActiveSessionMock.mockResolvedValue(makeSession({ id: 77, status: "running" }));
+
+    const response = await request(app).post("/api/inbox/scan").send({ days: 14 });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: "scan_already_running", sessionId: 77 });
+    expect(createSessionMock).not.toHaveBeenCalled();
+    expect(startScanWorkerMock).not.toHaveBeenCalled();
   });
 
   it("returns 400 when days is missing", async () => {
     const response = await request(app).post("/api/inbox/scan").send({});
     expect(response.status).toBe(400);
-    expect(scanInboxMock).not.toHaveBeenCalled();
+    expect(getFirstConnectionIdMock).not.toHaveBeenCalled();
+    expect(createSessionMock).not.toHaveBeenCalled();
   });
 
   it("returns 400 when days is not an integer", async () => {
     const response = await request(app).post("/api/inbox/scan").send({ days: 7.5 });
     expect(response.status).toBe(400);
-    expect(scanInboxMock).not.toHaveBeenCalled();
+    expect(createSessionMock).not.toHaveBeenCalled();
   });
 
   it("returns 400 when days is negative", async () => {
     const response = await request(app).post("/api/inbox/scan").send({ days: -3 });
     expect(response.status).toBe(400);
-    expect(scanInboxMock).not.toHaveBeenCalled();
+    expect(createSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when days is an empty string", async () => {
+    const response = await request(app).post("/api/inbox/scan").send({ days: "   " });
+    expect(response.status).toBe(400);
+    expect(createSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when days is the wrong type entirely", async () => {
+    const response = await request(app).post("/api/inbox/scan").send({ days: true });
+    expect(response.status).toBe(400);
+    expect(createSessionMock).not.toHaveBeenCalled();
   });
 
   it("returns 503 when no Gmail account is connected", async () => {
-    scanInboxMock.mockRejectedValue(new Error("No Gmail account connected"));
+    getFirstConnectionIdMock.mockRejectedValue(new Error("No Gmail account connected"));
 
     const response = await request(app).post("/api/inbox/scan").send({ days: 14 });
 
     expect(response.status).toBe(503);
     expect(response.body.error).toMatch(/No Gmail account connected/);
+    expect(createSessionMock).not.toHaveBeenCalled();
   });
 
-  it("returns 500 when the service throws another error", async () => {
-    scanInboxMock.mockRejectedValue(new Error("Claude API timeout"));
+  it("returns 500 when getFirstConnectionId throws a non-NoGmail error", async () => {
+    getFirstConnectionIdMock.mockRejectedValue(new Error("DB exploded"));
 
     const response = await request(app).post("/api/inbox/scan").send({ days: 14 });
 
     expect(response.status).toBe(500);
+  });
+
+  it("returns 500 when getFirstConnectionId rejects with a non-Error value", async () => {
+    getFirstConnectionIdMock.mockRejectedValue({ shape: "unknown" });
+
+    const response = await request(app).post("/api/inbox/scan").send({ days: 14 });
+
+    expect(response.status).toBe(500);
+  });
+});
+
+describe("GET /api/inbox/scan/active", () => {
+  it("returns the running session when one exists", async () => {
+    getFirstConnectionIdMock.mockResolvedValue(1);
+    const session = makeSession({ id: 10, status: "running", currentStep: "fetching_emails" });
+    getActiveSessionMock.mockResolvedValue(session);
+
+    const response = await request(app).get("/api/inbox/scan/active");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ session });
+  });
+
+  it("returns null when no session is running", async () => {
+    getFirstConnectionIdMock.mockResolvedValue(1);
+    getActiveSessionMock.mockResolvedValue(null);
+
+    const response = await request(app).get("/api/inbox/scan/active");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ session: null });
+  });
+
+  it("returns 503 when no Gmail account is connected", async () => {
+    getFirstConnectionIdMock.mockRejectedValue(new Error("No Gmail account connected"));
+
+    const response = await request(app).get("/api/inbox/scan/active");
+
+    expect(response.status).toBe(503);
+  });
+
+  it("returns 500 when getFirstConnectionId throws a non-NoGmail error", async () => {
+    getFirstConnectionIdMock.mockRejectedValue(new Error("DB blew up"));
+
+    const response = await request(app).get("/api/inbox/scan/active");
+
+    expect(response.status).toBe(500);
+  });
+
+  it("returns 500 when getFirstConnectionId rejects with a non-Error value", async () => {
+    getFirstConnectionIdMock.mockRejectedValue("not-an-error");
+
+    const response = await request(app).get("/api/inbox/scan/active");
+
+    expect(response.status).toBe(500);
+  });
+});
+
+describe("GET /api/inbox/scan/last", () => {
+  it("returns the most recent session regardless of status", async () => {
+    getFirstConnectionIdMock.mockResolvedValue(1);
+    const session = makeSession({ id: 9, status: "succeeded", currentStep: null });
+    getLastSessionMock.mockResolvedValue(session);
+
+    const response = await request(app).get("/api/inbox/scan/last");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ session });
+  });
+
+  it("returns null when no sessions have ever run", async () => {
+    getFirstConnectionIdMock.mockResolvedValue(1);
+    getLastSessionMock.mockResolvedValue(null);
+
+    const response = await request(app).get("/api/inbox/scan/last");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ session: null });
+  });
+
+  it("returns 503 when no Gmail account is connected", async () => {
+    getFirstConnectionIdMock.mockRejectedValue(new Error("No Gmail account connected"));
+
+    const response = await request(app).get("/api/inbox/scan/last");
+
+    expect(response.status).toBe(503);
+  });
+
+  it("returns 500 when getFirstConnectionId throws a non-NoGmail error", async () => {
+    getFirstConnectionIdMock.mockRejectedValue(new Error("DB unhappy"));
+
+    const response = await request(app).get("/api/inbox/scan/last");
+
+    expect(response.status).toBe(500);
+  });
+
+  it("returns 500 when getFirstConnectionId rejects with a non-Error value", async () => {
+    getFirstConnectionIdMock.mockRejectedValue("string-rejection");
+
+    const response = await request(app).get("/api/inbox/scan/last");
+
+    expect(response.status).toBe(500);
+  });
+});
+
+describe("GET /api/inbox/scan/:sessionId", () => {
+  it("returns the session by id", async () => {
+    const session = makeSession({ id: 55, status: "succeeded" });
+    getSessionByIdMock.mockResolvedValue(session);
+
+    const response = await request(app).get("/api/inbox/scan/55");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ session });
+    expect(getSessionByIdMock).toHaveBeenCalledWith(55);
+  });
+
+  it("returns 400 for a non-numeric sessionId", async () => {
+    const response = await request(app).get("/api/inbox/scan/not-a-number");
+    expect(response.status).toBe(400);
+    expect(getSessionByIdMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when the session does not exist", async () => {
+    getSessionByIdMock.mockResolvedValue(null);
+
+    const response = await request(app).get("/api/inbox/scan/9999");
+
+    expect(response.status).toBe(404);
   });
 });
 

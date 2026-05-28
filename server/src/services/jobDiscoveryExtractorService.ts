@@ -71,6 +71,7 @@ const EXTRACTOR_SYSTEM_PROMPT = [
   "5. `jobUrl` MUST be an absolute http(s) URL pointing at the actual posting. Use the first such URL associated with the job — typically the \"View job\" or \"Apply\" link. If there's no URL for a job, skip that job entirely.",
   "6. `company` and `title` must be the company name and role title as written in the email. Don't normalize, abbreviate, or expand them.",
   "7. `confidence` is your 0..1 self-assessment of how certain you are this is a real, specific job opening (not e.g. a category page or a general inquiry).",
+  "8. `workArrangement` classifies how the role is performed as exactly one of \"remote\" | \"on_site\" | \"hybrid\", or null when there is no usable signal. Infer it from an explicit statement, OR from the location text itself (location \"Remote\" → \"remote\", \"Hybrid\" → \"hybrid\"), OR from the description prose (e.g. \"fully distributed team\" → \"remote\"). Map \"On-site\", \"On site\", \"In-person\", \"In office\" → \"on_site\". When genuinely unclear, return null — like the other fields, never invent a value when the email gives no signal.",
 ].join("\n");
 
 /**
@@ -83,6 +84,7 @@ const ExtractedJobSchema = z.object({
   company: z.string(),
   jobUrl: z.string().url(),
   location: z.string().nullable(),
+  workArrangement: z.enum(["remote", "on_site", "hybrid"]).nullable(),
   salary: z.string().nullable(),
   description: z.string().nullable(),
   confidence: z.number().min(0).max(1),
@@ -117,12 +119,13 @@ const RECORD_EXTRACTED_JOBS_TOOL: Anthropic.Messages.Tool = {
         type: "array",
         items: {
           type: "object",
-          required: ["title", "company", "jobUrl", "location", "salary", "description", "confidence"],
+          required: ["title", "company", "jobUrl", "location", "workArrangement", "salary", "description", "confidence"],
           properties: {
             title: { type: "string" },
             company: { type: "string" },
             jobUrl: { type: "string" },
             location: { type: ["string", "null"] },
+            workArrangement: { type: ["string", "null"], enum: ["remote", "on_site", "hybrid", null] },
             salary: { type: ["string", "null"] },
             description: { type: ["string", "null"] },
             confidence: { type: "number", minimum: 0, maximum: 1 },

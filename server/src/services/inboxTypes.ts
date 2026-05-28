@@ -18,6 +18,30 @@
 export type DiscoveredJobStatusValue = "pending" | "imported" | "duplicate" | "dismissed";
 
 /**
+ * String-literal mirror of Prisma's `WorkArrangement` enum. Must stay
+ * byte-identical to the values in schema.prisma so DB writes and runtime
+ * comparisons line up. `null` (not a member here) represents "unknown" on the
+ * nullable columns. Shared by the inbox extractor, the discovery service, and
+ * the scraper service (smartProxyScraperService) — it's the one canonical
+ * runtime list of legal work-arrangement values.
+ *   remote  — fully remote / distributed
+ *   on_site — in-office / in-person
+ *   hybrid  — split between remote and on-site
+ */
+export type WorkArrangementValue = "remote" | "on_site" | "hybrid";
+
+/**
+ * The complete set of legal {@link WorkArrangementValue} strings as a runtime
+ * array. Used by request/response validators and the scraper's enum-mapping
+ * (which normalizes the container's free-text value to one of these or null).
+ */
+export const WORK_ARRANGEMENT_VALUES: readonly WorkArrangementValue[] = [
+  "remote",
+  "on_site",
+  "hybrid",
+];
+
+/**
  * One job extracted from a single email by the job-discovery extractor.
  * The extractor returns an array of these (possibly empty when the email
  * is not actually about specific openings).
@@ -31,6 +55,10 @@ export interface ExtractedJob {
   company: string;
   jobUrl: string;
   location: string | null;
+  // Structured Remote/On-Site/Hybrid classification; null when the email gave
+  // no usable signal. The extractor infers it from an explicit mention OR from
+  // the location text itself ("Remote" → "remote").
+  workArrangement: WorkArrangementValue | null;
   salary: string | null;
   description: string | null;
   confidence: number;
@@ -142,6 +170,10 @@ export interface PublicDiscoveredJob {
   company: string;
   jobUrl: string;
   location: string | null;
+  // Structured Remote/On-Site/Hybrid classification; null = unknown. Mirrors
+  // the DiscoveredJob.work_arrangement column. camelCase on the wire because
+  // PublicDiscoveredJob is built by an explicit projection mapper.
+  workArrangement: WorkArrangementValue | null;
   salary: string | null;
   description: string | null;
   confidence: number;

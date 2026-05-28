@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { Link as RouterLink, useNavigate } from "react-router-dom";
 import {
   Alert,
@@ -22,15 +22,17 @@ import {
 } from "@mui/icons-material";
 import {
   listInboxDiscoveries,
-  scanInbox,
   importInboxDiscoveries,
   dismissInboxDiscovery,
   restoreInboxDiscovery,
   type DiscoveredJobResponse,
   type DiscoveredJobEmail,
+  type GmailSyncSessionResponse,
 } from "../services/inboxApi";
 import { listGmailConnections, type GmailConnectionResponse } from "../services/gmailApi";
 import DiscoveryStatusPill from "../components/DiscoveryStatusPill";
+import SyncStepIndicator from "../components/SyncStepIndicator";
+import { useGmailSyncSession } from "../hooks/useGmailSyncSession";
 
 /**
  * Fixed list of "show jobs from the last N days" presets surfaced in the
@@ -311,7 +313,6 @@ function InboxPage(): ReactElement {
   const [period, setPeriod] = useState<string>("2w");
   const [filter, setFilter] = useState<FilterId>("all");
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [scanning, setScanning] = useState(false);
   const [importing, setImporting] = useState(false);
   const [discoveries, setDiscoveries] = useState<DiscoveredJobResponse[]>([]);
   const [connections, setConnections] = useState<GmailConnectionResponse[]>([]);
@@ -375,32 +376,81 @@ function InboxPage(): ReactElement {
   }, [fetchConnections]);
 
   /**
-   * Triggers a synchronous inbox scan, then refetches discoveries so any new
-   * rows show up immediately. Shows a snackbar with the newDiscoveries count.
+   * Fired by the sync-session hook once a polled session transitions from
+   * `running` to a terminal status. On success: refetch discoveries +
+   * surface a "Found N new" snackbar (or "No new jobs found" when N=0).
+   * On failure: surface an error snackbar with the worker's lastError.
+   *
+   * @param {GmailSyncSessionResponse} finalSession - The settled session
+   */
+  const handleSyncSettled = useCallback(
+    (finalSession: GmailSyncSessionResponse): void => {
+      if (finalSession.status === "succeeded") {
+        setHasScannedThisSession(true);
+        const newDiscoveryCount = finalSession.result?.newDiscoveries ?? 0;
+        if (newDiscoveryCount > 0) {
+          setSnackbarMessage({
+            severity: "success",
+            text: `Found ${String(newDiscoveryCount)} new`,
+          });
+        } else {
+          setSnackbarMessage({ severity: "info", text: "No new jobs found" });
+        }
+        return;
+      }
+      // failed
+      const failureReason = finalSession.lastError ?? "Scan failed";
+      setSnackbarMessage({ severity: "error", text: `Scan failed: ${failureReason}` });
+    },
+    []
+  );
+
+  const sync = useGmailSyncSession({ onSettled: handleSyncSettled });
+  const scanning = sync.isRunning;
+
+  // Reactive refetch: whenever the hook's session state transitions out of
+  // `running` (succeeded or failed), refresh the discoveries list. Using a
+  // useEffect with `sync.session` as a dep guarantees we use the current
+  // `fetchDiscoveries` closure (with the current periodDays), regardless of
+  // any stale callback captured inside the polling setInterval. The ref
+  // dedupes so each settled session triggers exactly one refetch even if
+  // the effect runs multiple times for the same session.
+  const refetchedForSessionIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (sync.session === null) {
+      return;
+    }
+    const isSettled = sync.session.status !== "running";
+    if (!isSettled) {
+      return;
+    }
+    const alreadyRefetched = refetchedForSessionIdRef.current === sync.session.id;
+    if (alreadyRefetched) {
+      return;
+    }
+    refetchedForSessionIdRef.current = sync.session.id;
+    void fetchDiscoveries();
+  }, [sync.session, fetchDiscoveries]);
+
+  // Surface hook-side errors (failed start, polling 404, etc.) into the
+  // page-level error alert so the user can see what went wrong. The hook
+  // owns the "is a scan running" state; the page owns surfacing failures.
+  useEffect(() => {
+    if (sync.error !== null) {
+      setListError(sync.error);
+    }
+  }, [sync.error]);
+
+  /**
+   * Kicks off a new Gmail sync via the hook. The hook handles the 409-join
+   * case transparently; this handler just clears the page-level error and
+   * delegates.
    *
    * @returns {Promise<void>}
    */
   const handleRescan = async (): Promise<void> => {
-    setScanning(true);
     setListError("");
-    try {
-      const scanResult = await scanInbox(periodDays);
-      setHasScannedThisSession(true);
-      await fetchDiscoveries();
-      if (scanResult.newDiscoveries > 0) {
-        setSnackbarMessage({
-          severity: "success",
-          text: `Found ${String(scanResult.newDiscoveries)} new`,
-        });
-      } else {
-        setSnackbarMessage({ severity: "info", text: "No new jobs found" });
-      }
-    } catch (err) {
-      const errorText = err instanceof Error ? err.message : "Failed to scan inbox";
-      setListError(errorText);
-    } finally {
-      setScanning(false);
-    }
+    await sync.start(periodDays);
   };
 
   /**
@@ -672,7 +722,13 @@ function InboxPage(): ReactElement {
             </Typography>
           )}
         </Box>
-        <Box sx={{ display: "flex", gap: 1 }}>
+        <Box sx={{ display: "flex", gap: 1.5, alignItems: "center" }}>
+          {scanning && sync.session !== null && (
+            <SyncStepIndicator
+              currentStep={sync.session.currentStep}
+              status={sync.session.status}
+            />
+          )}
           <Button
             variant="contained"
             startIcon={
@@ -685,7 +741,7 @@ function InboxPage(): ReactElement {
             onClick={handleRescan}
             disabled={scanning || !hasConnections}
           >
-            {scanning ? "Scanning…" : "Re-scan inbox"}
+            {scanning ? "Processing Gmail…" : "Re-scan inbox"}
           </Button>
         </Box>
       </Box>

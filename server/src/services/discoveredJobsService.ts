@@ -26,7 +26,11 @@
  * Wellfound digest" case.
  */
 
-import type { DiscoveredJob, JobListing } from "../../prisma/generated/client/client.js";
+import type {
+  DiscoveredJob,
+  GmailMessage,
+  JobListing,
+} from "../../prisma/generated/client/client.js";
 import { DiscoveredJobStatus } from "../../prisma/generated/client/client.js";
 import prisma from "../prismaClient.js";
 import {
@@ -47,6 +51,7 @@ import type {
   PublicDiscoveredJobReference,
   ScanResult,
 } from "./inboxTypes.js";
+import type { SyncLogger } from "./syncLogger.js";
 
 /**
  * Maximum number of inbox messages processed in parallel during scanInbox.
@@ -158,6 +163,11 @@ export function lightNormalizeNullableForStorage(value: string | null): string |
  * each new row's `duplicate_of_job_id` is set when a JobListing already
  * exists with normalized-matching (company, title). Idempotent.
  *
+ * Thin wrapper around {@link runScanWorkInline} that resolves the
+ * connection id and translates the `days` argument into a Date — preserved
+ * for any direct callers (e.g. unit tests) that want the legacy synchronous
+ * behavior without going through the session worker.
+ *
  * @param {object} args - Scan parameters
  * @param {number} args.days - Lower bound on email received-at, in days back from now
  * @returns {Promise<ScanResult>} Counts: messages scanned, jobs found, newly-inserted rows
@@ -166,12 +176,47 @@ export function lightNormalizeNullableForStorage(value: string | null): string |
 export async function scanInbox(args: { days: number }): Promise<ScanResult> {
   const connectionId = await getFirstConnectionId();
   const sinceDate = new Date(Date.now() - args.days * MILLISECONDS_PER_DAY);
+  return runScanWorkInline({ connectionId, sinceDate });
+}
+
+/**
+ * Core "do the scan" routine shared by both the legacy {@link scanInbox}
+ * entry point and the new background worker in `gmailSyncWorker.ts`.
+ * Accepts the resolved `connectionId` + `sinceDate` directly so callers that
+ * have already done that work (e.g. the worker, which logs the resolution)
+ * don't double-resolve. An optional {@link SyncLogger} is threaded into each
+ * per-message call so the worker can record progress per Gmail message.
+ *
+ * Messages are processed oldest-first. Gmail's `users.messages.list` returns
+ * IDs newest-first; we reverse a copy of that list before handing it to
+ * {@link processWithConcurrency} so that partial progress on a crashed scan
+ * covers the older end of the window and the next run's incremental
+ * `sinceDate` naturally moves forward from where this one left off.
+ *
+ * @param {object} args - Scan inputs
+ * @param {number} args.connectionId - GmailConnection id to scan against
+ * @param {Date} args.sinceDate - Lower bound on email received-at
+ * @param {SyncLogger} [args.logger] - Optional session-scoped logger for per-message progress lines
+ * @returns {Promise<ScanResult>} Counts: messages scanned, jobs found, newly-inserted rows
+ */
+export async function runScanWorkInline(args: {
+  connectionId: number;
+  sinceDate: Date;
+  logger?: SyncLogger;
+}): Promise<ScanResult> {
+  const { connectionId, sinceDate, logger } = args;
   const messageIds = await listJobKeywordMessages(connectionId, sinceDate);
+  // Gmail returns IDs newest-first; reverse so we process the oldest matching
+  // email first. With SCAN_CONCURRENCY_CAP=1, partial progress on a crashed
+  // scan covers the older end of the window, and the next run's incremental
+  // sinceDate naturally moves forward from there. `[...arr].reverse()` keeps
+  // the original `messageIds` intact (the reverse is in-place but on the copy).
+  const messageIdsOldestFirst = [...messageIds].reverse();
 
   const perMessageOutcomes = await processWithConcurrency<string, PerMessageScanOutcome>(
-    messageIds,
+    messageIdsOldestFirst,
     SCAN_CONCURRENCY_CAP,
-    (messageId) => processSingleMessage(connectionId, messageId)
+    (messageId) => processSingleMessage(connectionId, messageId, logger)
   );
 
   let totalExtractedJobCount = 0;
@@ -193,6 +238,19 @@ export async function scanInbox(args: { days: number }): Promise<ScanResult> {
  * DiscoveredJob row per extracted job. Tracks whether each upsert created a
  * new row (versus refreshed an existing one) so the scanInbox tally is
  * accurate.
+ *
+ * Already-scanned guard: GmailMessage is the source of truth for "have we
+ * ever processed this email". When a row exists, both the Gmail
+ * `messages.get` call and the Claude API call are skipped — even when the
+ * previous extraction returned zero jobs. This is the main runtime win:
+ * messages that are clearly not job posts get skipped on every re-scan.
+ *
+ * GmailMessage is created BEFORE the DiscoveredJob inserts so the dedupe
+ * key (gmail_message_id, company, title, location) has a valid FK to
+ * reference. If the DiscoveredJob loop crashes partway through, the
+ * GmailMessage row stays — meaning we won't re-Claude that message on the
+ * next scan, but we will lose the rows that didn't get inserted. Same
+ * crash semantics as before the GmailMessage refactor.
  *
  * Skips any extracted job whose `company` or `title` is empty after
  * light-normalization — those rows can't be deduplicated under the new key
@@ -218,14 +276,67 @@ export async function scanInbox(args: { days: number }): Promise<ScanResult> {
  *
  * @param {number} connectionId - GmailConnection id to scan against
  * @param {string} messageId - Gmail message id to process
+ * @param {SyncLogger} [logger] - Optional session-scoped logger; when provided, emits per-message progress lines under the `finding_jobs` step
  * @returns {Promise<PerMessageScanOutcome>} Per-message extraction + insertion counts
  */
 async function processSingleMessage(
   connectionId: number,
-  messageId: string
+  messageId: string,
+  logger?: SyncLogger
 ): Promise<PerMessageScanOutcome> {
+  // Already-scanned guard. GmailMessage rows are created during each scan
+  // regardless of whether the extractor produced any jobs, so a hit here
+  // means "we've seen this email before". Skips the Gmail messages.get
+  // call (~200-500ms) AND the Claude tool-use call (2-10s).
+  const existingScannedMessage = await prisma.gmailMessage.findFirst({
+    where: {
+      gmail_connection_id: connectionId,
+      email_message_id: messageId,
+    },
+    select: { id: true },
+  });
+  const messageWasAlreadyScanned = existingScannedMessage !== null;
+  if (messageWasAlreadyScanned) {
+    if (logger !== undefined) {
+      await logger.log(
+        "finding_jobs",
+        `Skipped already-scanned message ${messageId}`,
+        { messageId }
+      );
+    }
+    return { extractedJobCount: 0, newDiscoveryCount: 0 };
+  }
+
   const message = await fetchMessage(connectionId, messageId);
+  const labelColor = getEmailLabelColor(message.fromAddress);
+
+  // Persist the GmailMessage row up front. After this point any subsequent
+  // crash leaves the row in the DB — which means the next scan correctly
+  // treats this message as "already seen" and skips Claude. The cost is
+  // that any DiscoveredJob rows we WOULD have inserted after a mid-loop
+  // crash are lost (same behavior as the pre-GmailMessage codepath).
+  const gmailMessageRow = await prisma.gmailMessage.create({
+    data: {
+      gmail_connection_id: connectionId,
+      email_message_id: message.messageId,
+      email_thread_id: message.threadId,
+      email_from_name: message.fromName,
+      email_from_address: message.fromAddress,
+      email_subject: message.subject,
+      email_snippet: message.snippet,
+      email_received_at: message.receivedAt,
+      email_label_color: labelColor,
+    },
+  });
+
   const extractionResult = await extractFromMessage(message);
+  if (logger !== undefined) {
+    await logger.log("finding_jobs", `Processed message ${messageId}`, {
+      messageId,
+      subject: message.subject,
+      extractedJobCount: extractionResult.jobs.length,
+    });
+  }
 
   let newDiscoveryCount = 0;
 
@@ -255,19 +366,15 @@ async function processSingleMessage(
       normalizedTitle,
       normalizedLocation
     );
-    const labelColor = getEmailLabelColor(message.fromAddress);
     const duplicateOfJobId = existingJobListing ? existingJobListing.id : null;
 
     // Within-email candidate lookup: pull all DiscoveredJob rows for this
-    // (connection, message) where (company, title) match case-insensitively.
-    // Then apply the either-null-wildcard rule on location at the
-    // application layer — SQLite + Prisma can't express a function-based
-    // predicate or the wildcard semantic in a findUnique key.
+    // GmailMessage where (company, title) match case-insensitively. Then
+    // apply the either-null-wildcard rule on location at the application
+    // layer — SQLite + Prisma can't express a function-based predicate or
+    // the wildcard semantic in a findUnique key.
     const candidateRows = await prisma.discoveredJob.findMany({
-      where: {
-        gmail_connection_id: connectionId,
-        email_message_id: message.messageId,
-      },
+      where: { gmail_message_id: gmailMessageRow.id },
     });
     const companyTitleMatchingCandidates = candidateRows.filter((candidateRow) => {
       const candidateCompanyMatches =
@@ -290,14 +397,7 @@ async function processSingleMessage(
       await prisma.discoveredJob.create({
         data: {
           gmail_connection_id: connectionId,
-          email_message_id: message.messageId,
-          email_thread_id: message.threadId,
-          email_from_name: message.fromName,
-          email_from_address: message.fromAddress,
-          email_subject: message.subject,
-          email_snippet: message.snippet,
-          email_received_at: message.receivedAt,
-          email_label_color: labelColor,
+          gmail_message_id: gmailMessageRow.id,
           title: normalizedTitle,
           company: normalizedCompany,
           job_url: extractedJob.jobUrl,
@@ -348,8 +448,6 @@ async function processSingleMessage(
         description: extractedJob.description,
         confidence: extractedJob.confidence,
         duplicate_of_job_id: duplicateOfJobId,
-        // Refresh sender color in case the sender renamed since last scan.
-        email_label_color: labelColor,
         ...(shouldAutoFlipToDuplicate
           ? { status: DiscoveredJobStatus.duplicate }
           : {}),
@@ -419,10 +517,11 @@ function pickMergeTarget(
 
 /**
  * Shape of the rows returned by listDiscoveries' findMany call, including
- * the duplicate/imported JobListing relations. Declared inline so the public
- * surface of this module stays compact.
+ * the GmailMessage source, plus the duplicate/imported JobListing relations.
+ * Declared inline so the public surface of this module stays compact.
  */
 type DiscoveredJobWithRelations = DiscoveredJob & {
+  gmail_message: GmailMessage;
   duplicate_of_job: JobListing | null;
   imported_job_listing: JobListing | null;
 };
@@ -468,11 +567,13 @@ export async function listDiscoveries(args: {
 }): Promise<PublicDiscoveredJob[]> {
   const sinceDate = new Date(Date.now() - args.days * MILLISECONDS_PER_DAY);
 
+  // `email_received_at` lives on GmailMessage now, so the where-clause +
+  // orderBy traverse the relation. Prisma generates a JOIN under the hood.
   const whereClause: {
-    email_received_at: { gte: Date };
+    gmail_message: { email_received_at: { gte: Date } };
     status?: DiscoveredJobStatusValue;
   } = {
-    email_received_at: { gte: sinceDate },
+    gmail_message: { email_received_at: { gte: sinceDate } },
   };
   const hasStatusFilter = args.status !== undefined;
   if (hasStatusFilter) {
@@ -482,10 +583,11 @@ export async function listDiscoveries(args: {
   const discoveryRows = (await prisma.discoveredJob.findMany({
     where: whereClause,
     include: {
+      gmail_message: true,
       duplicate_of_job: true,
       imported_job_listing: true,
     },
-    orderBy: { email_received_at: "desc" },
+    orderBy: { gmail_message: { email_received_at: "desc" } },
   })) as DiscoveredJobWithRelations[];
 
   return discoveryRows.map((row) => mapDiscoveredJobRowToPublic(row));
@@ -502,7 +604,8 @@ export async function listDiscoveries(args: {
 function mapDiscoveredJobRowToPublic(
   row: DiscoveredJobWithRelations
 ): PublicDiscoveredJob {
-  const gmailDeepLinkUrl = `https://mail.google.com/mail/u/0/#inbox/${row.email_message_id}`;
+  const sourceMessage = row.gmail_message;
+  const gmailDeepLinkUrl = `https://mail.google.com/mail/u/0/#inbox/${sourceMessage.email_message_id}`;
   const duplicateOfReference = buildJobListingReference(row.duplicate_of_job);
   const importedAsReference = buildJobListingReference(row.imported_job_listing);
 
@@ -517,14 +620,14 @@ function mapDiscoveredJobRowToPublic(
     description: row.description,
     confidence: row.confidence,
     email: {
-      messageId: row.email_message_id,
-      threadId: row.email_thread_id,
-      fromName: row.email_from_name,
-      fromAddress: row.email_from_address,
-      subject: row.email_subject,
-      snippet: row.email_snippet,
-      receivedAt: row.email_received_at.toISOString(),
-      labelColor: row.email_label_color,
+      messageId: sourceMessage.email_message_id,
+      threadId: sourceMessage.email_thread_id,
+      fromName: sourceMessage.email_from_name,
+      fromAddress: sourceMessage.email_from_address,
+      subject: sourceMessage.email_subject,
+      snippet: sourceMessage.email_snippet,
+      receivedAt: sourceMessage.email_received_at.toISOString(),
+      labelColor: sourceMessage.email_label_color,
       gmailUrl: gmailDeepLinkUrl,
     },
     duplicateOf: duplicateOfReference,
@@ -553,8 +656,11 @@ export async function importDiscoveries(ids: number[]): Promise<ImportResult> {
   const duplicateEntries: { discoveryId: number; jobListingId: number }[] = [];
 
   for (const discoveryId of ids) {
+    // Include the source GmailMessage so we can read `email_received_at`
+    // for the new JobListing's `post_date` without a second round-trip.
     const discoveryRow = await prisma.discoveredJob.findUnique({
       where: { id: discoveryId },
+      include: { gmail_message: true },
     });
     const discoveryNotFound = discoveryRow === null;
     if (discoveryNotFound) {
@@ -589,7 +695,7 @@ export async function importDiscoveries(ids: number[]): Promise<ImportResult> {
           description: discoveryRow.description ?? "",
           salary: discoveryRow.salary,
           location: discoveryRow.location,
-          post_date: discoveryRow.email_received_at,
+          post_date: discoveryRow.gmail_message.email_received_at,
           status: "init",
         },
       });

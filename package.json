@@ -16,7 +16,9 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "check:duplication": "npx jscpd .",
-    "tsc": "tsc --noEmit -p client/tsconfig.json && tsc --noEmit -p server/tsconfig.json"
+    "tsc": "tsc --noEmit -p client/tsconfig.json && tsc --noEmit -p server/tsconfig.json",
+    "db:push": "npx prisma db push --accept-data-loss && npx prisma db seed",
+    "db:seed": "npx prisma db seed"
   },
   "keywords": [],
   "author": "",

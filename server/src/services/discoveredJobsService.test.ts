@@ -3,6 +3,11 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("../prismaClient.js", () => ({
   default: {
     gmailConnection: { findFirst: vi.fn() },
+    gmailMessage: {
+      findFirst: vi.fn(),
+      findUnique: vi.fn(),
+      create: vi.fn(),
+    },
     jobListing: { findMany: vi.fn(), create: vi.fn() },
     discoveredJob: {
       // findUnique is still used by importDiscoveries / dismiss / restore
@@ -51,6 +56,7 @@ vi.mock("./jobListingMatchService.js", async () => {
 import prisma from "../prismaClient.js";
 import {
   scanInbox,
+  runScanWorkInline,
   listDiscoveries,
   importDiscoveries,
   dismissDiscovery,
@@ -114,11 +120,11 @@ function buildExtractedJob(overrides: Partial<{
 }
 
 /**
- * Builds a DiscoveredJob row fixture as returned by Prisma. Used to mock
- * findUnique / findMany / upsert. `created_date` and `updated_date` default
- * to the same Date so the row is treated as "newly inserted" by scanInbox.
+ * Builds a GmailMessage row fixture as returned by Prisma. Used to back
+ * the `gmail_message` relation on DiscoveredJob fixtures and to mock the
+ * gmailMessage.findFirst / create return values.
  */
-function buildDiscoveredJobRow(overrides: Partial<{
+function buildGmailMessageRow(overrides: Partial<{
   id: number;
   gmail_connection_id: number;
   email_message_id: string;
@@ -129,16 +135,7 @@ function buildDiscoveredJobRow(overrides: Partial<{
   email_snippet: string | null;
   email_received_at: Date;
   email_label_color: string | null;
-  title: string;
-  company: string;
-  job_url: string;
-  location: string | null;
-  salary: string | null;
-  description: string | null;
-  status: "pending" | "imported" | "duplicate" | "dismissed";
-  imported_job_listing_id: number | null;
-  duplicate_of_job_id: number | null;
-  confidence: number;
+  scanned_at: Date;
   created_date: Date;
   updated_date: Date;
 }> = {}) {
@@ -154,6 +151,45 @@ function buildDiscoveredJobRow(overrides: Partial<{
     email_snippet: "We found new openings" as string | null,
     email_received_at: baseDate,
     email_label_color: "#0a66c2" as string | null,
+    scanned_at: baseDate,
+    created_date: baseDate,
+    updated_date: baseDate,
+  };
+  return { ...baseRow, ...overrides };
+}
+
+/**
+ * Builds a DiscoveredJob row fixture as returned by Prisma, with its
+ * `gmail_message` relation embedded so importDiscoveries / listDiscoveries
+ * code paths that traverse the relation work without extra setup. Email
+ * metadata lives on the embedded GmailMessage — override via the second
+ * argument when a specific email field matters.
+ */
+function buildDiscoveredJobRow(
+  overrides: Partial<{
+    id: number;
+    gmail_connection_id: number;
+    gmail_message_id: number;
+    title: string;
+    company: string;
+    job_url: string;
+    location: string | null;
+    salary: string | null;
+    description: string | null;
+    status: "pending" | "imported" | "duplicate" | "dismissed";
+    imported_job_listing_id: number | null;
+    duplicate_of_job_id: number | null;
+    confidence: number;
+    created_date: Date;
+    updated_date: Date;
+  }> = {},
+  messageOverrides: Parameters<typeof buildGmailMessageRow>[0] = {}
+) {
+  const baseDate = new Date("2026-05-22T10:00:00.000Z");
+  const baseRow = {
+    id: 1,
+    gmail_connection_id: 1,
+    gmail_message_id: 1,
     title: "Senior Engineer",
     company: "Acme Corp",
     job_url: "https://example.com/job/1",
@@ -167,7 +203,20 @@ function buildDiscoveredJobRow(overrides: Partial<{
     created_date: baseDate,
     updated_date: baseDate,
   };
-  return { ...baseRow, ...overrides };
+  const merged = { ...baseRow, ...overrides };
+  const gmailMessage = buildGmailMessageRow({ id: merged.gmail_message_id, ...messageOverrides });
+  return { ...merged, gmail_message: gmailMessage };
+}
+
+/**
+ * Alias retained for sites that explicitly construct (row, message)
+ * fixtures together. Same shape as buildDiscoveredJobRow's two-arg form.
+ */
+function buildDiscoveredJobRowWithMessage(
+  rowOverrides: Parameters<typeof buildDiscoveredJobRow>[0] = {},
+  messageOverrides: Parameters<typeof buildGmailMessageRow>[0] = {}
+) {
+  return buildDiscoveredJobRow(rowOverrides, messageOverrides);
 }
 
 /**
@@ -211,6 +260,14 @@ beforeEach(() => {
   fetchMsgMock.mockReset();
   extractMock.mockReset();
   findExistingMatchMock.mockReset();
+  // Default: no prior GmailMessage exists for any (connection, messageId)
+  // pair, so the already-scanned guard in processSingleMessage falls
+  // through to the real fetch + Claude + upsert path. Individual tests
+  // override `gmailMessage.findFirst` when they want a guard hit.
+  vi.mocked(prisma.gmailMessage.findFirst).mockResolvedValue(null);
+  // Default: gmailMessage.create returns a freshly-stamped row. Individual
+  // tests override when they need a specific id for FK assertions.
+  vi.mocked(prisma.gmailMessage.create).mockResolvedValue(buildGmailMessageRow());
 });
 
 describe("scanInbox", () => {
@@ -329,13 +386,11 @@ describe("scanInbox", () => {
 
     await scanInbox({ days: 7 });
 
-    // Scan path's findMany is scoped to (connection_id, message_id). The
-    // (company, title, location) filter is applied in JS via normalizeForMatch.
+    // Scan path's findMany is scoped to gmail_message_id (the FK to the
+    // freshly-created GmailMessage row). The (company, title, location)
+    // filter is applied in JS via normalizeForMatch.
     const findManyCall = vi.mocked(prisma.discoveredJob.findMany).mock.calls[0]?.[0];
-    expect(findManyCall?.where).toEqual({
-      gmail_connection_id: 1,
-      email_message_id: "gmail-msg-1",
-    });
+    expect(findManyCall?.where).toEqual({ gmail_message_id: 1 });
   });
 
   it("skips a row whose extracted company is empty without inserting anything", async () => {
@@ -543,6 +598,191 @@ describe("scanInbox", () => {
   });
 });
 
+describe("processSingleMessage — already-scanned guard", () => {
+  it("skips fetchMessage + extractFromMessage when a GmailMessage row already exists for the (connection, message) pair", async () => {
+    getFirstConnIdMock.mockResolvedValue(1);
+    listMsgsMock.mockResolvedValue(["gmail-msg-already-seen"]);
+    // Guard hit: GmailMessage row exists.
+    vi.mocked(prisma.gmailMessage.findFirst).mockResolvedValue(
+      buildGmailMessageRow({ id: 9, email_message_id: "gmail-msg-already-seen" })
+    );
+
+    const result = await scanInbox({ days: 7 });
+
+    expect(result).toEqual({ scanned: 1, found: 0, newDiscoveries: 0 });
+    // The expensive paths must NOT have run.
+    expect(fetchMsgMock).not.toHaveBeenCalled();
+    expect(extractMock).not.toHaveBeenCalled();
+    // No GmailMessage created (one already exists) and no DiscoveredJob writes.
+    expect(prisma.gmailMessage.create).not.toHaveBeenCalled();
+    expect(prisma.discoveredJob.create).not.toHaveBeenCalled();
+    expect(prisma.discoveredJob.update).not.toHaveBeenCalled();
+  });
+
+  it("logs a skip line through the syncLogger when one is provided", async () => {
+    listMsgsMock.mockResolvedValue(["gmail-msg-cached"]);
+    vi.mocked(prisma.gmailMessage.findFirst).mockResolvedValue(
+      buildGmailMessageRow({ id: 10, email_message_id: "gmail-msg-cached" })
+    );
+
+    const loggerLogMock = vi.fn().mockResolvedValue(undefined);
+    const fakeLogger = {
+      log: loggerLogMock,
+      error: vi.fn().mockResolvedValue(undefined),
+    };
+
+    await runScanWorkInline({
+      connectionId: 1,
+      sinceDate: new Date("2026-05-20T00:00:00.000Z"),
+      logger: fakeLogger,
+    });
+
+    expect(loggerLogMock).toHaveBeenCalledWith(
+      "finding_jobs",
+      expect.stringContaining("Skipped already-scanned message gmail-msg-cached"),
+      expect.objectContaining({ messageId: "gmail-msg-cached" })
+    );
+  });
+
+  it("falls through to fetch + Claude when no prior GmailMessage exists", async () => {
+    getFirstConnIdMock.mockResolvedValue(1);
+    listMsgsMock.mockResolvedValue(["gmail-msg-fresh"]);
+    vi.mocked(prisma.gmailMessage.findFirst).mockResolvedValue(null);
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary({ messageId: "gmail-msg-fresh" }));
+    extractMock.mockResolvedValue({
+      extractor: "claude-haiku-4-5",
+      jobs: [buildExtractedJob()],
+    });
+    findExistingMatchMock.mockResolvedValue(null);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.discoveredJob.create).mockResolvedValue(buildDiscoveredJobRow());
+
+    const result = await scanInbox({ days: 7 });
+
+    expect(result).toEqual({ scanned: 1, found: 1, newDiscoveries: 1 });
+    expect(fetchMsgMock).toHaveBeenCalled();
+    expect(extractMock).toHaveBeenCalled();
+    // A GmailMessage row should have been persisted up-front for the
+    // newly-fetched message.
+    expect(prisma.gmailMessage.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists a GmailMessage row even when Claude returns zero jobs (records the scan attempt)", async () => {
+    getFirstConnIdMock.mockResolvedValue(1);
+    listMsgsMock.mockResolvedValue(["gmail-msg-empty"]);
+    vi.mocked(prisma.gmailMessage.findFirst).mockResolvedValue(null);
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary({ messageId: "gmail-msg-empty" }));
+    extractMock.mockResolvedValue({ extractor: "claude-haiku-4-5", jobs: [] });
+
+    const result = await scanInbox({ days: 7 });
+
+    expect(result).toEqual({ scanned: 1, found: 0, newDiscoveries: 0 });
+    expect(prisma.gmailMessage.create).toHaveBeenCalledTimes(1);
+    expect(prisma.discoveredJob.create).not.toHaveBeenCalled();
+  });
+
+  it("links newly-created DiscoveredJob rows to the freshly-created GmailMessage via gmail_message_id FK", async () => {
+    getFirstConnIdMock.mockResolvedValue(1);
+    listMsgsMock.mockResolvedValue(["gmail-msg-link"]);
+    vi.mocked(prisma.gmailMessage.findFirst).mockResolvedValue(null);
+    vi.mocked(prisma.gmailMessage.create).mockResolvedValue(
+      buildGmailMessageRow({ id: 777 })
+    );
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary({ messageId: "gmail-msg-link" }));
+    extractMock.mockResolvedValue({
+      extractor: "claude-haiku-4-5",
+      jobs: [buildExtractedJob()],
+    });
+    findExistingMatchMock.mockResolvedValue(null);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.discoveredJob.create).mockResolvedValue(buildDiscoveredJobRow({ id: 1 }));
+
+    await scanInbox({ days: 7 });
+
+    const createCall = vi.mocked(prisma.discoveredJob.create).mock.calls[0]?.[0];
+    expect(createCall?.data.gmail_message_id).toBe(777);
+  });
+});
+
+describe("runScanWorkInline", () => {
+  it("threads the logger into per-message processing and produces ScanResult", async () => {
+    listMsgsMock.mockResolvedValue(["gmail-msg-1"]);
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary());
+    extractMock.mockResolvedValue({
+      extractor: "claude-haiku-4-5",
+      jobs: [buildExtractedJob()],
+    });
+    findExistingMatchMock.mockResolvedValue(null);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.discoveredJob.create).mockResolvedValue(buildDiscoveredJobRow());
+
+    const loggerLogMock = vi.fn().mockResolvedValue(undefined);
+    const fakeLogger = {
+      log: loggerLogMock,
+      error: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const result = await runScanWorkInline({
+      connectionId: 1,
+      sinceDate: new Date("2026-05-20T00:00:00.000Z"),
+      logger: fakeLogger,
+    });
+
+    expect(result).toEqual({ scanned: 1, found: 1, newDiscoveries: 1 });
+    // Logger was called at least once for the per-message processing step.
+    expect(loggerLogMock).toHaveBeenCalledWith(
+      "finding_jobs",
+      expect.stringContaining("Processed message"),
+      expect.objectContaining({ messageId: "gmail-msg-1" })
+    );
+  });
+
+  it("skips logger calls when no logger is provided (legacy scanInbox path)", async () => {
+    listMsgsMock.mockResolvedValue(["gmail-msg-1"]);
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary());
+    extractMock.mockResolvedValue({
+      extractor: "claude-haiku-4-5",
+      jobs: [buildExtractedJob()],
+    });
+    findExistingMatchMock.mockResolvedValue(null);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.discoveredJob.create).mockResolvedValue(buildDiscoveredJobRow());
+
+    const result = await runScanWorkInline({
+      connectionId: 1,
+      sinceDate: new Date("2026-05-20T00:00:00.000Z"),
+    });
+
+    expect(result).toEqual({ scanned: 1, found: 1, newDiscoveries: 1 });
+  });
+
+  it("processes message ids oldest-first (reverses Gmail's newest-first ordering)", async () => {
+    // Gmail's `messages.list` returns ids newest-first; the scanner reverses
+    // so the OLDEST matching email is fetched + extracted first. This makes
+    // partial progress on a crashed scan cover the older end of the window
+    // (the next run's incremental sinceDate then moves forward from there).
+    listMsgsMock.mockResolvedValue(["msg-newest", "msg-middle", "msg-oldest"]);
+    // Guard falls through for all messages — process each one fresh.
+    vi.mocked(prisma.gmailMessage.findFirst).mockResolvedValue(null);
+    fetchMsgMock.mockImplementation(async (_connectionId: number, messageId: string) => {
+      return buildGmailMessageSummary({ messageId });
+    });
+    // Empty Claude result — no DiscoveredJob inserts, just the GmailMessage
+    // create per message which is enough to verify iteration order.
+    extractMock.mockResolvedValue({ extractor: "claude-haiku-4-5", jobs: [] });
+
+    await runScanWorkInline({
+      connectionId: 1,
+      sinceDate: new Date("2026-05-20T00:00:00.000Z"),
+    });
+
+    const fetchedMessageIdsInOrder = fetchMsgMock.mock.calls.map(
+      (call) => call[1] as string
+    );
+    expect(fetchedMessageIdsInOrder).toEqual(["msg-oldest", "msg-middle", "msg-newest"]);
+  });
+});
+
 describe("listDiscoveries", () => {
   it("maps rows to PublicDiscoveredJob including gmailUrl, duplicateOf, importedAs", async () => {
     const duplicateOfListing = buildJobListingRow({
@@ -556,21 +796,18 @@ describe("listDiscoveries", () => {
       status: "applying",
     });
     const rowWithDuplicateRelation = {
-      ...buildDiscoveredJobRow({
-        id: 1,
-        duplicate_of_job_id: 100,
-        email_message_id: "msg-A",
-      }),
+      ...buildDiscoveredJobRowWithMessage(
+        { id: 1, duplicate_of_job_id: 100, gmail_message_id: 51 },
+        { id: 51, email_message_id: "msg-A" }
+      ),
       duplicate_of_job: duplicateOfListing,
       imported_job_listing: null,
     };
     const rowWithImportedRelation = {
-      ...buildDiscoveredJobRow({
-        id: 2,
-        status: "imported",
-        imported_job_listing_id: 200,
-        email_message_id: "msg-B",
-      }),
+      ...buildDiscoveredJobRowWithMessage(
+        { id: 2, status: "imported", imported_job_listing_id: 200, gmail_message_id: 52 },
+        { id: 52, email_message_id: "msg-B" }
+      ),
       duplicate_of_job: null,
       imported_job_listing: importedListing,
     };
@@ -599,13 +836,17 @@ describe("listDiscoveries", () => {
       status: "applying",
     });
 
-    // Verify the query shape (where + include + orderBy)
+    // Verify the query shape (where + include + orderBy). With email_*
+    // moved onto GmailMessage, orderBy traverses the relation.
     const findManyCall = vi.mocked(prisma.discoveredJob.findMany).mock.calls[0]?.[0];
     expect(findManyCall?.include).toEqual({
+      gmail_message: true,
       duplicate_of_job: true,
       imported_job_listing: true,
     });
-    expect(findManyCall?.orderBy).toEqual({ email_received_at: "desc" });
+    expect(findManyCall?.orderBy).toEqual({
+      gmail_message: { email_received_at: "desc" },
+    });
   });
 
   it("applies the status filter when provided", async () => {
@@ -636,11 +877,10 @@ describe("listDiscoveries", () => {
       status: "init",
     });
     const rowWithNullTitleRef = {
-      ...buildDiscoveredJobRow({
-        id: 99,
-        duplicate_of_job_id: 300,
-        email_message_id: "msg-Z",
-      }),
+      ...buildDiscoveredJobRowWithMessage(
+        { id: 99, duplicate_of_job_id: 300, gmail_message_id: 60 },
+        { id: 60, email_message_id: "msg-Z" }
+      ),
       duplicate_of_job: duplicateOfWithNullTitle,
       imported_job_listing: null,
     };

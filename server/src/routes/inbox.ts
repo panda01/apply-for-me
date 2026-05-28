@@ -9,13 +9,20 @@
 
 import { Router, Request, Response } from "express";
 import {
-  scanInbox,
   listDiscoveries,
   importDiscoveries,
   dismissDiscovery,
   restoreDiscovery,
 } from "../services/discoveredJobsService.js";
 import type { DiscoveredJobStatusValue } from "../services/inboxTypes.js";
+import {
+  createSession,
+  getActiveSession,
+  getLastSession,
+  getSessionById,
+} from "../services/gmailSyncSessionService.js";
+import { startScanWorker } from "../services/gmailSyncWorker.js";
+import { getFirstConnectionId } from "../services/gmailMessageReaderService.js";
 import { parseIdParam } from "./_helpers.js";
 
 const router = Router();
@@ -120,13 +127,19 @@ router.get("/discoveries", async (req: Request, res: Response) => {
 
 /**
  * POST /api/inbox/scan
- * Triggers an inbox scan: fetches recent Gmail messages, extracts jobs, and
- * upserts DiscoveredJob rows. The user explicitly opts into this — there is
- * no automatic background scanner — so the response is the ScanResult the
- * page renders alongside the discoveries list.
+ * Starts an inbox scan as a background worker and immediately returns the
+ * session id so the client can begin polling. The scan itself walks through
+ * three named steps (fetching_emails → finding_jobs → saving_jobs) and the
+ * GmailSyncSession row is the source of truth for progress.
+ *
+ * When a scan is already running for the connection, this returns 409
+ * Conflict with the existing session's id so the second caller can
+ * seamlessly join the in-flight scan instead of starting a duplicate.
+ *
  * @param {number} req.body.days - Lower bound on email received-at, in days back
- * @returns {object} 200 - ScanResult { scanned, found, newDiscoveries }
+ * @returns {object} 200 - { sessionId, status: "running", reused: false } — worker started
  * @returns {object} 400 - Missing or invalid `days`
+ * @returns {object} 409 - { error: "scan_already_running", sessionId } — a scan is already in flight
  * @returns {object} 503 - No Gmail account is connected
  * @returns {object} 500 - Unexpected service failure
  */
@@ -143,9 +156,9 @@ router.post("/scan", async (req: Request, res: Response) => {
     return;
   }
 
+  let connectionId: number;
   try {
-    const result = await scanInbox({ days });
-    res.json(result);
+    connectionId = await getFirstConnectionId();
   } catch (err) {
     const message = err instanceof Error ? err.message : "";
     const isNoGmailAccount = message.includes("No Gmail account connected");
@@ -155,6 +168,101 @@ router.post("/scan", async (req: Request, res: Response) => {
     }
     throw err;
   }
+
+  const existingActiveSession = await getActiveSession(connectionId);
+  if (existingActiveSession !== null) {
+    res.status(409).json({
+      error: "scan_already_running",
+      sessionId: existingActiveSession.id,
+    });
+    return;
+  }
+
+  const { sessionId } = await createSession({
+    gmailConnectionId: connectionId,
+    daysRequested: days,
+  });
+  // Fire-and-forget. The worker writes progress into the session row; the
+  // client polls /api/inbox/scan/:sessionId until it leaves the `running`
+  // state. Errors inside the worker are caught and persisted to the row.
+  void startScanWorker(sessionId, days);
+  res.json({ sessionId, status: "running", reused: false });
+});
+
+/**
+ * GET /api/inbox/scan/active
+ * Returns the currently-running GmailSyncSession for the connection, or
+ * `null` when no scan is in flight. The client polls this on mount and
+ * while a session is running so the persistent "Syncing…" button can
+ * survive page reloads.
+ * @returns {object} 200 - { session: PublicGmailSyncSession | null }
+ * @returns {object} 503 - No Gmail account is connected
+ */
+router.get("/scan/active", async (_req: Request, res: Response) => {
+  let connectionId: number;
+  try {
+    connectionId = await getFirstConnectionId();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "";
+    const isNoGmailAccount = message.includes("No Gmail account connected");
+    if (isNoGmailAccount) {
+      res.status(503).json({ error: message });
+      return;
+    }
+    throw err;
+  }
+  const activeSession = await getActiveSession(connectionId);
+  res.json({ session: activeSession });
+});
+
+/**
+ * GET /api/inbox/scan/last
+ * Returns the most recent GmailSyncSession for the connection, regardless
+ * of status. Useful for "last scan finished N seconds ago" UI and for
+ * debugging a completed (or failed) run after the fact.
+ * @returns {object} 200 - { session: PublicGmailSyncSession | null }
+ * @returns {object} 503 - No Gmail account is connected
+ */
+router.get("/scan/last", async (_req: Request, res: Response) => {
+  let connectionId: number;
+  try {
+    connectionId = await getFirstConnectionId();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "";
+    const isNoGmailAccount = message.includes("No Gmail account connected");
+    if (isNoGmailAccount) {
+      res.status(503).json({ error: message });
+      return;
+    }
+    throw err;
+  }
+  const lastSession = await getLastSession(connectionId);
+  res.json({ session: lastSession });
+});
+
+/**
+ * GET /api/inbox/scan/:sessionId
+ * Returns a single GmailSyncSession by id. Used by the polling hook to
+ * watch a known session's status transitions (running → succeeded/failed)
+ * without re-running the active-session lookup every tick.
+ * @param {number} req.params.sessionId - The GmailSyncSession id
+ * @returns {object} 200 - { session: PublicGmailSyncSession }
+ * @returns {object} 400 - Invalid sessionId parameter
+ * @returns {object} 404 - No session with that id
+ */
+router.get("/scan/:sessionId", async (req: Request, res: Response) => {
+  const sessionIdParam = req.params["sessionId"];
+  const sessionId = parsePositiveInteger(sessionIdParam);
+  if (sessionId === null) {
+    res.status(400).json({ error: "sessionId must be a positive integer" });
+    return;
+  }
+  const session = await getSessionById(sessionId);
+  if (session === null) {
+    res.status(404).json({ error: "session not found" });
+    return;
+  }
+  res.json({ session });
 });
 
 /**

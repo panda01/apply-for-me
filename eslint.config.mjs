@@ -21,6 +21,9 @@ export default tseslint.config(
         ...globals.browser,
       },
     },
+    rules: {
+      "no-nested-ternary": "error"
+    }
   },
   {
     files: ["server/**/*.ts"],
@@ -30,6 +33,7 @@ export default tseslint.config(
       },
     },
     rules: {
+      "no-nested-ternary": "error",
       "require-jsdoc": ["error", {
         "require": {
           "FunctionDeclaration": true,

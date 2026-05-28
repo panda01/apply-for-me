@@ -21,6 +21,21 @@ enum WorkAuthorization {
   sponsorship_required
 }
 
+// Where the work is physically performed. Stored on JobListing.work_arrangement
+// and DiscoveredJob.work_arrangement; both columns are nullable, where NULL
+// means "unknown" (the email/scrape gave no usable signal). Populated by the
+// inbox extractor (jobDiscoveryExtractorService), the scraper agent
+// (docker/managed-container/agent.ts), or promoted from a DiscoveredJob on
+// import. The string-literal mirror WorkArrangementValue lives in inboxTypes.ts.
+//   remote  — fully remote / distributed
+//   on_site — in-office / in-person (maps from "On-site", "On site", "In-person")
+//   hybrid  — split between remote and on-site
+enum WorkArrangement {
+  remote
+  on_site
+  hybrid
+}
+
 // A reusable bundle of personal info used to fill out job-application forms.
 // One row per "identity" the user wants to apply with — e.g. "Default",
 // "Tech roles", "Contract work". The Apply flow loads the chosen row by id
@@ -70,7 +85,8 @@ model JobListing {
   application_url String? // Off-platform URL where the actual application form lives. Null until the resolver succeeds (or when status=missing_form_url after a failed resolve).
   description     String?
   salary          String?
-  location        String?
+  location        String? // Free-text location ("Remote", "San Francisco, CA"). Distinct from work_arrangement, which is the structured Remote/On-Site/Hybrid classification.
+  work_arrangement WorkArrangement? // Structured Remote/On-Site/Hybrid classification; null = unknown. Captured by the scraper agent or promoted from a DiscoveredJob on import.
   live_url        String? // Temporarily holds the browser-use live view URL for the iframe during application
   status          JobStatus @default(init)
   post_date       DateTime?
@@ -245,16 +261,13 @@ model DiscoveredJob {
   gmail_connection_id     Int
   gmail_connection        GmailConnection      @relation(fields: [gmail_connection_id], references: [id], onDelete: Cascade)
 
-  // Source email metadata — enough to render the design's `.email-tag` and
-  // `.disc-group-head` plus deep-link back to Gmail.
-  email_message_id        String
-  email_thread_id         String?
-  email_from_name         String
-  email_from_address      String
-  email_subject           String
-  email_snippet           String?
-  email_received_at       DateTime
-  email_label_color       String? // Hex string derived from sender domain via senderColorPalette.ts; nullable for unknown senders.
+  // The Gmail message this discovery was extracted from. Source-of-truth
+  // for the email metadata (subject, sender, snippet, received_at) and the
+  // "already scanned" guard. NOT NULL so every discovery is traceable
+  // back to its email; ON DELETE CASCADE so cleaning up a GmailMessage
+  // wipes the discoveries it produced.
+  gmail_message_id        Int
+  gmail_message           GmailMessage         @relation(fields: [gmail_message_id], references: [id], onDelete: Cascade)
 
   // Extracted job fields. `company` and `title` are the dedup identity
   // (normalized at compare time, stored as Claude returned them).
@@ -262,6 +275,12 @@ model DiscoveredJob {
   company                 String
   job_url                 String
   location                String?
+  // Structured Remote/On-Site/Hybrid classification; null = unknown. Captured
+  // by the inbox extractor. Intentionally NOT part of the dedupe key below
+  // (the key stays company+title+location); instead it follows the same
+  // null→valid promotion rule as `location` on re-scan merges, so a later
+  // scan that learns the arrangement upgrades a previously-null row.
+  work_arrangement        WorkArrangement?
   salary                  String?
   description             String?
 
@@ -276,8 +295,13 @@ model DiscoveredJob {
   created_date            DateTime             @default(now())
   updated_date            DateTime             @updatedAt
 
-  @@unique([gmail_connection_id, email_message_id, company, title, location], map: "discovered_jobs_dedupe_key")
-  @@index([gmail_connection_id, status, email_received_at])
+  // Dedupe key: one discovery per (source email, company, title, location).
+  // `gmail_message_id` implies `gmail_connection_id` (every GmailMessage
+  // belongs to one connection), so the connection isn't part of the key.
+  // COLLATE NOCASE + COALESCE(location,'') is re-applied as raw SQL by
+  // server/prisma/seed.ts after every `db push`.
+  @@unique([gmail_message_id, company, title, location], map: "discovered_jobs_dedupe_key")
+  @@index([gmail_connection_id, status])
   @@map("discovered_jobs")
 }
 
@@ -310,7 +334,114 @@ model GmailConnection {
   // Inbox-discovered job candidates extracted from this Gmail account's messages.
   discovered_jobs         DiscoveredJob[]
 
+  // Every Gmail message we've ever scanned for this connection (regardless
+  // of whether the extractor pulled any jobs out of it). Source of truth
+  // for the "already scanned, don't re-extract" guard.
+  gmail_messages          GmailMessage[]
+
+  // One row per scan attempt against this connection — see GmailSyncSession.
+  gmail_sync_sessions     GmailSyncSession[]
+
   @@map("gmail_connections")
+}
+
+// One row per Gmail message we have ever fetched + run through the
+// extractor (or attempted to). Created BEFORE any DiscoveredJob inserts so
+// the next scan's already-scanned guard can short-circuit even when the
+// extractor returned zero jobs from this email. Carries all the email
+// metadata that DiscoveredJob used to denormalize.
+//
+// `email_label_color` is derived from the sender domain by senderColorPalette;
+// nullable for senders the palette doesn't recognize. `email_thread_id` is
+// nullable because Gmail occasionally omits it on standalone messages.
+// `email_snippet` is nullable for messages whose body Gmail truncated to empty.
+//
+// `scanned_at` is when we first persisted the row — useful for debugging
+// "when did we first see this email" without parsing logs.
+model GmailMessage {
+  id                  Int             @id @default(autoincrement())
+  gmail_connection_id Int
+  gmail_connection    GmailConnection @relation(fields: [gmail_connection_id], references: [id], onDelete: Cascade)
+
+  email_message_id    String
+  email_thread_id     String?
+  email_from_name     String
+  email_from_address  String
+  email_subject       String
+  email_snippet       String?
+  email_received_at   DateTime
+  email_label_color   String?
+
+  scanned_at          DateTime        @default(now())
+  created_date        DateTime        @default(now())
+  updated_date        DateTime        @updatedAt
+
+  // Jobs the extractor pulled out of this email (0..N).
+  discovered_jobs     DiscoveredJob[]
+
+  // One row per (connection, gmail message id) — the lookup the
+  // already-scanned guard uses.
+  @@unique([gmail_connection_id, email_message_id])
+  @@index([gmail_connection_id, email_received_at])
+  @@map("gmail_messages")
+}
+
+// Lifecycle of one inbox-scan attempt. A GmailSyncSession row is created when
+// POST /api/inbox/scan is invoked; the scan worker then transitions it through
+// the three named steps (`fetching_emails` → `finding_jobs` → `saving_jobs`)
+// and writes per-step log entries into the `logs` JSON column. The status
+// resolves to `succeeded` or `failed` when the worker exits. The route layer
+// reads this row to render the persistent "Syncing…" state in the UI even
+// across page reloads, and the server's startup hook reconciles any leftover
+// `running` rows (process killed mid-scan) by flipping them to `failed` with
+// `last_error="server restart"`.
+enum GmailSyncSessionStatus {
+  running    // Worker is actively processing this scan
+  succeeded  // Worker finished without error and wrote `result`
+  failed     // Worker threw, or the row was reconciled at boot after a crash
+}
+
+// Steps the scan worker progresses through. The UI maps these to the three
+// labels on the SyncStepIndicator: "Fetching emails", "Finding jobs in emails",
+// "Saving jobs". `current_step` is null between session-create and the first
+// transition (still spinning up) and after `finished_at` is set (no current
+// step on a finished session).
+enum GmailSyncStep {
+  fetching_emails
+  finding_jobs
+  saving_jobs
+}
+
+// One row per scan attempt. Worker writes its progress here; the route layer
+// reads it to drive the UI's persistent loading state. Stored alongside (not
+// inside) DiscoveredJob so re-scans accumulate an audit trail.
+//
+// `logs` is JSON-as-text (SQLite has no first-class JSON column, matching the
+// existing ApplicationAttemptLogs / ApplicationUrlResolutionLog convention).
+// Each entry is a SyncLogEntry: { ts, step, level, message, detail? }.
+// `result` is JSON-as-text of `ScanResult` ({ scanned, found, newDiscoveries });
+// null while running and on `failed` rows.
+//
+// `@@index([gmail_connection_id, status])` powers the cheap "is a scan running
+// for this connection?" lookup on /api/inbox/scan/active.
+model GmailSyncSession {
+  id                  Int                    @id @default(autoincrement())
+  gmail_connection_id Int
+  gmail_connection    GmailConnection        @relation(fields: [gmail_connection_id], references: [id], onDelete: Cascade)
+  status              GmailSyncSessionStatus @default(running)
+  current_step        GmailSyncStep?
+  started_at          DateTime               @default(now())
+  finished_at         DateTime?
+  days_requested      Int                    // The `days` value the scan was issued with
+  last_error          String?                // Populated on `failed`; null otherwise
+  logs                String                 @default("[]") // JSON-as-text of SyncLogEntry[]
+  result              String?                // JSON-as-text of ScanResult; null until success
+  created_date        DateTime               @default(now())
+  updated_date        DateTime               @updatedAt
+
+  @@index([gmail_connection_id, status])
+  @@index([gmail_connection_id, started_at])
+  @@map("gmail_sync_sessions")
 }
 
 // Records each Docker container spawned through the managed-containers API.
