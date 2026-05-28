@@ -7,6 +7,7 @@ import {
   CircularProgress,
   Paper,
   Snackbar,
+  Tooltip,
   Typography,
 } from "@mui/material";
 import ArrowBackOutlinedIcon from "@mui/icons-material/ArrowBackOutlined";
@@ -48,6 +49,9 @@ import { getStatusMeta } from "../lib/jobStatus";
  * without the user needing to re-select their profile.
  */
 const SELECTED_PROFILE_STORAGE_KEY = "afm:selectedApplicationProfileId";
+
+/** Hint shown on the disabled Apply button when a job has no resolved application_url yet. */
+const FETCH_INFO_HINT = "Fetch the job's info first to find the application form.";
 
 /**
  * One of the 4 tone classes the design exposes for attempt rows
@@ -557,10 +561,14 @@ function JobViewPage() {
   const isResolutionInProgress = jobListing?.resolution_in_progress === true;
   const hasJobDetails = !!jobListing?.title;
   const hasApplicationUrl = !!jobListing?.application_url;
-  // Auto-apply requires a resolved application_url (the off-platform form). When
-  // the row is in missing_form_url state, or application_url is still null
-  // (e.g. fetch hasn't run yet), the Apply button is hidden.
-  const canApply = (jobListing?.status === "init" || jobListing?.status === "error_applying") && hasApplicationUrl;
+  // The Apply button is shown for status-eligible jobs (`init` / `error_applying`).
+  // When the row is in those statuses but application_url is still null (e.g. fetch
+  // hasn't run yet), the Apply button is shown-but-disabled with a hint tooltip
+  // rather than hidden. `canApply` stays true only when the job is status-eligible
+  // AND has a resolved application_url — it gates the actual apply action and the
+  // attempts empty-state copy below.
+  const isApplyStatusEligible = jobListing?.status === "init" || jobListing?.status === "error_applying";
+  const canApply = isApplyStatusEligible && hasApplicationUrl;
   const isAlreadyApplied = jobListing?.status === "applied";
 
   const totalAttempts = attempts === null ? 0 : attempts.length;
@@ -661,7 +669,7 @@ function JobViewPage() {
             </div>
 
             <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap", justifyContent: "flex-end" }}>
-              {!hasJobDetails && (
+              {!hasApplicationUrl && !isApplying && (
                 <Button
                   variant="outlined"
                   startIcon={isFetchingData ? <CircularProgress size={14} /> : <DownloadOutlinedIcon sx={{ fontSize: 16 }} />}
@@ -669,7 +677,7 @@ function JobViewPage() {
                   disabled={isFetchingData}
                   data-testid="fetch-data-button"
                 >
-                  {isFetchingData ? "Fetching..." : "Fetch Data"}
+                  {isFetchingData ? "Fetching…" : "Fetch Info"}
                 </Button>
               )}
 
@@ -701,18 +709,33 @@ function JobViewPage() {
                 </Button>
               )}
 
-              {canApply && (
-                <Button
-                  variant="contained"
-                  startIcon={isStartingApply
-                    ? <CircularProgress size={14} color="inherit" />
-                    : <AutoAwesomeOutlinedIcon sx={{ fontSize: 16 }} />}
-                  onClick={handleApply}
-                  disabled={isStartingApply || isApplying}
-                  data-testid="apply-button"
-                >
-                  {isStartingApply ? "Starting..." : "Auto-apply"}
-                </Button>
+              {isApplyStatusEligible && (
+                hasApplicationUrl ? (
+                  <Button
+                    variant="contained"
+                    startIcon={isStartingApply
+                      ? <CircularProgress size={14} color="inherit" />
+                      : <AutoAwesomeOutlinedIcon sx={{ fontSize: 16 }} />}
+                    onClick={handleApply}
+                    disabled={isStartingApply || isApplying}
+                    data-testid="apply-button"
+                  >
+                    {isStartingApply ? "Starting..." : "Auto-apply"}
+                  </Button>
+                ) : (
+                  <Tooltip title={FETCH_INFO_HINT}>
+                    <span>
+                      <Button
+                        variant="contained"
+                        startIcon={<AutoAwesomeOutlinedIcon sx={{ fontSize: 16 }} />}
+                        disabled
+                        data-testid="apply-button"
+                      >
+                        Auto-apply
+                      </Button>
+                    </span>
+                  </Tooltip>
+                )
               )}
 
               {isAlreadyApplied && (

@@ -6,6 +6,8 @@ import { resolve as resolvePath } from "node:path";
 import { Prisma } from "../../prisma/generated/client/client.js";
 import prisma from "../prismaClient.js";
 import { scrapeJobViaContainer } from "../services/smartProxyScraperService.js";
+import type { ScrapedJobListing } from "../services/smartProxyScraperService.js";
+import { stripTrackingParams } from "../services/urlSanitizerService.js";
 import { findOrSpawnRunningContainer, SpawnContainerError } from "../services/managedContainerService.js";
 import { resolveApplicationUrl, createContainerProgressReporter } from "../services/applicationUrlResolverService.js";
 import type { ResolverOutcome, ResolutionTrace } from "../services/applicationUrlResolverService.js";
@@ -68,67 +70,157 @@ function parsePostDate(postDateString: string): Date {
 }
 
 /**
- * Scrapes a job listing via the managed-container smart proxy, persists the
- * scraped fields, and then attempts to resolve the off-platform application
- * URL. On resolver success the application_url column is populated; on
- * "not_found" the JobListing's status is flipped to "missing_form_url" so
- * the UI can surface the failure and offer a Retry button.
+ * Resolve-first enrichment for a job listing. Rather than scraping the
+ * user-supplied URL up front, this FIRST resolves the off-platform application
+ * page (seeded from the row's existing title/company), and only then scrapes
+ * THAT application page for the remaining details.
  *
- * Before kicking off the resolver, an `ApplicationUrlResolutionLog` row is
- * inserted with `outcome=null` and `managed_container_id` pointing at the
- * supplied container — this is what the live-trace UI reads to find the
- * in-progress attempt. The same row is UPDATEd with the terminal fields when
- * the resolver settles.
+ * Flow:
+ *  1. The supplied URL is cleaned of tracking params and an
+ *     `ApplicationUrlResolutionLog` row is inserted with `outcome=null` and
+ *     `managed_container_id` pointing at the supplied container — this is what
+ *     the live-trace UI reads to find the in-progress attempt.
+ *  2. The resolver runs against the cleaned URL using the row's EXISTING
+ *     title/company as the search seed (with no apply-button hint, so it skips
+ *     re-scraping a gated login wall and goes straight to direct-check → Brave
+ *     search by title + company). The log row is settled and the outcome is
+ *     applied to the listing (application_url set, or status flipped to
+ *     "missing_form_url" on not_found).
+ *  3. When NO application page is found, the function STOPS — it does not
+ *     scrape or populate any listing fields.
+ *  4. When an application page IS found, that page is scraped (best-effort) and
+ *     the listing is persisted FILL-IF-EMPTY: only fields the row is currently
+ *     missing are written, so existing curated values (e.g. from inbox
+ *     discovery) are never overwritten.
  *
  * Designed to be fire-and-forget from the POST /:id/fetch route — exceptions
  * are caught and logged so a stalled scrape never crashes the API.
  *
- * @param {number} jobListingId - The id of the job listing row to enrich
- * @param {string} url - The job listing URL to scrape
+ * @param {NonNullable<Awaited<ReturnType<typeof findJobListingOrSend404>>>} jobListing - The full existing job listing row to enrich; its current field values determine which fields get filled and seed the resolver search
  * @param {{ id: number; hostPort: number }} container - The chosen managed container; its id is stored on the log row and its hostPort hosts the live progress map the resolver pushes to
  */
 async function scrapeAndUpdateJobListing(
-  jobListingId: number,
-  url: string,
+  jobListing: NonNullable<Awaited<ReturnType<typeof findJobListingOrSend404>>>,
   container: { id: number; hostPort: number }
 ): Promise<void> {
   try {
-    const scrapedData = await scrapeJobViaContainer(container.hostPort, url);
+    const cleanUrl = stripTrackingParams(jobListing.url);
+    console.log(`[fetch] job ${String(jobListing.id)}: cleaned url ${jobListing.url} -> ${cleanUrl}`);
 
-    const formattedTitle = scrapedData.company
-      ? `${scrapedData.company} - ${scrapedData.title}`
-      : scrapedData.title;
+    const logId = await beginResolutionLog(jobListing.id, container);
 
-    await prisma.jobListing.update({
-      where: { id: jobListingId },
-      data: {
-        title: formattedTitle,
-        // Also write the normalized company directly so the inbox-discovery dedup
-        // key (company + title) is available without re-parsing the formatted title.
-        // Empty string when the scraper didn't return a company so the row is excluded
-        // from dedup matching (see jobListingMatchService.findExistingJobListingByCompanyTitle).
-        company: scrapedData.company,
-        description: scrapedData.description,
-        salary: scrapedData.salary,
-        post_date: scrapedData.post_date !== null ? parsePostDate(scrapedData.post_date) : new Date(),
-      },
-    });
+    // Resolver search seed comes from the EXISTING row — its title/company are
+    // the listing's authoritative identity (e.g. curated via inbox discovery).
+    // The title is used VERBATIM (never split on " - ").
+    const resolverTitle = (jobListing.title ?? "").trim();
+    const resolverCompany = (jobListing.company ?? "").trim();
+    const resolverDescription = jobListing.description ?? "";
+    console.log(`[fetch] job ${String(jobListing.id)}: resolving application page (title="${resolverTitle}", company="${resolverCompany}")`);
 
-    const logId = await beginResolutionLog(jobListingId, container);
-    const resolverResult = await resolveApplicationUrl({
-      originalUrl: url,
-      originalTitle: scrapedData.title,
-      originalDescription: scrapedData.description,
-      originalCompany: scrapedData.company,
-      originalApplyButtonUrl: scrapedData.apply_button_url,
+    const { outcome, trace } = await resolveApplicationUrl({
+      originalUrl: cleanUrl,
+      originalTitle: resolverTitle,
+      originalDescription: resolverDescription,
+      originalCompany: resolverCompany,
+      // No apply-button hint — skip re-scraping a gated login wall and go
+      // straight to direct-check → Brave search by title + company.
+      originalApplyButtonUrl: null,
       progressReporter: createContainerProgressReporter(container.hostPort, logId),
     });
 
-    await finalizeResolutionLog(logId, resolverResult.outcome, resolverResult.trace);
-    await applyResolverOutcomeToListing(jobListingId, resolverResult.outcome);
+    await finalizeResolutionLog(logId, outcome, trace);
+    await applyResolverOutcomeToListing(jobListing.id, outcome);
+
+    if (outcome.outcome === "not_found") {
+      console.log(`[fetch] job ${String(jobListing.id)}: no application page found (${outcome.reason}); stopping without populating info`);
+      return;
+    }
+
+    const applicationUrl = outcome.applicationUrl;
+    console.log(`[fetch] job ${String(jobListing.id)}: application page = ${applicationUrl} (outcome=${outcome.outcome})`);
+
+    // Scrape the resolved application page for details. Best-effort: the
+    // application_url is already persisted (step above), so a scrape failure
+    // here keeps that value and simply leaves the other fields unfilled.
+    let info: ScrapedJobListing;
+    try {
+      console.log(`[fetch] job ${String(jobListing.id)}: scraping ${applicationUrl} for details`);
+      info = await scrapeJobViaContainer(container.hostPort, applicationUrl);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.log(`[fetch] job ${String(jobListing.id)}: info scrape failed: ${errorMessage} (application_url kept)`);
+      return;
+    }
+
+    // FILL-IF-EMPTY: build a data object containing ONLY the fields the row is
+    // currently missing, so existing curated values are preserved untouched. A
+    // string field counts as missing when it trims to empty; work_arrangement
+    // counts as missing only when it is null.
+    const data: Prisma.JobListingUpdateInput = {};
+    const preservedFields: string[] = [];
+
+    const hasTitle = (jobListing.title ?? "").trim().length > 0;
+    if (hasTitle) {
+      preservedFields.push("title");
+    } else {
+      data.title = info.company ? `${info.company} - ${info.title}` : info.title;
+    }
+
+    const hasCompany = (jobListing.company ?? "").trim().length > 0;
+    if (hasCompany) {
+      preservedFields.push("company");
+    } else {
+      data.company = info.company;
+    }
+
+    const hasSalary = (jobListing.salary ?? "").trim().length > 0;
+    if (hasSalary) {
+      preservedFields.push("salary");
+    } else {
+      data.salary = info.salary;
+    }
+
+    const hasDescription = (jobListing.description ?? "").trim().length > 0;
+    if (hasDescription) {
+      preservedFields.push("description");
+    } else {
+      data.description = info.description;
+    }
+
+    const hasWorkArrangement = jobListing.work_arrangement !== null;
+    if (hasWorkArrangement) {
+      preservedFields.push("work_arrangement");
+    } else {
+      data.work_arrangement = info.work_arrangement;
+    }
+
+    const hasLocation = (jobListing.location ?? "").trim().length > 0;
+    const infoHasLocation = (info.location ?? "").trim().length > 0;
+    if (hasLocation) {
+      preservedFields.push("location");
+    } else if (infoHasLocation) {
+      // info.location is non-empty here (infoHasLocation guards it).
+      data.location = info.location;
+    } else {
+      preservedFields.push("location");
+    }
+
+    // post_date is NOT gated on the row: only write it when the scrape actually
+    // supplied one, and never clobber with new Date().
+    if (info.post_date !== null) {
+      data.post_date = parsePostDate(info.post_date);
+    }
+
+    const filledFields = Object.keys(data);
+    console.log(`[fetch] job ${String(jobListing.id)}: filled [${filledFields.join(", ")}]; preserved [${preservedFields.join(", ")}]`);
+
+    const hasFieldsToFill = filledFields.length > 0;
+    if (hasFieldsToFill) {
+      await prisma.jobListing.update({ where: { id: jobListing.id }, data });
+    }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    console.error(`[scraper] Failed to scrape/resolve job listing ${String(jobListingId)} at ${url}: ${errorMessage}`);
+    console.error(`[scraper] Failed to scrape/resolve job listing ${String(jobListing.id)} at ${jobListing.url}: ${errorMessage}`);
   }
 }
 
@@ -340,7 +432,7 @@ router.post("/:id/fetch", async (req: Request, res: Response) => {
 
   res.status(202).json(jobListing);
 
-  scrapeAndUpdateJobListing(jobListing.id, jobListing.url, container).catch(() => {
+  scrapeAndUpdateJobListing(jobListing, container).catch(() => {
     /* error already handled inside scrapeAndUpdateJobListing */
   });
 });
@@ -395,7 +487,7 @@ router.post("/:id/resolve-application-url", async (req: Request, res: Response) 
   res.status(202).json({ ...jobListing, latest_resolution_log_id: logId });
 
   // Narrowing — hasNoScrapedFields guard above guarantees these are non-null/non-empty.
-  runResolverForExistingListing(jobListing.id, jobListing.url, jobListing.title!, jobListing.description!, container, logId).catch(() => {
+  runResolverForExistingListing(jobListing.id, jobListing.url, jobListing.title!, jobListing.company ?? "", jobListing.description!, container, logId).catch(() => {
     /* error already handled inside runResolverForExistingListing */
   });
 });
@@ -414,7 +506,8 @@ router.post("/:id/resolve-application-url", async (req: Request, res: Response) 
  *
  * @param {number} jobListingId - The id of the listing to update
  * @param {string} url - The original (Indeed/LinkedIn) URL
- * @param {string} formattedTitle - The persisted formatted title ("Company - Role"); the company prefix is stripped before passing to the resolver so title-match comparisons stay accurate
+ * @param {string} title - The persisted job title, used VERBATIM (already the clean, normalized title — never split on " - ")
+ * @param {string} company - The persisted company name, used verbatim
  * @param {string} description - The persisted description text
  * @param {{ id: number; hostPort: number }} container - The chosen managed container hosting the live progress map
  * @param {number} logId - The pre-inserted ApplicationUrlResolutionLog row id this attempt belongs to
@@ -422,13 +515,13 @@ router.post("/:id/resolve-application-url", async (req: Request, res: Response) 
 async function runResolverForExistingListing(
   jobListingId: number,
   url: string,
-  formattedTitle: string,
+  title: string,
+  company: string,
   description: string,
   container: { id: number; hostPort: number },
   logId: number
 ): Promise<void> {
   try {
-    const { company, title } = splitFormattedTitle(formattedTitle);
     const resolverResult = await resolveApplicationUrl({
       originalUrl: url,
       originalTitle: title,

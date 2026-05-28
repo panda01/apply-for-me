@@ -402,6 +402,7 @@ async function processSingleMessage(
           company: normalizedCompany,
           job_url: extractedJob.jobUrl,
           location: normalizedLocation,
+          work_arrangement: extractedJob.workArrangement,
           salary: extractedJob.salary,
           description: extractedJob.description,
           confidence: extractedJob.confidence,
@@ -423,6 +424,11 @@ async function processSingleMessage(
     // target was picked because the new value's null acts as a wildcard,
     // so the stored value is at least as specific).
     //
+    // Work-arrangement handling: same promotion rule as location, but applied
+    // independently — `work_arrangement` is NOT part of the dedup identity, so
+    // we simply promote a stored null to a freshly-extracted valid value and
+    // never overwrite an existing valid arrangement with a null re-scan.
+    //
     // Status handling: only auto-flip `pending` → `duplicate` when a
     // JobListing has since appeared with matching (company, title, location).
     // Other status transitions (imported, dismissed) are user-driven and
@@ -435,6 +441,14 @@ async function processSingleMessage(
     const shouldPromoteLocation = newLocationIsValid && existingLocationIsNull;
     const locationToWrite = shouldPromoteLocation ? normalizedLocation : mergeTarget.location;
 
+    const newWorkArrangementIsValid = extractedJob.workArrangement !== null;
+    const existingWorkArrangementIsNull = mergeTarget.work_arrangement === null;
+    const shouldPromoteWorkArrangement =
+      newWorkArrangementIsValid && existingWorkArrangementIsNull;
+    const workArrangementToWrite = shouldPromoteWorkArrangement
+      ? extractedJob.workArrangement
+      : mergeTarget.work_arrangement;
+
     const shouldAutoFlipToDuplicate =
       mergeTarget.status === DiscoveredJobStatus.pending &&
       existingJobListing !== null;
@@ -444,6 +458,7 @@ async function processSingleMessage(
       data: {
         job_url: extractedJob.jobUrl,
         location: locationToWrite,
+        work_arrangement: workArrangementToWrite,
         salary: extractedJob.salary,
         description: extractedJob.description,
         confidence: extractedJob.confidence,
@@ -616,6 +631,7 @@ function mapDiscoveredJobRowToPublic(
     company: row.company,
     jobUrl: row.job_url,
     location: row.location,
+    workArrangement: row.work_arrangement,
     salary: row.salary,
     description: row.description,
     confidence: row.confidence,
@@ -695,6 +711,7 @@ export async function importDiscoveries(ids: number[]): Promise<ImportResult> {
           description: discoveryRow.description ?? "",
           salary: discoveryRow.salary,
           location: discoveryRow.location,
+          work_arrangement: discoveryRow.work_arrangement,
           post_date: discoveryRow.gmail_message.email_received_at,
           status: "init",
         },

@@ -23,6 +23,7 @@ const baseJobListing: JobListingResponse = {
   description: "Build cool stuff",
   company: null,
   location: null,
+  work_arrangement: null,
   salary: null,
   status: "missing_form_url",
   live_url: null,

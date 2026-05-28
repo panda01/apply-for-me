@@ -40,6 +40,7 @@ describe("buildFuzzyMatchText", () => {
 describe("harvestCareersPage", () => {
   it("deduplicates by href and returns the top scored hrefs", async () => {
     vi.mocked(extractLinksViaContainer).mockResolvedValue({
+      url: "https://acme.com/careers",
       links: [
         { href: "https://acme.com/jobs/swe", text: "Software Engineer", accessibleName: "Software Engineer" },
         { href: "https://acme.com/jobs/swe", text: "Software Engineer", accessibleName: "Software Engineer" },
@@ -59,6 +60,7 @@ describe("harvestCareersPage", () => {
 
   it("returns an empty topHrefs list when no link meets the fuzzy threshold", async () => {
     vi.mocked(extractLinksViaContainer).mockResolvedValue({
+      url: "https://acme.com/careers",
       links: [
         { href: "https://acme.com/login", text: "Sign in", accessibleName: "Login" },
         { href: "https://acme.com/about", text: "About Us", accessibleName: "About" },
@@ -72,7 +74,7 @@ describe("harvestCareersPage", () => {
   });
 
   it("returns an empty topHrefs list when the container returns no links", async () => {
-    vi.mocked(extractLinksViaContainer).mockResolvedValue({ links: [] });
+    vi.mocked(extractLinksViaContainer).mockResolvedValue({ url: "https://acme.com/careers", links: [] });
 
     const result = await harvestCareersPage(41010, "https://acme.com/careers", "Software Engineer");
 

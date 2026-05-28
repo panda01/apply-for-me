@@ -489,6 +489,9 @@ export async function applyToJob(
       sessionSettings: {
         profileId,
         proxyCountryCode: "us",
+        // Off: we persist our own per-step screenshots (see onSubmissionScreenshotSaved)
+        // and never consume Browser-Use's session recordings. Required field since the SDK bump.
+        enableRecording: false,
       },
     });
 

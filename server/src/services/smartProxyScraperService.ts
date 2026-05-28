@@ -13,6 +13,7 @@
  */
 
 import prisma from "../prismaClient.js";
+import { WORK_ARRANGEMENT_VALUES, type WorkArrangementValue } from "./inboxTypes.js";
 
 /**
  * Maximum time (ms) to wait for the container's /analyze response. The agent
@@ -42,9 +43,21 @@ export interface ScrapedJobListing {
   description: string;
   salary: string | null;
   post_date: string | null;
+  // Normalized Remote/On-Site/Hybrid classification; null when the container
+  // reported no usable signal (empty string) or an unrecognized value. Validated
+  // against the WorkArrangement enum by normalizeWorkArrangement before it reaches here.
+  work_arrangement: WorkArrangementValue | null;
   apply_button_url: string | null;
   is_job_description: boolean;
   reasoning: string;
+  // Raw document.title of the analyzed page. Used by the host to seed a Brave
+  // search query when the originally-supplied URL didn't look like a posting
+  // and the job row has no title yet.
+  page_title: string;
+  // Free-text location ("Remote", "San Francisco, CA") extracted from the page.
+  // Optional so a container built before this field existed still type-checks
+  // (the mapper defaults a missing value to "").
+  location?: string;
 }
 
 /**
@@ -63,7 +76,40 @@ interface AnalyzeRouteResponse {
   description: string;
   salary: string | null;
   post_date: string | null;
+  // Raw worksite-arrangement string the container reported: one of "remote" |
+  // "on_site" | "hybrid", or "" (empty string) when unknown. The host validates
+  // and normalizes this via normalizeWorkArrangement before persisting.
+  work_arrangement: string;
   apply_button_url: string | null;
+  // Optional so a container built before this field existed still type-checks;
+  // the mapper defaults a missing value to "".
+  page_title?: string;
+  location?: string;
+}
+
+/**
+ * Normalizes the container's raw, free-text work-arrangement string into a
+ * validated {@link WorkArrangementValue} or null. The container reports one of
+ * "remote" | "on_site" | "hybrid" (or "" when it found no usable signal), but
+ * because the value originates from an LLM we never trust it blindly: we trim
+ * it, lowercase it, and only accept it when it exactly matches one of the legal
+ * {@link WORK_ARRANGEMENT_VALUES}. Anything else — the empty string, stray
+ * casing that doesn't resolve, or an unrecognized token — collapses to null so
+ * the nullable WorkArrangement column never receives an out-of-enum value.
+ *
+ * @param {string} rawValue - The raw work_arrangement string from the container's /analyze response
+ * @returns {WorkArrangementValue | null} The matching enum value, or null when empty/unrecognized
+ */
+export function normalizeWorkArrangement(rawValue: string): WorkArrangementValue | null {
+  const normalizedCandidate = rawValue.trim().toLowerCase();
+  const matchedValue = WORK_ARRANGEMENT_VALUES.find(
+    (legalValue) => legalValue === normalizedCandidate
+  );
+  const hasNoRecognizedMatch = matchedValue === undefined;
+  if (hasNoRecognizedMatch) {
+    return null;
+  }
+  return matchedValue;
 }
 
 /**
@@ -128,9 +174,12 @@ export async function scrapeJobViaContainer(
     description: body.description,
     salary: body.salary,
     post_date: body.post_date,
+    work_arrangement: normalizeWorkArrangement(body.work_arrangement),
     apply_button_url: body.apply_button_url,
     is_job_description: body.is_job_description,
     reasoning: body.reasoning,
+    page_title: typeof body.page_title === "string" ? body.page_title : "",
+    location: typeof body.location === "string" ? body.location : "",
   };
 }
 

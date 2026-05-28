@@ -85,6 +85,7 @@ import {
   parseResolutionLogRow,
   parseAttemptLogRow,
   buildJobListingsWhereClause,
+  parsePostDate,
 } from "./jobListings.js";
 
 /** Absolute path of a tiny PNG fixture checked into claude_tmp/ for the streaming-route tests. */
@@ -126,6 +127,9 @@ const mockJobListing = {
   post_date: new Date("2026-03-07T00:00:00.000Z"),
   created_date: new Date("2026-03-07T00:00:00.000Z"),
   status: "init" as const,
+  // Structured Remote/On-Site/Hybrid classification — null (unknown) for the
+  // un-scraped fixture so it matches the real nullable Prisma row shape.
+  work_arrangement: null,
 };
 
 const mockCompletedJobListing = {
@@ -141,6 +145,9 @@ const mockCompletedJobListing = {
   post_date: new Date("2026-03-01T00:00:00.000Z"),
   created_date: new Date("2026-03-07T00:00:00.000Z"),
   status: "init" as const,
+  // Structured Remote/On-Site/Hybrid classification — null (unknown) by default;
+  // individual tests override this when they care about the value.
+  work_arrangement: null,
 };
 
 const mockRunningContainer = { id: 1, hostPort: 41001 };
@@ -154,6 +161,10 @@ const baseScrapeResult = {
   apply_button_url: null as string | null,
   is_job_description: true,
   reasoning: "Looks like a job description",
+  // ScrapedJobListing now carries the normalized work-arrangement enum value (or
+  // null when unknown); default to null so existing scrape tests stay neutral.
+  work_arrangement: null as "remote" | "on_site" | "hybrid" | null,
+  page_title: "Software Engineer - Acme Corp | LinkedIn",
 };
 
 beforeEach(() => {
@@ -356,48 +367,21 @@ describe("POST /api/job-listings/:id/fetch", () => {
     expect(response.body.url).toBe("https://linkedin.com/jobs/1");
   });
 
-  it("should persist the scraped fields and the resolver application_url on resolver success", async () => {
+  it("resolves the application page first, then scrapes that page and fills empty fields", async () => {
+    // Blank row (fresh single-URL add): everything gets filled from the found page.
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
     vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "resolved_via_search", applicationUrl: "https://acme.com/careers/123" }));
     vi.mocked(scrapeJobViaContainer).mockResolvedValue({
       ...baseScrapeResult,
-      apply_button_url: "https://acme.com/jobs/123/apply",
+      title: "Senior Engineer",
+      company: "Acme Corp",
+      salary: "$120k - $150k",
+      description: "Build cool stuff",
+      work_arrangement: "remote",
+      location: "Remote",
+      post_date: "2026-03-01",
     });
-    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({
-      outcome: "resolved_via_redirect",
-      applicationUrl: "https://acme.com/jobs/123/apply",
-    }));
-    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
-
-    await request(app).post("/api/job-listings/1/fetch");
-    await vi.waitFor(() => {
-      const updateCalls = vi.mocked(prisma.jobListing.update).mock.calls;
-      expect(updateCalls.length).toBeGreaterThanOrEqual(2);
-    });
-
-    const updateCalls = vi.mocked(prisma.jobListing.update).mock.calls;
-    const scrapeCall = updateCalls[0];
-    expect(scrapeCall[0]).toEqual({
-      where: { id: 1 },
-      data: expect.objectContaining({
-        title: "Acme Corp - Software Engineer",
-        description: "Build cool stuff",
-        salary: "$120k - $150k",
-      }),
-    });
-
-    const resolverCall = updateCalls[1];
-    expect(resolverCall[0]).toEqual({
-      where: { id: 1 },
-      data: { application_url: "https://acme.com/jobs/123/apply" },
-    });
-  });
-
-  it("should flip status to missing_form_url when the resolver returns not_found", async () => {
-    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
-    vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
-    vi.mocked(scrapeJobViaContainer).mockResolvedValue(baseScrapeResult);
-    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "not_found", reason: "no matches" }));
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
 
     await request(app).post("/api/job-listings/1/fetch");
@@ -405,19 +389,63 @@ describe("POST /api/job-listings/:id/fetch", () => {
       expect(vi.mocked(prisma.jobListing.update).mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 
+    // The resolver is seeded from the row, with the apply-button hint skipped.
+    expect(resolveApplicationUrl).toHaveBeenCalledWith(expect.objectContaining({
+      originalUrl: "https://linkedin.com/jobs/1",
+      originalApplyButtonUrl: null,
+    }));
+    // The page scraped for details is the RESOLVED url, not the original.
+    expect(scrapeJobViaContainer).toHaveBeenCalledWith(mockRunningContainer.hostPort, "https://acme.com/careers/123");
+
     const updateCalls = vi.mocked(prisma.jobListing.update).mock.calls;
-    const resolverCall = updateCalls[1];
-    expect(resolverCall[0]).toEqual({
+    // First update: the resolver outcome writes application_url.
+    expect(updateCalls[0][0]).toEqual({ where: { id: 1 }, data: { application_url: "https://acme.com/careers/123" } });
+    // Second update: fill-if-empty from the found page.
+    expect(updateCalls[1][0]).toEqual({
       where: { id: 1 },
-      data: { application_url: null, status: "missing_form_url" },
+      data: expect.objectContaining({
+        title: "Acme Corp - Senior Engineer",
+        company: "Acme Corp",
+        salary: "$120k - $150k",
+        description: "Build cool stuff",
+        work_arrangement: "remote",
+        location: "Remote",
+      }),
     });
   });
 
-  it("should default post_date to now when scraper returns null post_date", async () => {
+  it("never overwrites existing fields — only fills the ones the row is missing", async () => {
+    // Row already has most fields populated; only work_arrangement is missing.
+    const rowWithData = { ...mockCompletedJobListing, title: "Globex - Staff Engineer", company: "Globex", salary: "$200k", description: "Existing description", location: "NYC, NY" };
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(rowWithData);
+    vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://globex.com/jobs/9" }));
+    vi.mocked(scrapeJobViaContainer).mockResolvedValue({
+      ...baseScrapeResult,
+      title: "Different Title", company: "Different Co", salary: "$1", description: "different", work_arrangement: "remote", location: "Mars", post_date: null,
+    });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app).post("/api/job-listings/1/fetch");
+    await vi.waitFor(() => {
+      expect(vi.mocked(prisma.jobListing.update).mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    // The resolver searches by the row's verbatim title + company.
+    expect(resolveApplicationUrl).toHaveBeenCalledWith(expect.objectContaining({
+      originalTitle: "Globex - Staff Engineer",
+      originalCompany: "Globex",
+    }));
+    const updateCalls = vi.mocked(prisma.jobListing.update).mock.calls;
+    expect(updateCalls[0][0]).toEqual({ where: { id: 1 }, data: { application_url: "https://globex.com/jobs/9" } });
+    // Only the missing field (work_arrangement) is filled; everything else preserved.
+    expect(updateCalls[1][0]).toEqual({ where: { id: 1 }, data: { work_arrangement: "remote" } });
+  });
+
+  it("stops without scraping or populating when no application page is found", async () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
     vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
-    vi.mocked(scrapeJobViaContainer).mockResolvedValue({ ...baseScrapeResult, post_date: null });
-    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://acme.com" }));
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "not_found", reason: "no matches" }));
     vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
 
     await request(app).post("/api/job-listings/1/fetch");
@@ -425,40 +453,128 @@ describe("POST /api/job-listings/:id/fetch", () => {
       expect(vi.mocked(prisma.jobListing.update)).toHaveBeenCalled();
     });
 
-    const firstCall = vi.mocked(prisma.jobListing.update).mock.calls[0];
-    const dataArg = firstCall[0].data as { post_date: Date };
-    expect(dataArg.post_date).toBeInstanceOf(Date);
+    // No application page → no info scrape, and the only update is the failure flip.
+    expect(scrapeJobViaContainer).not.toHaveBeenCalled();
+    const updateCalls = vi.mocked(prisma.jobListing.update).mock.calls;
+    expect(updateCalls).toHaveLength(1);
+    expect(updateCalls[0][0]).toEqual({ where: { id: 1 }, data: { application_url: null, status: "missing_form_url" } });
   });
 
-  it("should log and swallow a scrape failure rather than crash the async handler", async () => {
+  it("keeps the resolved application_url when the info scrape fails", async () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
     vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://acme.com/jobs/9" }));
     vi.mocked(scrapeJobViaContainer).mockRejectedValue(new Error("container exploded"));
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => { /* swallow */ });
+
+    const response = await request(app).post("/api/job-listings/1/fetch");
+    expect(response.status).toBe(202);
+    await vi.waitFor(() => {
+      expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringMatching(/info scrape failed/));
+    });
+
+    // application_url was written before the info scrape; the failed scrape doesn't undo it.
+    const updateCalls = vi.mocked(prisma.jobListing.update).mock.calls;
+    expect(updateCalls).toHaveLength(1);
+    expect(updateCalls[0][0]).toEqual({ where: { id: 1 }, data: { application_url: "https://acme.com/jobs/9" } });
+    consoleLogSpy.mockRestore();
+  });
+
+  it("strips tracking params from the URL before resolving", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue({ ...mockJobListing, url: "https://boards.greenhouse.io/acme/jobs/5?utm_source=email&gh_jid=5&trackingId=abc" });
+    vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://boards.greenhouse.io/acme/jobs/5" }));
+    vi.mocked(scrapeJobViaContainer).mockResolvedValue(baseScrapeResult);
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app).post("/api/job-listings/1/fetch");
+    await vi.waitFor(() => {
+      expect(resolveApplicationUrl).toHaveBeenCalled();
+    });
+
+    expect(resolveApplicationUrl).toHaveBeenCalledWith(expect.objectContaining({
+      originalUrl: "https://boards.greenhouse.io/acme/jobs/5?gh_jid=5",
+    }));
+  });
+
+  it("does not set post_date when the scraped page has none", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
+    vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://acme.com" }));
+    vi.mocked(scrapeJobViaContainer).mockResolvedValue({ ...baseScrapeResult, post_date: null });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app).post("/api/job-listings/1/fetch");
+    await vi.waitFor(() => {
+      expect(vi.mocked(prisma.jobListing.update).mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    const fillData = vi.mocked(prisma.jobListing.update).mock.calls[1][0].data as Record<string, unknown>;
+    expect(fillData).not.toHaveProperty("post_date");
+  });
+
+  it("logs and swallows a resolver failure rather than crashing the async handler", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
+    vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
+    vi.mocked(resolveApplicationUrl).mockRejectedValue(new Error("resolver exploded"));
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => { /* swallow */ });
 
     const response = await request(app).post("/api/job-listings/1/fetch");
     expect(response.status).toBe(202);
-
     await vi.waitFor(() => {
-      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringMatching(/container exploded/));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringMatching(/resolver exploded/));
     });
-
     consoleErrorSpy.mockRestore();
   });
 
-  it("should log a non-Error scrape rejection with the stringified reason", async () => {
+  it("logs a non-Error resolver rejection with the stringified reason", async () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
     vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
-    vi.mocked(scrapeJobViaContainer).mockRejectedValue("non-error-string");
+    vi.mocked(resolveApplicationUrl).mockRejectedValue("non-error-string");
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => { /* swallow */ });
 
     await request(app).post("/api/job-listings/1/fetch");
-
     await vi.waitFor(() => {
       expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringMatching(/non-error-string/));
     });
-
     consoleErrorSpy.mockRestore();
+  });
+
+  it("issues no fill update when the page adds nothing the row is missing", async () => {
+    // Row is already fully populated (incl. work_arrangement) and the scrape has no
+    // post_date, so the fill `data` is empty and no second update is issued.
+    const fullRow = { ...mockCompletedJobListing, title: "Globex - Staff Engineer", company: "Globex", salary: "$200k", description: "desc", location: "NYC", work_arrangement: "remote" };
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(fullRow as never);
+    vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://globex.com/jobs/1" }));
+    vi.mocked(scrapeJobViaContainer).mockResolvedValue({ ...baseScrapeResult, post_date: null });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app).post("/api/job-listings/1/fetch");
+    await vi.waitFor(() => {
+      expect(vi.mocked(prisma.jobListing.update)).toHaveBeenCalled();
+    });
+
+    const updateCalls = vi.mocked(prisma.jobListing.update).mock.calls;
+    expect(updateCalls).toHaveLength(1);
+    expect(updateCalls[0][0]).toEqual({ where: { id: 1 }, data: { application_url: "https://globex.com/jobs/1" } });
+  });
+
+  it("fills a bare title (no 'Company - ' prefix) when the found page has no company", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
+    vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
+    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://acme.com" }));
+    vi.mocked(scrapeJobViaContainer).mockResolvedValue({ ...baseScrapeResult, title: "Standalone Role", company: "", post_date: null });
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+
+    await request(app).post("/api/job-listings/1/fetch");
+    await vi.waitFor(() => {
+      expect(vi.mocked(prisma.jobListing.update).mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    const fillData = vi.mocked(prisma.jobListing.update).mock.calls[1][0].data as Record<string, unknown>;
+    expect(fillData.title).toBe("Standalone Role");
   });
 });
 
@@ -549,7 +665,7 @@ describe("POST /api/job-listings/:id/resolve-application-url", () => {
     });
   });
 
-  it("calls the resolver with the company and title split from the formatted title", async () => {
+  it("calls the resolver with the row's title and company used VERBATIM (never split on ' - ')", async () => {
     vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(scrapedListing);
     vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
     vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://acme.com" }));
@@ -561,11 +677,13 @@ describe("POST /api/job-listings/:id/resolve-application-url", () => {
       expect(resolveApplicationUrl).toHaveBeenCalled();
     });
 
+    // The stored title is passed through unchanged — splitting it would mangle
+    // a real title that legitimately contains " - " (e.g. "Full Stack Engineer - Senior").
     expect(resolveApplicationUrl).toHaveBeenCalledWith(expect.objectContaining({
       originalUrl: scrapedListing.url,
-      originalTitle: "Software Engineer",
+      originalTitle: scrapedListing.title,
       originalDescription: scrapedListing.description,
-      originalCompany: "Acme Corp",
+      originalCompany: scrapedListing.company,
       // The retry path also threads in a progressReporter created by the route.
       progressReporter: expect.any(Object),
     }));
@@ -605,23 +723,16 @@ describe("POST /api/job-listings/:id/resolve-application-url", () => {
 });
 
 describe("parsePostDate (exported for coverage)", () => {
-  it("falls back to the current date when chrono-node returns null", async () => {
-    // chrono-node returns null for unparseable strings; ensure parsePostDate gives a Date back.
+  it("falls back to the current date when chrono-node returns null", () => {
+    // chrono-node returns null for unparseable strings; parsePostDate should still give a Date back.
     mockParseDate.mockReturnValueOnce(null);
-    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockJobListing);
-    vi.mocked(findOrSpawnRunningContainer).mockResolvedValue(mockRunningContainer);
-    vi.mocked(scrapeJobViaContainer).mockResolvedValue({ ...baseScrapeResult, post_date: "garbage string" });
-    vi.mocked(resolveApplicationUrl).mockResolvedValue(resolverResult({ outcome: "direct", applicationUrl: "https://acme.com" }));
-    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockCompletedJobListing);
+    expect(parsePostDate("garbage string")).toBeInstanceOf(Date);
+  });
 
-    await request(app).post("/api/job-listings/1/fetch");
-    await vi.waitFor(() => {
-      expect(vi.mocked(prisma.jobListing.update)).toHaveBeenCalled();
-    });
-
-    const firstCall = vi.mocked(prisma.jobListing.update).mock.calls[0];
-    const dataArg = firstCall[0].data as { post_date: Date };
-    expect(dataArg.post_date).toBeInstanceOf(Date);
+  it("returns the parsed date when chrono-node succeeds", () => {
+    const parsed = new Date("2026-03-01T00:00:00.000Z");
+    mockParseDate.mockReturnValueOnce(parsed);
+    expect(parsePostDate("March 1, 2026")).toBe(parsed);
   });
 });
 

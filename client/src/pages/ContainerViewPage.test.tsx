@@ -30,6 +30,13 @@ const mockContainer = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The page auto-pings on mount for every successfully-loaded container.
+  // Without a default, the bare vi.fn() resolves to `undefined`, and the
+  // post-mount setPingResult(undefined) can land after a test tears down,
+  // crashing deriveStatusChipProps (reads .status on undefined) as a flaky
+  // unhandled error. A healthy default makes the auto-ping deterministic;
+  // tests that assert specific ping behavior override it below.
+  vi.mocked(pingManagedContainerHealth).mockResolvedValue({ status: "ok", name: mockContainer.name });
 });
 
 function renderPage(initialPath = "/containers/1") {
@@ -52,6 +59,12 @@ describe("ContainerViewPage", () => {
     await waitFor(() => {
       expect(screen.getByTestId("container-name").textContent).toBe("abc123def456");
       expect(screen.getByTestId("container-host-port").textContent).toBe("41123");
+    });
+
+    // Let the on-mount auto-ping settle within the test so its state update
+    // doesn't leak past teardown as an unhandled error.
+    await waitFor(() => {
+      expect(screen.getByTestId("ping-status")).toBeTruthy();
     });
   });
 

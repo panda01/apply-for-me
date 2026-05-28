@@ -22,6 +22,7 @@ const baseJob = {
   description: "Build cool stuff",
   company: null,
   location: null,
+  work_arrangement: null,
   salary: null,
   status: "applied" as const,
   live_url: null,

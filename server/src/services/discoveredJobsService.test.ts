@@ -54,6 +54,7 @@ vi.mock("./jobListingMatchService.js", async () => {
 });
 
 import prisma from "../prismaClient.js";
+import type { WorkArrangementValue } from "./inboxTypes.js";
 import {
   scanInbox,
   runScanWorkInline,
@@ -101,6 +102,7 @@ function buildExtractedJob(overrides: Partial<{
   company: string;
   jobUrl: string;
   location: string | null;
+  workArrangement: WorkArrangementValue | null;
   salary: string | null;
   description: string | null;
   confidence: number;
@@ -108,11 +110,17 @@ function buildExtractedJob(overrides: Partial<{
   // Use `in`-checks for nullable fields so an explicit `location: null`
   // override is honored (a plain `??` would coerce null back to the default).
   const resolvedLocation = "location" in overrides ? overrides.location : "Remote";
+  // workArrangement defaults to null (the "unknown" sentinel) so existing
+  // tests that don't care about it stay realistic; tests that exercise the
+  // promotion rules pass an explicit value or null override.
+  const resolvedWorkArrangement =
+    "workArrangement" in overrides ? overrides.workArrangement : null;
   return {
     title: overrides.title ?? "Senior Engineer",
     company: overrides.company ?? "Acme Corp",
     jobUrl: overrides.jobUrl ?? "https://example.com/job/1",
     location: resolvedLocation ?? null,
+    workArrangement: resolvedWorkArrangement ?? null,
     salary: overrides.salary ?? "$150k-$200k",
     description: overrides.description ?? "Job description",
     confidence: overrides.confidence ?? 0.9,
@@ -174,6 +182,7 @@ function buildDiscoveredJobRow(
     company: string;
     job_url: string;
     location: string | null;
+    work_arrangement: WorkArrangementValue | null;
     salary: string | null;
     description: string | null;
     status: "pending" | "imported" | "duplicate" | "dismissed";
@@ -194,6 +203,10 @@ function buildDiscoveredJobRow(
     company: "Acme Corp",
     job_url: "https://example.com/job/1",
     location: "Remote" as string | null,
+    // Structured Remote/On-Site/Hybrid classification; null = unknown. Mirrors
+    // the DiscoveredJob.work_arrangement column. Defaults to null so the merge
+    // promotion tests can opt in to a stored valid value explicitly.
+    work_arrangement: null as WorkArrangementValue | null,
     salary: "$150k-$200k" as string | null,
     description: "Job description" as string | null,
     status: "pending" as "pending" | "imported" | "duplicate" | "dismissed",
@@ -228,6 +241,7 @@ function buildJobListingRow(overrides: Partial<{
   title: string | null;
   company: string | null;
   url: string;
+  work_arrangement: WorkArrangementValue | null;
   status: "init" | "applying" | "applied" | "error_applying" | "closed" | "missing_form_url";
 }> = {}) {
   const baseRow = {
@@ -239,6 +253,9 @@ function buildJobListingRow(overrides: Partial<{
     description: null,
     salary: null,
     location: null,
+    // Structured Remote/On-Site/Hybrid classification; null = unknown. Mirrors
+    // the JobListing.work_arrangement column copied from a discovery on import.
+    work_arrangement: null as WorkArrangementValue | null,
     live_url: null,
     status: "init" as
       | "init"
@@ -596,6 +613,103 @@ describe("scanInbox", () => {
     const createCall = vi.mocked(prisma.discoveredJob.create).mock.calls[0]?.[0];
     expect(createCall?.data.location).toBe("New York");
   });
+
+  it("persists the extracted work_arrangement verbatim on a freshly-created row", async () => {
+    // The CREATE branch copies extractedJob.workArrangement straight onto the
+    // new DiscoveredJob — no normalization happens at this layer (the value is
+    // already a validated WorkArrangementValue by the time it reaches here).
+    getFirstConnIdMock.mockResolvedValue(1);
+    listMsgsMock.mockResolvedValue(["gmail-msg-1"]);
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary());
+    extractMock.mockResolvedValue({
+      extractor: "claude-haiku-4-5",
+      jobs: [buildExtractedJob({ workArrangement: "remote" })],
+    });
+    findExistingMatchMock.mockResolvedValue(null);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.discoveredJob.create).mockResolvedValue(
+      buildDiscoveredJobRow({ work_arrangement: "remote" })
+    );
+
+    await scanInbox({ days: 7 });
+
+    const createCall = vi.mocked(prisma.discoveredJob.create).mock.calls[0]?.[0];
+    expect(createCall?.data.work_arrangement).toBe("remote");
+  });
+
+  it("persists work_arrangement null when the extracted job has no usable signal", async () => {
+    getFirstConnIdMock.mockResolvedValue(1);
+    listMsgsMock.mockResolvedValue(["gmail-msg-1"]);
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary());
+    extractMock.mockResolvedValue({
+      extractor: "claude-haiku-4-5",
+      jobs: [buildExtractedJob({ workArrangement: null })],
+    });
+    findExistingMatchMock.mockResolvedValue(null);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
+    vi.mocked(prisma.discoveredJob.create).mockResolvedValue(buildDiscoveredJobRow());
+
+    await scanInbox({ days: 7 });
+
+    const createCall = vi.mocked(prisma.discoveredJob.create).mock.calls[0]?.[0];
+    expect(createCall?.data.work_arrangement).toBeNull();
+  });
+
+  it("within-email merge: new work_arrangement valid + existing null → promoted on the existing row", async () => {
+    // Same promotion rule as `location`, but applied independently:
+    // work_arrangement is NOT part of the dedup identity, so the merge target is
+    // chosen on (company, title, location) and the stored null arrangement is
+    // promoted to the freshly-extracted valid value.
+    getFirstConnIdMock.mockResolvedValue(1);
+    listMsgsMock.mockResolvedValue(["gmail-msg-1"]);
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary());
+    extractMock.mockResolvedValue({
+      extractor: "claude-haiku-4-5",
+      jobs: [buildExtractedJob({ workArrangement: "hybrid" })],
+    });
+    findExistingMatchMock.mockResolvedValue(null);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([
+      buildDiscoveredJobRow({ id: 21, status: "pending", work_arrangement: null }),
+    ]);
+    vi.mocked(prisma.discoveredJob.update).mockResolvedValue(
+      buildDiscoveredJobRow({ id: 21, work_arrangement: "hybrid" })
+    );
+
+    const result = await scanInbox({ days: 7 });
+
+    expect(result.newDiscoveries).toBe(0);
+    expect(prisma.discoveredJob.create).not.toHaveBeenCalled();
+    const updateCall = vi.mocked(prisma.discoveredJob.update).mock.calls[0]?.[0];
+    expect(updateCall?.where).toEqual({ id: 21 });
+    expect(updateCall?.data.work_arrangement).toBe("hybrid");
+  });
+
+  it("within-email merge: new work_arrangement null + existing valid → existing value preserved (no overwrite)", async () => {
+    // A re-scan that yields no work-arrangement signal must NOT clobber a
+    // previously-stored valid arrangement with null.
+    getFirstConnIdMock.mockResolvedValue(1);
+    listMsgsMock.mockResolvedValue(["gmail-msg-1"]);
+    fetchMsgMock.mockResolvedValue(buildGmailMessageSummary());
+    extractMock.mockResolvedValue({
+      extractor: "claude-haiku-4-5",
+      jobs: [buildExtractedJob({ workArrangement: null })],
+    });
+    findExistingMatchMock.mockResolvedValue(null);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([
+      buildDiscoveredJobRow({ id: 22, status: "pending", work_arrangement: "on_site" }),
+    ]);
+    vi.mocked(prisma.discoveredJob.update).mockResolvedValue(
+      buildDiscoveredJobRow({ id: 22, work_arrangement: "on_site" })
+    );
+
+    const result = await scanInbox({ days: 7 });
+
+    expect(result.newDiscoveries).toBe(0);
+    expect(prisma.discoveredJob.create).not.toHaveBeenCalled();
+    const updateCall = vi.mocked(prisma.discoveredJob.update).mock.calls[0]?.[0];
+    expect(updateCall?.where).toEqual({ id: 22 });
+    expect(updateCall?.data.work_arrangement).toBe("on_site");
+  });
 });
 
 describe("processSingleMessage — already-scanned guard", () => {
@@ -849,6 +963,37 @@ describe("listDiscoveries", () => {
     });
   });
 
+  it("emits workArrangement on the public projection, mirroring the row's work_arrangement column", async () => {
+    // mapDiscoveredJobRowToPublic projects row.work_arrangement straight onto
+    // the camelCase `workArrangement` wire field. Assert both a valid value and
+    // the null sentinel pass through faithfully.
+    const rowWithArrangement = {
+      ...buildDiscoveredJobRowWithMessage(
+        { id: 1, work_arrangement: "hybrid", gmail_message_id: 71 },
+        { id: 71, email_message_id: "msg-WA-1" }
+      ),
+      duplicate_of_job: null,
+      imported_job_listing: null,
+    };
+    const rowWithNullArrangement = {
+      ...buildDiscoveredJobRowWithMessage(
+        { id: 2, work_arrangement: null, gmail_message_id: 72 },
+        { id: 72, email_message_id: "msg-WA-2" }
+      ),
+      duplicate_of_job: null,
+      imported_job_listing: null,
+    };
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([
+      rowWithArrangement,
+      rowWithNullArrangement,
+    ] as unknown as never);
+
+    const result = await listDiscoveries({ days: 14 });
+
+    expect(result[0]?.workArrangement).toBe("hybrid");
+    expect(result[1]?.workArrangement).toBeNull();
+  });
+
   it("applies the status filter when provided", async () => {
     vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
 
@@ -943,6 +1088,49 @@ describe("importDiscoveries", () => {
       status: "imported",
       imported_job_listing_id: 500,
     });
+  });
+
+  it("copies the discovery's work_arrangement onto the newly-created JobListing", async () => {
+    // On import, the discovery's structured work_arrangement is promoted onto
+    // the new JobListing row so the Jobs page can render the badge without a
+    // re-scrape.
+    const pendingRow = buildDiscoveredJobRow({
+      id: 1,
+      status: "pending",
+      duplicate_of_job_id: null,
+      work_arrangement: "remote",
+    });
+    vi.mocked(prisma.discoveredJob.findUnique).mockResolvedValue(pendingRow);
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(
+      buildJobListingRow({ id: 600, work_arrangement: "remote" })
+    );
+    vi.mocked(prisma.discoveredJob.update).mockResolvedValue(pendingRow);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
+    wireTransactionPassthrough();
+
+    await importDiscoveries([1]);
+
+    const createCall = vi.mocked(prisma.jobListing.create).mock.calls[0]?.[0];
+    expect(createCall?.data.work_arrangement).toBe("remote");
+  });
+
+  it("copies a null work_arrangement onto the new JobListing when the discovery has no signal", async () => {
+    const pendingRow = buildDiscoveredJobRow({
+      id: 1,
+      status: "pending",
+      duplicate_of_job_id: null,
+      work_arrangement: null,
+    });
+    vi.mocked(prisma.discoveredJob.findUnique).mockResolvedValue(pendingRow);
+    vi.mocked(prisma.jobListing.create).mockResolvedValue(buildJobListingRow({ id: 601 }));
+    vi.mocked(prisma.discoveredJob.update).mockResolvedValue(pendingRow);
+    vi.mocked(prisma.discoveredJob.findMany).mockResolvedValue([]);
+    wireTransactionPassthrough();
+
+    await importDiscoveries([1]);
+
+    const createCall = vi.mocked(prisma.jobListing.create).mock.calls[0]?.[0];
+    expect(createCall?.data.work_arrangement).toBeNull();
   });
 
   it("flips sibling pending rows with matching (company, title) to duplicate_of_job_id", async () => {

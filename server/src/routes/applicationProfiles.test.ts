@@ -19,11 +19,17 @@ vi.mock("../prismaClient.js", () => {
 // Mock Prisma's namespace so the route's `err instanceof Prisma.PrismaClientKnownRequestError`
 // guard resolves to a real class shared with the mocked error instances thrown below.
 vi.mock("../../prisma/generated/client/client.js", () => {
+  // Mirrors the real Prisma client's KnownRequestError shape: the constructor
+  // now takes a params object ({ code, clientVersion }) rather than a bare code
+  // string, so `this.code` is read off the object to keep the route's
+  // `err.code === "P2002"` guard working at runtime.
   class PrismaClientKnownRequestError extends Error {
     public readonly code: string;
-    constructor(message: string, code: string) {
+    public readonly clientVersion: string;
+    constructor(message: string, params: { code: string; clientVersion: string }) {
       super(message);
-      this.code = code;
+      this.code = params.code;
+      this.clientVersion = params.clientVersion;
       this.name = "PrismaClientKnownRequestError";
     }
   }
@@ -225,7 +231,9 @@ describe("POST /api/application-profiles", () => {
 
   it("returns 409 when the name is already taken", async () => {
     vi.mocked(prisma.applicationProfile.create).mockRejectedValue(
-      new Prisma.PrismaClientKnownRequestError("Unique constraint failed", "P2002")
+      // The Prisma client's KnownRequestError constructor now takes a params
+      // object ({ code, clientVersion }) rather than a bare code string.
+      new Prisma.PrismaClientKnownRequestError("Unique constraint failed", { code: "P2002", clientVersion: "test" })
     );
 
     const response = await request(app)
@@ -314,7 +322,9 @@ describe("PUT /api/application-profiles/:id", () => {
   it("returns 409 when changing to a name that's already taken", async () => {
     vi.mocked(prisma.applicationProfile.findUnique).mockResolvedValue(sampleProfile);
     vi.mocked(prisma.applicationProfile.update).mockRejectedValue(
-      new Prisma.PrismaClientKnownRequestError("Unique constraint failed", "P2002")
+      // The Prisma client's KnownRequestError constructor now takes a params
+      // object ({ code, clientVersion }) rather than a bare code string.
+      new Prisma.PrismaClientKnownRequestError("Unique constraint failed", { code: "P2002", clientVersion: "test" })
     );
 
     const response = await request(app)

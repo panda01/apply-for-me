@@ -36,6 +36,9 @@ function buildJobListingRow(overrides: Partial<{
     description: null,
     salary: null,
     location: null,
+    // Structured Remote/On-Site/Hybrid classification; null = unknown. The
+    // matcher never reads it, but the Prisma JobListing row type requires it.
+    work_arrangement: null,
     live_url: null,
     status: "init" as const,
     post_date: null,

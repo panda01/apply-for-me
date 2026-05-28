@@ -91,7 +91,7 @@ describe("isSameJob", () => {
     expect(isSameJob({
       originalTitle: "Software Engineer",
       originalDescription: "x y z",
-      candidateTitle: "Senior Software Engineer",
+      candidateTitle: "Product Manager",
       candidateDescription: "x y z",
     })).toBe(false);
   });
@@ -161,11 +161,53 @@ describe("evaluateJobMatch", () => {
     const v = evaluateJobMatch({
       originalTitle: "Software Engineer",
       originalDescription: "x",
-      candidateTitle: "Senior Software Engineer",
+      candidateTitle: "Data Scientist",
       candidateDescription: "x",
     });
     expect(v.matched).toBe(false);
     expect(v.reason).toMatch(/title mismatch/);
+  });
+
+  it("returns matched=true when the candidate title is contained in the original title (containment)", () => {
+    const v = evaluateJobMatch({
+      originalTitle: "Full Stack Engineer - Senior",
+      originalDescription: "react node typescript backend",
+      candidateTitle: "Full Stack Engineer",
+      candidateDescription: "react node typescript backend",
+    });
+    expect(v.matched).toBe(true);
+  });
+
+  it("returns matched=true when the original title is contained in the candidate title (containment)", () => {
+    const v = evaluateJobMatch({
+      originalTitle: "Software Engineer",
+      originalDescription: "react node typescript backend",
+      candidateTitle: "Senior Software Engineer",
+      candidateDescription: "react node typescript backend",
+    });
+    expect(v.matched).toBe(true);
+  });
+
+  it("returns matched=false with 'title mismatch' reason when containment would break a word boundary", () => {
+    const v = evaluateJobMatch({
+      originalTitle: "Engineer",
+      originalDescription: "react node typescript backend",
+      candidateTitle: "Engineering Manager",
+      candidateDescription: "react node typescript backend",
+    });
+    expect(v.matched).toBe(false);
+    expect(v.reason).toMatch(/title mismatch/);
+  });
+
+  it("returns matched=true and skips the overlap check when the original description has no usable tokens", () => {
+    const v = evaluateJobMatch({
+      originalTitle: "Full Stack Engineer - Senior",
+      originalDescription: "",
+      candidateTitle: "Full Stack Engineer",
+      candidateDescription: "anything here",
+    });
+    expect(v.matched).toBe(true);
+    expect(v.reason).toMatch(/skip/i);
   });
 
   it("returns matched=false with the overlap percentage in the reason when descriptions diverge", () => {

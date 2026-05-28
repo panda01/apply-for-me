@@ -56,6 +56,7 @@ function buildDiscovery(overrides: Partial<DiscoveredJobResponse> = {}): Discove
     company: "Acme Co",
     jobUrl: "https://example.com/jobs/1",
     location: "Remote",
+    workArrangement: "remote",
     salary: "$160k–$200k",
     description: null,
     confidence: 0.92,
@@ -133,6 +134,57 @@ beforeEach(() => {
 });
 
 describe("InboxPage", () => {
+  it("renders a work-arrangement chip for a discovery and omits it when unknown", async () => {
+    // The chip label "Hybrid" can't collide with the location text below, so a
+    // single getByText cleanly proves the chip rendered for the hybrid row.
+    const hybridRow = buildDiscovery({
+      id: 1,
+      title: "Hybrid Job",
+      location: "Austin, TX",
+      workArrangement: "hybrid",
+    });
+    const unknownRow = buildDiscovery({
+      id: 2,
+      title: "Unknown Arrangement Job",
+      location: "Austin, TX",
+      workArrangement: null,
+      email: { ...buildDiscovery().email, messageId: "m-unknown" },
+    });
+    mockListDiscoveries.mockResolvedValue([hybridRow, unknownRow]);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Hybrid Job")).toBeDefined();
+    });
+    // The hybrid row shows a "Hybrid" chip…
+    expect(screen.getByText("Hybrid")).toBeDefined();
+    // …while the null-arrangement row renders no chip text at all. Neither row
+    // is remote, so "Remote"/"On-Site" chip labels never appear.
+    expect(screen.queryByText("Remote")).toBeNull();
+    expect(screen.queryByText("On-Site")).toBeNull();
+  });
+
+  it("renders a 'Remote' chip for a discovery whose workArrangement is remote", async () => {
+    // Use a non-"Remote" location so the only "Remote" text on screen is the chip.
+    const remoteRow = buildDiscovery({
+      id: 1,
+      title: "Remote Job",
+      location: "United States",
+      workArrangement: "remote",
+    });
+    mockListDiscoveries.mockResolvedValue([remoteRow]);
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Remote Job")).toBeDefined();
+    });
+    // The chip label "Remote" is the lone match because the location is
+    // "United States", not "Remote".
+    expect(screen.getByText("Remote")).toBeDefined();
+  });
+
   it("renders the empty state when no discoveries are returned", async () => {
     mockListDiscoveries.mockResolvedValue([]);
 

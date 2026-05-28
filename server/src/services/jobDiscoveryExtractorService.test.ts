@@ -63,6 +63,7 @@ describe("extractFromMessage", () => {
                 company: "Acme",
                 jobUrl: "https://acme.example.com/jobs/1",
                 location: "Remote",
+                workArrangement: "remote",
                 salary: null,
                 description: null,
                 confidence: 0.9,
@@ -72,6 +73,7 @@ describe("extractFromMessage", () => {
                 company: "Globex",
                 jobUrl: "https://globex.example.com/jobs/2",
                 location: null,
+                workArrangement: null,
                 salary: "$200k",
                 description: "Build distributed systems",
                 confidence: 0.85,
@@ -81,6 +83,7 @@ describe("extractFromMessage", () => {
                 company: "Initech",
                 jobUrl: "https://initech.example.com/jobs/3",
                 location: "NYC",
+                workArrangement: "on_site",
                 salary: null,
                 description: null,
                 confidence: 0.7,
@@ -117,6 +120,7 @@ describe("extractFromMessage", () => {
                 company: "Acme",
                 jobUrl: "https://acme.example.com/jobs/77",
                 location: "Remote",
+                workArrangement: "remote",
                 salary: null,
                 description: null,
                 confidence: 0.95,
@@ -134,6 +138,70 @@ describe("extractFromMessage", () => {
 
     expect(result.jobs).toHaveLength(1);
     expect(result.jobs[0]?.title).toBe("Frontend Engineer");
+  });
+
+  it("carries a valid workArrangement through to the parsed ExtractedJob", async () => {
+    // When Claude classifies the role as remote, the Zod-validated tool_use
+    // input passes the enum value straight onto the parsed ExtractedJob.
+    anthropicCreateMock.mockResolvedValue({
+      content: [
+        {
+          type: "tool_use",
+          name: "record_extracted_jobs",
+          input: {
+            jobs: [
+              {
+                title: "Backend Engineer",
+                company: "Acme",
+                jobUrl: "https://acme.example.com/jobs/88",
+                location: "Remote",
+                workArrangement: "remote",
+                salary: null,
+                description: null,
+                confidence: 0.92,
+              },
+            ],
+          },
+        },
+      ],
+      stop_reason: "tool_use",
+    });
+
+    const result = await extractFromMessage(buildMessageFixture());
+
+    expect(result.jobs).toHaveLength(1);
+    expect(result.jobs[0]?.workArrangement).toBe("remote");
+  });
+
+  it("carries a null workArrangement through when the email gives no usable signal", async () => {
+    anthropicCreateMock.mockResolvedValue({
+      content: [
+        {
+          type: "tool_use",
+          name: "record_extracted_jobs",
+          input: {
+            jobs: [
+              {
+                title: "Backend Engineer",
+                company: "Acme",
+                jobUrl: "https://acme.example.com/jobs/89",
+                location: null,
+                workArrangement: null,
+                salary: null,
+                description: null,
+                confidence: 0.6,
+              },
+            ],
+          },
+        },
+      ],
+      stop_reason: "tool_use",
+    });
+
+    const result = await extractFromMessage(buildMessageFixture());
+
+    expect(result.jobs).toHaveLength(1);
+    expect(result.jobs[0]?.workArrangement).toBeNull();
   });
 
   it("returns an empty jobs array when the email is not actually about openings", async () => {
@@ -215,6 +283,7 @@ describe("extractFromMessage", () => {
                 company: "Acme",
                 // jobUrl intentionally omitted
                 location: null,
+                workArrangement: null,
                 salary: null,
                 description: null,
                 confidence: 0.9,

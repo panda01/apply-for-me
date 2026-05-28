@@ -13,11 +13,38 @@ import {
   findFirstRunningContainer,
   scrapeJobViaContainer,
   extractLinksViaContainer,
+  normalizeWorkArrangement,
 } from "./smartProxyScraperService.js";
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("normalizeWorkArrangement", () => {
+  it("returns 'remote' for an exact lowercase match", () => {
+    expect(normalizeWorkArrangement("remote")).toBe("remote");
+  });
+
+  it("lowercases mixed-case input ('Remote' → 'remote')", () => {
+    expect(normalizeWorkArrangement("Remote")).toBe("remote");
+  });
+
+  it("trims and lowercases together ('  HYBRID  ' → 'hybrid')", () => {
+    expect(normalizeWorkArrangement("  HYBRID  ")).toBe("hybrid");
+  });
+
+  it("accepts the underscored on_site token verbatim", () => {
+    expect(normalizeWorkArrangement("on_site")).toBe("on_site");
+  });
+
+  it("returns null for the empty string (container found no signal)", () => {
+    expect(normalizeWorkArrangement("")).toBeNull();
+  });
+
+  it("returns null for an unrecognized free-text value ('anywhere' → null)", () => {
+    expect(normalizeWorkArrangement("anywhere")).toBeNull();
+  });
 });
 
 describe("findFirstRunningContainer", () => {
@@ -52,7 +79,11 @@ describe("scrapeJobViaContainer", () => {
     description: "Build cool things",
     salary: "$120k",
     post_date: "2026-03-01",
+    // Raw container value the host normalizes via normalizeWorkArrangement.
+    work_arrangement: "remote",
     apply_button_url: "https://acme.com/apply",
+    page_title: "Software Engineer at Acme | Careers",
+    location: "Remote",
   };
 
   it("POSTs to the container's /analyze endpoint and returns the parsed subset", async () => {
@@ -70,9 +101,12 @@ describe("scrapeJobViaContainer", () => {
       description: "Build cool things",
       salary: "$120k",
       post_date: "2026-03-01",
+      work_arrangement: "remote",
       apply_button_url: "https://acme.com/apply",
       is_job_description: true,
       reasoning: "ok",
+      page_title: "Software Engineer at Acme | Careers",
+      location: "Remote",
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:41010/analyze",
@@ -81,6 +115,61 @@ describe("scrapeJobViaContainer", () => {
         body: JSON.stringify({ url: "https://linkedin.com/jobs/1", useProxy: true }),
       })
     );
+  });
+
+  it("normalizes an unrecognized container work_arrangement to null on the mapped result", async () => {
+    // The scrape mapper runs the raw container value through
+    // normalizeWorkArrangement, so junk collapses to null rather than leaking
+    // an out-of-enum value to the nullable column.
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ ...fixtureResponse, work_arrangement: "somewhere-else" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await scrapeJobViaContainer(41010, "https://linkedin.com/jobs/2");
+
+    expect(result.work_arrangement).toBeNull();
+  });
+
+  it("normalizes a mixed-case container work_arrangement to the canonical enum value", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ ...fixtureResponse, work_arrangement: "  On_Site " }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await scrapeJobViaContainer(41010, "https://linkedin.com/jobs/3");
+
+    expect(result.work_arrangement).toBe("on_site");
+  });
+
+  it("defaults page_title to an empty string when an older container omits it", async () => {
+    const withoutPageTitle: Record<string, unknown> = { ...fixtureResponse };
+    delete withoutPageTitle.page_title;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(withoutPageTitle),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await scrapeJobViaContainer(41010, "https://linkedin.com/jobs/4");
+
+    expect(result.page_title).toBe("");
+  });
+
+  it("defaults location to an empty string when an older container omits it", async () => {
+    const body: Record<string, unknown> = { ...fixtureResponse };
+    delete body.location;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(body),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await scrapeJobViaContainer(41010, "https://linkedin.com/jobs/5");
+
+    expect(result.location).toBe("");
   });
 
   it("forwards a useProxy=false override when supplied", async () => {

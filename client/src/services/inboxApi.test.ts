@@ -30,6 +30,7 @@ function buildSampleDiscovery(overrides: Partial<DiscoveredJobResponse> = {}): D
     company: "Acme Co",
     jobUrl: "https://example.com/jobs/1",
     location: "Remote",
+    workArrangement: null,
     salary: "$160k–$200k",
     description: null,
     confidence: 0.92,

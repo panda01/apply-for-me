@@ -21,6 +21,7 @@ function buildListing(overrides: Partial<JobListingResponse> = {}): JobListingRe
     description: "Cool job",
     company: "Acme",
     location: null,
+    work_arrangement: null,
     salary: null,
     status: "init",
     live_url: null,

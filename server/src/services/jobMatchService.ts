@@ -5,12 +5,14 @@
  * the same role as the LinkedIn / Indeed posting we started from, before
  * adopting the company-site URL as the application_url.
  *
- * Decision strategy: exact title match (case-insensitive, normalized) AND a
- * minimum token-overlap ratio between descriptions. Both signals are cheap,
- * deterministic, and avoid an extra LLM round-trip. False positives skew toward
- * "different roles with the same generic title at the same company" — the
- * description overlap mitigates that since two different roles at one company
- * rarely share their bullet-point Responsibilities text.
+ * Decision strategy: title containment (case-insensitive, normalized — one
+ * title appears as a whole-word phrase inside the other) AND a minimum
+ * token-overlap ratio between descriptions. Both signals are cheap,
+ * deterministic, and avoid an extra LLM round-trip. Containment (rather than
+ * exact equality) lets a "Full Stack Engineer - Senior" listing match a company
+ * page titled just "Full Stack Engineer". The description overlap is the guard
+ * against over-matching, since two different roles at one company rarely share
+ * their bullet-point Responsibilities text.
  */
 
 /**
@@ -141,7 +143,16 @@ export function evaluateJobMatch(input: JobMatchInput): JobMatchVerdict {
     return { matched: false, reason: "candidate title is empty after normalization" };
   }
 
-  const isTitleMatch = normalizedOriginal === normalizedCandidate;
+  // Title containment ("in") rather than exact equality. Candidate pages often
+  // title a role slightly differently than the source listing — e.g. a
+  // "Full Stack Engineer - Senior" posting whose company careers page just says
+  // "Full Stack Engineer". We accept the pair when one normalized title appears
+  // as a whole-word phrase inside the other. Space-padding both sides enforces
+  // word boundaries so "engineer" doesn't spuriously match "engineering".
+  const paddedOriginal = ` ${normalizedOriginal} `;
+  const paddedCandidate = ` ${normalizedCandidate} `;
+  const isTitleMatch =
+    paddedCandidate.includes(paddedOriginal) || paddedOriginal.includes(paddedCandidate);
   if (!isTitleMatch) {
     return {
       matched: false,
@@ -151,6 +162,17 @@ export function evaluateJobMatch(input: JobMatchInput): JobMatchVerdict {
 
   const originalTokens = tokenizeDescription(input.originalDescription);
   const candidateTokens = tokenizeDescription(input.candidateDescription);
+  // When the original listing has no usable description — e.g. it came from a
+  // gated source like LinkedIn/Indeed that we couldn't scrape — there's nothing
+  // to compare against, so the overlap would always be 0% and reject every
+  // candidate. Fall back to the (already-passed) title match alone.
+  const hasOriginalDescriptionTokens = originalTokens.size > 0;
+  if (!hasOriginalDescriptionTokens) {
+    return {
+      matched: true,
+      reason: "title matched; original description unavailable, so the description-overlap check was skipped",
+    };
+  }
   const overlap = computeOverlapRatio(originalTokens, candidateTokens);
   const overlapPercent = Math.round(overlap * 100);
   const thresholdPercent = Math.round(MIN_DESCRIPTION_TOKEN_OVERLAP_RATIO * 100);

@@ -125,12 +125,12 @@ describe("tryGetHostname", () => {
 });
 
 describe("buildSearchQuery", () => {
-  it("joins company and title with a single space and trims", () => {
-    expect(buildSearchQuery(" Acme ", " Software Engineer ")).toBe("Acme Software Engineer");
+  it("joins title then company with a single space and trims", () => {
+    expect(buildSearchQuery(" Acme ", " Software Engineer ")).toBe("Software Engineer Acme");
   });
 
   it("collapses extra internal whitespace", () => {
-    expect(buildSearchQuery("Acme  Corp", "Senior   Engineer")).toBe("Acme Corp Senior Engineer");
+    expect(buildSearchQuery("Acme  Corp", "Senior   Engineer")).toBe("Senior Engineer Acme Corp");
   });
 });
 
@@ -210,9 +210,11 @@ describe("resolveApplicationUrl", () => {
       description: "",
       salary: null,
       post_date: null,
+      work_arrangement: null,
       apply_button_url: "https://acme.com/apply/123",
       is_job_description: true,
       reasoning: "",
+      page_title: "",
     });
 
     const result = await resolveApplicationUrl(baseInput);
@@ -232,9 +234,11 @@ describe("resolveApplicationUrl", () => {
         description: "Build cool things at Acme",
         salary: null,
         post_date: null,
+        work_arrangement: null,
         apply_button_url: null,
         is_job_description: true,
         reasoning: "",
+        page_title: "",
       });
     vi.mocked(searchWeb).mockResolvedValue([
       { title: "Acme careers", url: "https://acme.com/jobs/1", description: "" },
@@ -244,7 +248,7 @@ describe("resolveApplicationUrl", () => {
     const result = await resolveApplicationUrl(baseInput);
 
     expect(result.outcome).toEqual({ outcome: "resolved_via_search", applicationUrl: "https://acme.com/jobs/1" });
-    expect(searchWeb).toHaveBeenCalledWith("Acme Software Engineer");
+    expect(searchWeb).toHaveBeenCalledWith("Software Engineer Acme");
     // Trace records the apply-button URL as null because the re-scrape failed
     expect(result.trace.applyButtonUrlConsidered).toBeNull();
   });
@@ -287,9 +291,11 @@ describe("resolveApplicationUrl", () => {
       description: "Build cool things at Acme",
       salary: null,
       post_date: null,
+      work_arrangement: null,
       apply_button_url: null,
       is_job_description: true,
       reasoning: "",
+      page_title: "",
     });
     vi.mocked(evaluateJobMatch).mockReturnValue(matchedVerdict);
 
@@ -299,7 +305,7 @@ describe("resolveApplicationUrl", () => {
     });
 
     expect(result.outcome).toEqual({ outcome: "resolved_via_search", applicationUrl: "https://acme.com/jobs/123" });
-    expect(result.trace.searchQuery).toBe("Acme Software Engineer");
+    expect(result.trace.searchQuery).toBe("Software Engineer Acme");
     expect(result.trace.braveResults).toHaveLength(1);
     expect(result.trace.inspectedCandidates).toHaveLength(1);
     expect(result.trace.inspectedCandidates[0]).toMatchObject({
@@ -322,9 +328,11 @@ describe("resolveApplicationUrl", () => {
       description: "Build cool things at Acme",
       salary: null,
       post_date: null,
+      work_arrangement: null,
       apply_button_url: null,
       is_job_description: true,
       reasoning: "",
+      page_title: "",
     });
     vi.mocked(evaluateJobMatch).mockReturnValue(matchedVerdict);
 
@@ -356,9 +364,11 @@ describe("resolveApplicationUrl", () => {
         description: "Build cool things at Acme",
         salary: null,
         post_date: null,
+        work_arrangement: null,
         apply_button_url: null,
         is_job_description: true,
         reasoning: "",
+        page_title: "",
       });
     vi.mocked(evaluateJobMatch).mockReturnValue(matchedVerdict);
 
@@ -434,9 +444,11 @@ describe("resolveApplicationUrl", () => {
       description: "Different work",
       salary: null,
       post_date: null,
+      work_arrangement: null,
       apply_button_url: null,
       is_job_description: true,
       reasoning: "",
+      page_title: "",
     });
     vi.mocked(evaluateJobMatch).mockReturnValue({ matched: false, reason: "title mismatch (original=\"x\", candidate=\"y\")" });
 
@@ -464,9 +476,11 @@ describe("resolveApplicationUrl", () => {
       description: "Different",
       salary: null,
       post_date: null,
+      work_arrangement: null,
       apply_button_url: null,
       is_job_description: true,
       reasoning: "",
+      page_title: "",
     });
     vi.mocked(evaluateJobMatch).mockReturnValue(rejectedVerdict);
 
@@ -514,9 +528,11 @@ describe("resolveApplicationUrl", () => {
       description: "Build cool things at Acme",
       salary: null,
       post_date: null,
+      work_arrangement: null,
       apply_button_url: null,
       is_job_description: true,
       reasoning: "",
+      page_title: "",
     });
     vi.mocked(evaluateJobMatch).mockReturnValue(matchedVerdict);
 
@@ -569,9 +585,11 @@ describe("resolveApplicationUrl", () => {
       description: "Build cool things at Acme",
       salary: null,
       post_date: null,
+      work_arrangement: null,
       apply_button_url: null,
       is_job_description: true,
       reasoning: "",
+      page_title: "",
     });
     vi.mocked(evaluateJobMatch).mockReturnValue(matchedVerdict);
 
@@ -680,9 +698,11 @@ describe("resolveApplicationUrl with progressReporter", () => {
       description: "Build cool things at Acme",
       salary: null,
       post_date: null,
+      work_arrangement: null,
       apply_button_url: null,
       is_job_description: true,
       reasoning: "ok",
+      page_title: "",
     });
     vi.mocked(evaluateJobMatch).mockReturnValue({ matched: true, reason: "title matched" });
 
@@ -713,9 +733,11 @@ describe("resolveApplicationUrl with progressReporter", () => {
         description: "Build cool things at Acme",
         salary: null,
         post_date: null,
+        work_arrangement: null,
         apply_button_url: null,
         is_job_description: true,
         reasoning: "ok",
+        page_title: "",
       });
     vi.mocked(evaluateJobMatch).mockReturnValue({ matched: true, reason: "matched" });
 

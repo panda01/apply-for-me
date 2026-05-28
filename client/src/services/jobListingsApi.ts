@@ -2,6 +2,7 @@
  * Frontend API service for interacting with the job listings backend.
  */
 import { requestJson } from "./httpClient";
+import { type WorkArrangement } from "../components/WorkArrangementChip";
 
 export interface JobListingResponse {
   id: number;
@@ -16,6 +17,10 @@ export interface JobListingResponse {
   // Job location ("Remote", "United States", "San Francisco, CA", etc.) as
   // captured by the scraper or inbox extractor. Null when unknown.
   location: string | null;
+  // Structured work arrangement (Remote / On-Site / Hybrid) classified at
+  // scrape/inbox-discovery time. Serialized as a raw snake_case Prisma column.
+  // Null on rows where the arrangement couldn't be determined.
+  work_arrangement: WorkArrangement | null;
   salary: string | null;
   status: string;
   live_url: string | null;

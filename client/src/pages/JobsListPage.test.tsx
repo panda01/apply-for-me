@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 
 /**
@@ -25,10 +26,12 @@ vi.mock("../services/jobListingsApi", () => ({
   getJobListings: vi.fn(),
   deleteJobListing: vi.fn(),
   applyToJob: vi.fn(),
+  fetchJobData: vi.fn(),
 }));
 
 import JobsListPage from "./JobsListPage";
-import { getJobListings, applyToJob } from "../services/jobListingsApi";
+import { getJobListings, applyToJob, fetchJobData } from "../services/jobListingsApi";
+import { type WorkArrangement } from "../components/WorkArrangementChip";
 
 /**
  * Builds a single JobListingResponse-shaped row with sensible defaults so individual
@@ -45,6 +48,7 @@ function makeListing(overrides: Partial<{
   description: string;
   company: string | null;
   location: string | null;
+  work_arrangement: WorkArrangement | null;
   salary: string | null;
   post_date: string;
   created_date: string;
@@ -61,6 +65,7 @@ function makeListing(overrides: Partial<{
     description: "Build cool stuff",
     company: "Acme Corp",
     location: "Remote",
+    work_arrangement: null,
     salary: null,
     post_date: "2026-03-01T00:00:00.000Z",
     created_date: "2026-03-07T00:00:00.000Z",
@@ -134,6 +139,7 @@ describe("JobsListPage", () => {
         description: "Build cool stuff",
         company: null,
         location: null,
+        work_arrangement: null,
         salary: null,
         post_date: "2026-03-01T00:00:00.000Z",
         created_date: "2026-03-07T00:00:00.000Z",
@@ -149,6 +155,27 @@ describe("JobsListPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Acme Corp - Software Engineer")).toBeDefined();
     });
+  });
+
+  it("renders a 'Remote' work-arrangement chip in the location cell for a remote listing", async () => {
+    // Override the default "Remote" location to "United States" so the only
+    // "Remote" text on screen is the WorkArrangementChip in the location cell.
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 1,
+        title: "Remote Listing",
+        location: "United States",
+        work_arrangement: "remote",
+      }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Remote Listing")).toBeDefined();
+    });
+    // The chip label "Remote" renders alongside the "United States" location.
+    expect(screen.getByText("Remote")).toBeDefined();
   });
 
   it("should show loading indicator initially", () => {
@@ -201,6 +228,7 @@ describe("JobsListPage", () => {
       description: "",
       company: null,
       location: null,
+      work_arrangement: null,
       salary: null,
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
@@ -247,6 +275,7 @@ describe("JobsListPage", () => {
       description: "",
       company: null,
       location: null,
+      work_arrangement: null,
       salary: null,
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
@@ -300,6 +329,7 @@ describe("JobsListPage", () => {
       description: "Build stuff",
       company: null,
       location: null,
+      work_arrangement: null,
       salary: null,
       post_date: "2026-03-07T00:00:00.000Z",
       created_date: "2026-03-07T00:00:00.000Z",
@@ -473,8 +503,14 @@ describe("JobsListPage", () => {
 
   it("shows an action alert when Apply is clicked without a stored profile", async () => {
     window.localStorage.removeItem("afm:selectedApplicationProfileId");
+    // A resolved application_url renders the single ENABLED Apply button.
     vi.mocked(getJobListings).mockResolvedValue([
-      makeListing({ id: 1, status: "init", title: "Apply Target" }),
+      makeListing({
+        id: 1,
+        status: "init",
+        title: "Apply Target",
+        application_url: "https://boards.example.com/apply/1",
+      }),
     ]);
 
     renderJobsListPage();
@@ -494,8 +530,14 @@ describe("JobsListPage", () => {
   it("calls applyToJob and refreshes the list when a profile is stored", async () => {
     window.localStorage.setItem("afm:selectedApplicationProfileId", "5");
     vi.mocked(applyToJob).mockResolvedValue(makeListing({ id: 1, status: "applying" }));
+    // A resolved application_url renders the single ENABLED Apply button.
     vi.mocked(getJobListings).mockResolvedValue([
-      makeListing({ id: 1, status: "init", title: "Apply Target" }),
+      makeListing({
+        id: 1,
+        status: "init",
+        title: "Apply Target",
+        application_url: "https://boards.example.com/apply/1",
+      }),
     ]);
 
     renderJobsListPage();
@@ -518,8 +560,14 @@ describe("JobsListPage", () => {
   it("surfaces an Alert when applyToJob rejects", async () => {
     window.localStorage.setItem("afm:selectedApplicationProfileId", "5");
     vi.mocked(applyToJob).mockRejectedValue(new Error("boom"));
+    // A resolved application_url renders the single ENABLED Apply button.
     vi.mocked(getJobListings).mockResolvedValue([
-      makeListing({ id: 1, status: "init", title: "Apply Target" }),
+      makeListing({
+        id: 1,
+        status: "init",
+        title: "Apply Target",
+        application_url: "https://boards.example.com/apply/1",
+      }),
     ]);
 
     renderJobsListPage();
@@ -537,8 +585,14 @@ describe("JobsListPage", () => {
   it("shows generic error when applyToJob rejects with a non-Error", async () => {
     window.localStorage.setItem("afm:selectedApplicationProfileId", "5");
     vi.mocked(applyToJob).mockRejectedValue("nope");
+    // A resolved application_url renders the single ENABLED Apply button.
     vi.mocked(getJobListings).mockResolvedValue([
-      makeListing({ id: 1, status: "init", title: "Apply Target" }),
+      makeListing({
+        id: 1,
+        status: "init",
+        title: "Apply Target",
+        application_url: "https://boards.example.com/apply/1",
+      }),
     ]);
 
     renderJobsListPage();
@@ -551,6 +605,222 @@ describe("JobsListPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Failed to start application")).toBeDefined();
     });
+  });
+
+  it("renders an enabled Apply button and no Fetch Info button for an init row with an application_url", async () => {
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 11,
+        status: "init",
+        title: "Resolved Init",
+        application_url: "https://boards.example.com/apply/11",
+      }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Resolved Init")).toBeDefined();
+    });
+
+    const applyButton = screen.getByTestId("apply-button-11") as HTMLButtonElement;
+    expect(applyButton).toBeDefined();
+    expect(applyButton.disabled).toBe(false);
+    // No fetch-info affordance when the application_url is already resolved.
+    expect(screen.queryByTestId("fetch-info-button-11")).toBeNull();
+  });
+
+  it("renders a Fetch Info button and a disabled Apply button for an init row without an application_url", async () => {
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 12,
+        status: "init",
+        title: "Unresolved Init",
+        application_url: null,
+      }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Unresolved Init")).toBeDefined();
+    });
+
+    expect(screen.getByTestId("fetch-info-button-12")).toBeDefined();
+    const applyButton = screen.getByTestId("apply-button-12") as HTMLButtonElement;
+    expect(applyButton).toBeDefined();
+    expect(applyButton.disabled).toBe(true);
+  });
+
+  it("exposes the fetch-info hint on the disabled Apply button via the Tooltip", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 13,
+        status: "init",
+        title: "Tooltip Init",
+        application_url: null,
+      }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Tooltip Init")).toBeDefined();
+    });
+
+    // The disabled Apply button is wrapped in a <span> so MUI's Tooltip can still
+    // receive hover events. Hovering that wrapper surfaces the tooltip with the
+    // exact hint copy.
+    const disabledApply = screen.getByTestId("apply-button-13");
+    const tooltipWrapper = disabledApply.parentElement as HTMLElement;
+    await user.hover(tooltipWrapper);
+
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip.textContent).toBe(
+      "Fetch the job's info first to find the application form."
+    );
+  });
+
+  it("calls fetchJobData with the row id and shows the Fetching state when Fetch Info is clicked", async () => {
+    // Hold fetchJobData unresolved so the in-flight "Fetching…" state is observable.
+    let resolveFetch: (() => void) | undefined;
+    vi.mocked(fetchJobData).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = () => resolve(makeListing({ id: 14, status: "init" }));
+        })
+    );
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 14,
+        status: "init",
+        title: "Fetch Me",
+        application_url: null,
+      }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Fetch Me")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByTestId("fetch-info-button-14"));
+
+    await waitFor(() => {
+      expect(fetchJobData).toHaveBeenCalledWith(14);
+    });
+
+    // While in flight the button shows the "Fetching…" label, a spinner, and is disabled.
+    await waitFor(() => {
+      const fetchButton = screen.getByTestId("fetch-info-button-14") as HTMLButtonElement;
+      expect(fetchButton.textContent).toContain("Fetching…");
+      expect(fetchButton.disabled).toBe(true);
+    });
+    expect(screen.getByRole("progressbar")).toBeDefined();
+
+    // Resolve the fetch so the test exits cleanly without dangling timers.
+    await act(async () => {
+      resolveFetch?.();
+    });
+  });
+
+  it("surfaces an Alert with the rejection message when fetchJobData fails", async () => {
+    vi.mocked(fetchJobData).mockRejectedValue(new Error("scrape failed"));
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 15,
+        status: "init",
+        title: "Fetch Fail",
+        application_url: null,
+      }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Fetch Fail")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByTestId("fetch-info-button-15"));
+
+    await waitFor(() => {
+      expect(screen.getByText("scrape failed")).toBeDefined();
+    });
+  });
+
+  it("does not navigate to the job view when the disabled Apply wrapper is clicked", async () => {
+    // The disabled Apply button is wrapped in a <span> whose onClick stops
+    // propagation so a click on it never bubbles to the row's navigate handler.
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 17,
+        status: "init",
+        title: "No Nav Init",
+        application_url: null,
+      }),
+    ]);
+
+    render(
+      <MemoryRouter initialEntries={["/jobs"]}>
+        <Routes>
+          <Route path="/jobs" element={<JobsListPage />} />
+          <Route path="/jobs/:id" element={<div>Job View Page for 17</div>} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("No Nav Init")).toBeDefined();
+    });
+
+    const tooltipWrapper = screen.getByTestId("apply-button-17").parentElement as HTMLElement;
+    fireEvent.click(tooltipWrapper);
+
+    // Still on the list — the stopPropagation kept the row's navigate from firing.
+    expect(screen.queryByText("Job View Page for 17")).toBeNull();
+    expect(screen.getByText("No Nav Init")).toBeDefined();
+  });
+
+  it("prunes the fetching spinner and enables Apply once the refetched row gains an application_url", async () => {
+    // fetchJobData succeeds; the follow-up list refetch returns the same row now
+    // carrying an application_url, which the prune effect uses to drop the id from
+    // fetchingIds — stopping the spinner and switching the row to an enabled Apply.
+    vi.mocked(fetchJobData).mockResolvedValue(
+      makeListing({ id: 16, status: "init", application_url: "https://boards.example.com/apply/16" })
+    );
+    vi.mocked(getJobListings)
+      .mockResolvedValueOnce([
+        makeListing({ id: 16, status: "init", title: "Resolve Me", application_url: null }),
+      ])
+      .mockResolvedValue([
+        makeListing({
+          id: 16,
+          status: "init",
+          title: "Resolve Me",
+          application_url: "https://boards.example.com/apply/16",
+        }),
+      ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Resolve Me")).toBeDefined();
+    });
+    // Initially unresolved: Fetch Info present, Apply disabled.
+    expect(screen.getByTestId("fetch-info-button-16")).toBeDefined();
+    expect((screen.getByTestId("apply-button-16") as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByTestId("fetch-info-button-16"));
+
+    // After the fetch resolves and the list refetches with a URL, the prune effect
+    // removes the tracked id: the Fetch Info button disappears and Apply enables.
+    await waitFor(() => {
+      const applyButton = screen.getByTestId("apply-button-16") as HTMLButtonElement;
+      expect(applyButton.disabled).toBe(false);
+    });
+    expect(screen.queryByTestId("fetch-info-button-16")).toBeNull();
   });
 
   it("auto-applies to every selected init row in the bulk bar", async () => {
@@ -616,8 +886,14 @@ describe("JobsListPage", () => {
 
   it("dismisses the action-level Alert when its close button is clicked", async () => {
     window.localStorage.removeItem("afm:selectedApplicationProfileId");
+    // A resolved application_url renders the single ENABLED Apply button.
     vi.mocked(getJobListings).mockResolvedValue([
-      makeListing({ id: 1, status: "init", title: "Apply Target" }),
+      makeListing({
+        id: 1,
+        status: "init",
+        title: "Apply Target",
+        application_url: "https://boards.example.com/apply/1",
+      }),
     ]);
 
     renderJobsListPage();

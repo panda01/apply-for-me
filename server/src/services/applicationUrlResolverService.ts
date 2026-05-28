@@ -281,16 +281,18 @@ export function tryGetHostname(rawUrl: string): string | null {
 }
 
 /**
- * Builds the Brave Search query for a given job. Plain "company role" works
- * well in practice — adding "careers" or "apply" biases too aggressively and
- * misses pages that just describe the role.
+ * Builds the Brave Search query for a given job. Puts the job TITLE first, then
+ * the company — leading with the role matches the way job pages title
+ * themselves and ranks the actual posting above generic company pages. Plain
+ * "role company" works well in practice; adding "careers" or "apply" biases too
+ * aggressively and misses pages that just describe the role.
  *
  * @param {string} company - The hiring company's name
  * @param {string} title - The job title
- * @returns {string} The query string
+ * @returns {string} The query string ("{title} {company}")
  */
 export function buildSearchQuery(company: string, title: string): string {
-  return `${company.trim()} ${title.trim()}`.replace(/\s+/g, " ").trim();
+  return `${title.trim()} ${company.trim()}`.replace(/\s+/g, " ").trim();
 }
 
 /**

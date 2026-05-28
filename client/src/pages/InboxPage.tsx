@@ -31,6 +31,7 @@ import {
 } from "../services/inboxApi";
 import { listGmailConnections, type GmailConnectionResponse } from "../services/gmailApi";
 import DiscoveryStatusPill from "../components/DiscoveryStatusPill";
+import WorkArrangementChip from "../components/WorkArrangementChip";
 import SyncStepIndicator from "../components/SyncStepIndicator";
 import { useGmailSyncSession } from "../hooks/useGmailSyncSession";
 
@@ -212,6 +213,8 @@ function DiscoveredRow({
               <span>{item.location}</span>
             </>
           )}
+          {/* Chip self-returns null when the arrangement is unknown, so no guard needed. */}
+          <WorkArrangementChip value={item.workArrangement} />
           {item.salary !== null && (
             <>
               <span className="dotsep">·</span>

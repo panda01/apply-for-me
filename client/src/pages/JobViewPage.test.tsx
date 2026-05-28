@@ -57,6 +57,7 @@ const mockCompletedListing = {
   description: "Build cool stuff with great teams and cutting-edge technology.",
   company: "Acme Corp",
   location: null,
+  work_arrangement: null,
   salary: "$120k - $150k",
   status: "init",
   live_url: null,
@@ -74,6 +75,7 @@ const mockEmptyListing = {
   description: "",
   company: null,
   location: null,
+  work_arrangement: null,
   salary: null,
   status: "init",
   live_url: null,
@@ -91,6 +93,7 @@ const mockApplyingListing = {
   description: "",
   company: null,
   location: null,
+  work_arrangement: null,
   salary: null,
   status: "applying",
   live_url: null,
@@ -239,7 +242,7 @@ describe("JobViewPage", () => {
     expect(screen.getByTestId("fetch-data-button")).toBeDefined();
   });
 
-  it("should show Fetch Data and Auto-apply buttons for init status when application_url is set", async () => {
+  it("should show an enabled Auto-apply button and hide Fetch Info for init status when application_url is set", async () => {
     vi.mocked(getJobListing).mockResolvedValue({
       ...mockCompletedListing,
       title: "",
@@ -248,21 +251,47 @@ describe("JobViewPage", () => {
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
+      expect(screen.getByTestId("apply-button")).toBeDefined();
     });
-    expect(screen.getByTestId("apply-button")).toBeDefined();
+    // With a resolved application_url the Auto-apply button is the enabled,
+    // clickable variant (no disabled attribute, no Tooltip wrapper).
+    expect((screen.getByTestId("apply-button") as HTMLButtonElement).disabled).toBe(false);
+    // The Fetch Info button only renders while there's no application_url, so
+    // it must be absent here.
+    expect(screen.queryByTestId("fetch-data-button")).toBeNull();
   });
 
-  it("should hide the Auto-apply button when application_url is null even if status is init", async () => {
-    vi.mocked(getJobListing).mockResolvedValue(mockEmptyListing);
+  it("should render a disabled Auto-apply button with a hint when application_url is null for an init job with a title", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getJobListing).mockResolvedValue({
+      ...mockEmptyListing,
+      title: "Acme Corp - Software Engineer",
+    });
 
     renderJobViewPage();
 
     await waitFor(() => {
-      expect(screen.getByTestId("fetch-data-button")).toBeDefined();
+      expect(screen.getByTestId("apply-button")).toBeDefined();
     });
-    // Auto-apply button should not be present — the apply gate requires application_url.
-    expect(screen.queryByTestId("apply-button")).toBeNull();
+    // The apply gate requires a resolved application_url, so the button renders
+    // but is disabled rather than hidden.
+    const applyButton = screen.getByTestId("apply-button") as HTMLButtonElement;
+    expect(applyButton.disabled).toBe(true);
+
+    // The Fetch Info button is present and labeled "Fetch Info" (its testid is
+    // unchanged) since the job still has no application_url.
+    const fetchButton = screen.getByTestId("fetch-data-button");
+    expect(fetchButton.textContent).toContain("Fetch Info");
+
+    // Hovering the disabled button's Tooltip wrapper surfaces the hint that the
+    // job's info must be fetched first. MUI renders the disabled <button> inside
+    // a <span> wrapper that owns the hover, so hover that wrapper.
+    const tooltipWrapper = applyButton.parentElement as HTMLElement;
+    await user.hover(tooltipWrapper);
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip.textContent).toBe(
+      "Fetch the job's info first to find the application form."
+    );
   });
 
   it("should call fetchJobData when Fetch Data button is clicked", async () => {
@@ -570,6 +599,7 @@ describe("JobViewPage — application_url resolution UI", () => {
     description: "Build cool stuff",
     company: "Acme Corp",
     location: null,
+    work_arrangement: null,
     salary: null,
     status: "missing_form_url",
     live_url: null,
@@ -611,6 +641,7 @@ describe("JobViewPage — application_url resolution UI", () => {
       description: "Build cool stuff",
       company: "Acme Corp",
       location: null,
+      work_arrangement: null,
       salary: null,
       status: "init",
       live_url: null,
@@ -786,6 +817,7 @@ describe("JobViewPage — Manage panel + attempts list", () => {
     description: "Build cool stuff",
     company: "Acme Corp",
     location: null,
+    work_arrangement: null,
     salary: "$120k",
     status: "init",
     live_url: null,
@@ -869,7 +901,7 @@ describe("JobViewPage — Manage panel + attempts list", () => {
   it("navigates to /jobs after a successful delete", async () => {
     const user = userEvent.setup();
     vi.mocked(getJobListing).mockResolvedValue(baseListing);
-    vi.mocked(deleteJobListing).mockResolvedValue(undefined as unknown as void);
+    vi.mocked(deleteJobListing).mockResolvedValue(baseListing);
 
     renderPage();
 

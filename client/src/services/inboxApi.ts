@@ -6,6 +6,7 @@
  * predictable failure mode rather than 404.
  */
 import { requestJson } from "./httpClient";
+import { type WorkArrangement } from "../components/WorkArrangementChip";
 
 /**
  * String-literal mirror of the server's DiscoveredJobStatus enum.
@@ -50,6 +51,7 @@ export interface DiscoveredJobResponse {
   company: string;
   jobUrl: string;
   location: string | null;
+  workArrangement: WorkArrangement | null;
   salary: string | null;
   description: string | null;
   confidence: number;

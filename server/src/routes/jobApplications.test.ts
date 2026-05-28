@@ -68,6 +68,9 @@ const mockInitJobListing = {
   post_date: new Date("2026-03-07T00:00:00.000Z"),
   created_date: new Date("2026-03-07T00:00:00.000Z"),
   status: "init" as const,
+  // Nullable structured Remote/On-Site/Hybrid classification — null (unknown)
+  // here so the mock matches the real Prisma JobListing row shape.
+  work_arrangement: null,
 };
 
 const mockApplyingJobListing = {

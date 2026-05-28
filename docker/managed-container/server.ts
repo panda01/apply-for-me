@@ -3,7 +3,7 @@ import { chromium, Browser, BrowserContext, BrowserContextOptions } from "patchr
 import { promises as fs } from "node:fs";
 import { join as joinPath } from "node:path";
 import { createHash } from "node:crypto";
-import { runAnalyzeAgent } from "./agent.js";
+import { analyzeUrl } from "./agent.js";
 import { captureCleanedScreenshot } from "./popup.js";
 import { getSmartproxyConfig } from "./smartproxy.js";
 import {
@@ -227,17 +227,19 @@ app.post("/screenshot", async (req: Request, res: Response) => {
 
 /**
  * POST /analyze
- * Runs the Claude tool-calling agent against the supplied URL to determine
- * whether it is a job description page. The agent dismisses popups, summarizes
- * the page, optionally clicks elements, takes a screenshot, then reports.
- * By default the agent's page is loaded through WireGuard; when `useProxy` is
- * true, the per-request browser context is routed through Smartproxy
- * residential exits — necessary for Cloudflare-protected sites like Indeed.
+ * Opens the supplied URL and decides — using deterministic heuristics, not an
+ * LLM agent loop — whether it is a job-description page, then extracts the
+ * structured job fields with a single Claude Haiku call (only when the page
+ * passes the heuristic gate). Dismisses popups, summarizes the page, optionally
+ * expands collapsed sections, and takes a screenshot.
+ * By default the page is loaded through WireGuard; when `useProxy` is true, the
+ * per-request browser context is routed through Smartproxy residential exits —
+ * necessary for Cloudflare-protected sites like Indeed.
  * @param {string} req.body.url - The URL to analyze
- * @param {boolean} [req.body.useProxy] - When true, route the agent's page through Smartproxy
- * @returns {object} 200 - { is_job_description, apply_button_present, description_signals, reasoning, screenshot_b64, title, company, description, salary, post_date, apply_button_url }
+ * @param {boolean} [req.body.useProxy] - When true, route the page through Smartproxy
+ * @returns {object} 200 - { is_job_description, apply_button_present, description_signals, reasoning, screenshot_b64, title, company, description, salary, post_date, work_arrangement, location, apply_button_url, page_title }
  * @returns {object} 400 - Missing or invalid URL
- * @returns {object} 500 - Agent loop or upstream Claude error (incl. missing proxy creds when useProxy=true)
+ * @returns {object} 500 - Navigation/capture error (incl. missing proxy creds when useProxy=true)
  */
 app.post("/analyze", async (req: Request, res: Response) => {
   const body = req.body as { url?: unknown; useProxy?: unknown } | undefined;
@@ -256,7 +258,7 @@ app.post("/analyze", async (req: Request, res: Response) => {
     const browser = await getBrowser();
     context = await browser.newContext(buildContextOptions(useProxy));
     page = await context.newPage();
-    const result = await runAnalyzeAgent(page, targetUrl);
+    const result = await analyzeUrl(page, targetUrl);
     const analyzePngBuffer = Buffer.from(result.screenshot_b64, "base64");
     const savedAnalyzePath = await persistScreenshot(targetUrl, analyzePngBuffer);
     if (savedAnalyzePath !== null) {
@@ -265,7 +267,7 @@ app.post("/analyze", async (req: Request, res: Response) => {
     res.json(result);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    console.error(`[analyze] Agent failed for ${targetUrl} (useProxy=${String(useProxy)}): ${errorMessage}`);
+    console.error(`[analyze] Analysis failed for ${targetUrl} (useProxy=${String(useProxy)}): ${errorMessage}`);
     res.status(500).json({ error: `Analyze failed: ${errorMessage}` });
   } finally {
     if (page !== undefined) {

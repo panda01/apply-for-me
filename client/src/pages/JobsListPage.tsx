@@ -14,16 +14,22 @@ import {
   TableHead,
   TableRow,
   TextField,
+  Tooltip,
 } from "@mui/material";
 import Search from "@mui/icons-material/Search";
 import {
   applyToJob,
+  fetchJobData,
   getJobListings,
   type JobListingResponse,
 } from "../services/jobListingsApi";
 import StatusPill from "../components/StatusPill";
+import WorkArrangementChip from "../components/WorkArrangementChip";
 import { KNOWN_STATUSES, getStatusMeta } from "../lib/jobStatus";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
+
+/** Hint shown on the disabled Apply button when a job has no resolved application_url yet. */
+const FETCH_INFO_HINT = "Fetch the job's info first to find the application form.";
 
 /**
  * Tries to extract the hostname portion of a URL string for display.
@@ -58,6 +64,7 @@ function JobsListPage() {
   const [actionErrorMessage, setActionErrorMessage] = useState("");
   const [activeTab, setActiveTab] = useState<string>("all");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [fetchingIds, setFetchingIds] = useState<Set<number>>(new Set());
 
   // Search input is initialised from the URL `?q=` param so deep links and
   // back-navigation restore the previous search context.
@@ -118,8 +125,12 @@ function JobsListPage() {
 
   useEffect(() => {
     const hasApplyingListings = jobListings.some((listing) => listing.status === "applying");
+    // Also keep polling while a background "Fetch Info" is in flight so the row
+    // refreshes (status / application_url) as soon as the scrape resolves.
+    const hasInFlightFetches = fetchingIds.size > 0;
+    const shouldPoll = hasApplyingListings || hasInFlightFetches;
 
-    if (hasApplyingListings) {
+    if (shouldPoll) {
       const hasNoExistingPoll = !pollIntervalRef.current;
       if (hasNoExistingPoll) {
         pollIntervalRef.current = setInterval(fetchListings, 5000);
@@ -137,7 +148,27 @@ function JobsListPage() {
         pollIntervalRef.current = null;
       }
     };
-  }, [jobListings, fetchListings]);
+  }, [jobListings, fetchListings, fetchingIds]);
+
+  /**
+   * Prunes the {@link fetchingIds} spinner-tracking set whenever the listings
+   * change. Once a background fetch resolves the row (status moves off "init",
+   * an application_url appears, or the row disappears entirely) we drop its id,
+   * which stops its "Fetching…" spinner and enables the Apply button.
+   */
+  useEffect(() => {
+    setFetchingIds((previous) => {
+      if (previous.size === 0) return previous;
+      const next = new Set(previous);
+      for (const trackedId of previous) {
+        const listing = jobListings.find((row) => row.id === trackedId);
+        const rowResolvedOrGone =
+          listing === undefined || listing.status !== "init" || !!listing.application_url;
+        if (rowResolvedOrGone) next.delete(trackedId);
+      }
+      return next.size === previous.size ? previous : next;
+    });
+  }, [jobListings]);
 
   /**
    * Memoized per-status counts used to populate tab badges and the page-sub
@@ -260,6 +291,31 @@ function JobsListPage() {
     } catch (err) {
       const errorText = err instanceof Error ? err.message : "Failed to start application";
       setActionErrorMessage(errorText);
+    }
+  };
+
+  /**
+   * Triggers the scrape + application-URL resolution flow for a single listing
+   * via {@link fetchJobData}. This populates the row's `application_url` (and may
+   * spawn a managed container), after which Apply becomes available. Tracks the
+   * id in {@link fetchingIds} to show a per-row spinner; on success the id is
+   * left in place and the prune effect removes it once the row resolves, while
+   * on failure it is removed immediately and the error is surfaced.
+   * @param {number} jobId - The job listing id to fetch info for.
+   */
+  const handleFetchInfo = async (jobId: number) => {
+    setActionErrorMessage("");
+    setFetchingIds((prev) => new Set(prev).add(jobId));
+    try {
+      await fetchJobData(jobId);
+      await fetchListings();
+    } catch (err) {
+      setActionErrorMessage(err instanceof Error ? err.message : "Failed to fetch job info");
+      setFetchingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(jobId);
+        return next;
+      });
     }
   };
 
@@ -492,6 +548,8 @@ function JobsListPage() {
                   ? listing.location
                   : "—";
                 const addedDateText = new Date(listing.created_date).toLocaleDateString();
+                const rowHasApplicationUrl = listing.application_url !== null && listing.application_url !== "";
+                const isRowFetchingInfo = fetchingIds.has(listing.id);
 
                 return (
                   <TableRow
@@ -517,7 +575,12 @@ function JobsListPage() {
                     <TableCell>
                       <StatusPill status={listing.status} />
                     </TableCell>
-                    <TableCell className="col-co">{locationText}</TableCell>
+                    <TableCell className="col-co">
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+                        <span>{locationText}</span>
+                        <WorkArrangementChip value={listing.work_arrangement} />
+                      </Box>
+                    </TableCell>
                     <TableCell className="mono">{listing.salary ?? "—"}</TableCell>
                     <TableCell
                       sx={{
@@ -539,13 +602,41 @@ function JobsListPage() {
                     <TableCell className="mono">{addedDateText}</TableCell>
                     <TableCell sx={{ textAlign: "right", pr: 2 }}>
                       {listing.status === "init" ? (
-                        <Button
-                          size="small"
-                          variant="contained"
-                          onClick={() => handleApplyOne(listing.id)}
-                        >
-                          Apply
-                        </Button>
+                        rowHasApplicationUrl ? (
+                          <Button
+                            size="small"
+                            variant="contained"
+                            onClick={() => handleApplyOne(listing.id)}
+                            data-testid={`apply-button-${String(listing.id)}`}
+                          >
+                            Apply
+                          </Button>
+                        ) : (
+                          <Box sx={{ display: "inline-flex", gap: 1, justifyContent: "flex-end" }}>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              onClick={() => handleFetchInfo(listing.id)}
+                              disabled={isRowFetchingInfo}
+                              startIcon={isRowFetchingInfo ? <CircularProgress size={14} /> : undefined}
+                              data-testid={`fetch-info-button-${String(listing.id)}`}
+                            >
+                              {isRowFetchingInfo ? "Fetching…" : "Fetch Info"}
+                            </Button>
+                            <Tooltip title={FETCH_INFO_HINT}>
+                              <span onClick={(event) => event.stopPropagation()}>
+                                <Button
+                                  size="small"
+                                  variant="contained"
+                                  disabled
+                                  data-testid={`apply-button-${String(listing.id)}`}
+                                >
+                                  Apply
+                                </Button>
+                              </span>
+                            </Tooltip>
+                          </Box>
+                        )
                       ) : (
                         <Button
                           size="small"
