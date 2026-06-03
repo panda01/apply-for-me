@@ -77,28 +77,31 @@ function ApplicationProfileEditPage() {
   }, [profileId, loadProfile]);
 
   /**
-   * Submits the form. In CREATE mode it POSTs and navigates back to the
-   * list. In EDIT mode it PUTs, then leaves the user on the page with a
-   * "Saved" indicator so they can see the green-check confirmation
-   * without losing context.
+   * Submits the form and returns the saved profile so the form can upload any
+   * staged resume / cover-letter files against the new/updated id. In both
+   * CREATE and EDIT mode the user is left on the page with a "Saved" indicator
+   * — we intentionally do NOT navigate away here, because the form awaits its
+   * file uploads after this promise resolves and navigating would unmount the
+   * form mid-upload. After a create, the freshly returned record becomes the
+   * page's initialValues, transitioning the page into edit mode.
    * @param {ApplicationProfileInput} input - The validated form payload
-   * @returns {Promise<void>}
+   * @returns {Promise<ApplicationProfileResponse>} The created or updated profile
+   * @throws {Error} If the save fails (surfaced to the form via submitError)
    */
-  const handleSubmit = async (input: ApplicationProfileInput): Promise<void> => {
+  const handleSubmit = async (input: ApplicationProfileInput): Promise<ApplicationProfileResponse> => {
     setIsSaving(true);
     setSubmitError("");
     try {
-      if (isEditMode && profileId !== null) {
-        const updated = await updateApplicationProfile(profileId, input);
-        setInitialValues(updated);
-        setSaveStatus("Saved just now");
-      } else {
-        await createApplicationProfile(input);
-        navigate("/profiles");
-      }
+      const saved = isEditMode && profileId !== null
+        ? await updateApplicationProfile(profileId, input)
+        : await createApplicationProfile(input);
+      setInitialValues(saved);
+      setSaveStatus("Saved just now");
+      return saved;
     } catch (err) {
       const errorText = err instanceof Error ? err.message : "Failed to save application profile";
       setSubmitError(errorText);
+      throw err instanceof Error ? err : new Error(errorText);
     } finally {
       setIsSaving(false);
     }

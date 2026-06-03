@@ -938,8 +938,16 @@ export function buildJobListingsWhereClause(
  * Array-valued `req.query.q` (e.g. `?q=a&q=b`) is coerced to undefined; only
  * a single string value is honored.
  *
+ * Each row is augmented with `resolution_in_progress` (true when the latest
+ * ApplicationUrlResolutionLog for that listing has a null outcome) and
+ * `latest_resolution_log_id`, mirroring the single-GET shape so the Jobs list
+ * page can drive its per-row "Fetch Info" spinner and detect when a background
+ * resolution attempt has finished. The augmentation costs one extra query for
+ * the whole page (logs are fetched in a single `findMany` and reduced to the
+ * latest per listing) rather than one query per row.
+ *
  * @param {string} [req.query.q] - Optional substring to filter by; matched against title, description, url, and application_url.
- * @returns {object[]} 200 - Array of matching job listings, ordered by created_date desc.
+ * @returns {object[]} 200 - Array of matching job listings (each with `resolution_in_progress` + `latest_resolution_log_id`), ordered by created_date desc.
  */
 router.get("/", async (req: Request, res: Response) => {
   const rawSearchQuery = req.query.q;
@@ -952,7 +960,33 @@ router.get("/", async (req: Request, res: Response) => {
     ...(hasWhereClause ? { where: whereClause } : {}),
   });
 
-  res.json(jobListings);
+  const listingIds = jobListings.map((row) => row.id);
+  const resolutionLogs = listingIds.length === 0
+    ? []
+    : await prisma.applicationUrlResolutionLog.findMany({
+        where: { job_listing_id: { in: listingIds } },
+        orderBy: { created_date: "desc" },
+        select: { id: true, job_listing_id: true, outcome: true },
+      });
+  // The logs come back newest-first, so the first one seen per listing is its
+  // latest attempt.
+  const latestLogByListingId = new Map<number, { id: number; outcome: string | null }>();
+  for (const log of resolutionLogs) {
+    if (!latestLogByListingId.has(log.job_listing_id)) {
+      latestLogByListingId.set(log.job_listing_id, { id: log.id, outcome: log.outcome });
+    }
+  }
+
+  const augmentedListings = jobListings.map((row) => {
+    const latestLog = latestLogByListingId.get(row.id) ?? null;
+    return {
+      ...row,
+      resolution_in_progress: latestLog !== null && latestLog.outcome === null,
+      latest_resolution_log_id: latestLog?.id ?? null,
+    };
+  });
+
+  res.json(augmentedListings);
 });
 
 /**

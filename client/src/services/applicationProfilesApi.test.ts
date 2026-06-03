@@ -5,6 +5,10 @@ import {
   createApplicationProfile,
   updateApplicationProfile,
   deleteApplicationProfile,
+  extractFromResume,
+  uploadProfileFile,
+  deleteProfileFile,
+  getProfileFileUrl,
   WORK_AUTHORIZATION_LABELS,
 } from "./applicationProfilesApi";
 
@@ -19,8 +23,10 @@ const mockProfile = {
   github: "https://github.com/panda01",
   linkedin: null,
   website: null,
-  resumeUrl: null,
-  coverLetterUrl: null,
+  resumeStorageKey: null,
+  resumeFileName: null,
+  coverLetterStorageKey: null,
+  coverLetterFileName: null,
   workAuthorization: null,
   desiredSalaryMin: null,
   created_date: "2026-05-21T00:00:00.000Z",
@@ -152,6 +158,142 @@ describe("deleteApplicationProfile", () => {
     const result = await deleteApplicationProfile(1);
     expect(result.id).toBe(1);
     expect(fetch).toHaveBeenCalledWith("/api/application-profiles/1", { method: "DELETE" });
+  });
+});
+
+describe("extractFromResume", () => {
+  it("POSTs the file as FormData (no Content-Type header) and returns response.fields", async () => {
+    const extractedFields = {
+      firstName: "Khalah",
+      middleName: null,
+      lastName: "Jones-Golden",
+      email: "khasan222@gmail.com",
+      phone: "13479770736",
+      github: "https://github.com/panda01",
+      linkedin: null,
+      website: null,
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ fields: extractedFields }),
+    }));
+
+    const file = new File(["resume bytes"], "resume.pdf", { type: "application/pdf" });
+    const result = await extractFromResume(file);
+
+    expect(result).toEqual(extractedFields);
+
+    const [url, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/application-profiles/extract-resume");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeInstanceOf(FormData);
+    expect((init.body as FormData).get("file")).toBe(file);
+    // The browser must set the multipart boundary itself, so no Content-Type.
+    expect(init.headers).toBeUndefined();
+  });
+
+  it("throws the server error message on a non-ok response", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "Could not parse resume" }),
+    }));
+
+    const file = new File(["x"], "resume.pdf", { type: "application/pdf" });
+    await expect(extractFromResume(file)).rejects.toThrow("Could not parse resume");
+  });
+
+  it("falls back to the default message when the error body has none", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({}),
+    }));
+
+    const file = new File(["x"], "resume.pdf", { type: "application/pdf" });
+    await expect(extractFromResume(file)).rejects.toThrow("Failed to import data from resume");
+  });
+});
+
+describe("uploadProfileFile", () => {
+  it("POSTs FormData with the file and kind, and returns the updated profile", async () => {
+    const updated = { ...mockProfile, resumeStorageKey: "key-1", resumeFileName: "resume.pdf" };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(updated),
+    }));
+
+    const file = new File(["resume bytes"], "resume.pdf", { type: "application/pdf" });
+    const result = await uploadProfileFile(1, "resume", file);
+
+    expect(result).toEqual(updated);
+
+    const [url, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/application-profiles/1/files");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeInstanceOf(FormData);
+    const body = init.body as FormData;
+    expect(body.get("file")).toBe(file);
+    expect(body.get("kind")).toBe("resume");
+    expect(init.headers).toBeUndefined();
+  });
+
+  it("throws the server error message on a non-ok response", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "File too large" }),
+    }));
+
+    const file = new File(["x"], "resume.pdf", { type: "application/pdf" });
+    await expect(uploadProfileFile(1, "resume", file)).rejects.toThrow("File too large");
+  });
+});
+
+describe("deleteProfileFile", () => {
+  it("DELETEs the kind-specific files URL and returns the updated profile", async () => {
+    const updated = { ...mockProfile, coverLetterStorageKey: null, coverLetterFileName: null };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(updated),
+    }));
+
+    const result = await deleteProfileFile(1, "coverLetter");
+
+    expect(result).toEqual(updated);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/application-profiles/1/files/coverLetter",
+      { method: "DELETE" }
+    );
+  });
+
+  it("throws the server error message on a non-ok response", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "Nothing to remove" }),
+    }));
+
+    await expect(deleteProfileFile(1, "coverLetter")).rejects.toThrow("Nothing to remove");
+  });
+});
+
+describe("getProfileFileUrl", () => {
+  it("GETs the kind-specific files URL and returns response.url", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ url: "https://storage.example.com/signed/resume.pdf" }),
+    }));
+
+    const result = await getProfileFileUrl(1, "resume");
+
+    expect(result).toBe("https://storage.example.com/signed/resume.pdf");
+    expect(fetch).toHaveBeenCalledWith("/api/application-profiles/1/files/resume");
+  });
+
+  it("throws the server error message on a non-ok response", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      json: () => Promise.resolve({ error: "File not found" }),
+    }));
+
+    await expect(getProfileFileUrl(1, "resume")).rejects.toThrow("File not found");
   });
 });
 

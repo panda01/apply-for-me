@@ -179,6 +179,10 @@ beforeEach(() => {
   vi.mocked(prisma.applicationUrlResolutionLog.create).mockResolvedValue({ id: 100 } as never);
   vi.mocked(prisma.applicationUrlResolutionLog.update).mockResolvedValue({ id: 100 } as never);
   vi.mocked(prisma.applicationUrlResolutionLog.findFirst).mockResolvedValue(null);
+  // The GET /api/job-listings list route now reduces these logs into per-row
+  // resolution_in_progress / latest_resolution_log_id fields. Default to an
+  // empty set so listing rows come back un-augmented unless a test opts in.
+  vi.mocked(prisma.applicationUrlResolutionLog.findMany).mockResolvedValue([]);
   vi.mocked(prisma.managedContainer.findUnique).mockResolvedValue(null);
   // Stub global fetch so the container `/begin` push is a no-op in tests.
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
@@ -1005,6 +1009,61 @@ describe("GET /api/job-listings", () => {
     expect(prisma.jobListing.findMany).toHaveBeenCalledWith({
       orderBy: { created_date: "desc" },
     });
+  });
+
+  it("augments each row with resolution_in_progress=true + the latest log id when its newest log has a null outcome", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
+    vi.mocked(prisma.applicationUrlResolutionLog.findMany).mockResolvedValue([
+      { id: 5, job_listing_id: 1, outcome: null },
+    ] as never);
+
+    const response = await request(app).get("/api/job-listings");
+
+    expect(response.status).toBe(200);
+    expect(response.body[0].resolution_in_progress).toBe(true);
+    expect(response.body[0].latest_resolution_log_id).toBe(5);
+    // The logs are fetched for every listing in one query, newest-first.
+    expect(prisma.applicationUrlResolutionLog.findMany).toHaveBeenCalledWith({
+      where: { job_listing_id: { in: [1] } },
+      orderBy: { created_date: "desc" },
+      select: { id: true, job_listing_id: true, outcome: true },
+    });
+  });
+
+  it("marks resolution_in_progress=false and uses the newest log when the latest attempt has a terminal outcome", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
+    // Newest-first: id 9 is the latest attempt (terminal), id 8 is older.
+    vi.mocked(prisma.applicationUrlResolutionLog.findMany).mockResolvedValue([
+      { id: 9, job_listing_id: 1, outcome: "not_found" },
+      { id: 8, job_listing_id: 1, outcome: "direct" },
+    ] as never);
+
+    const response = await request(app).get("/api/job-listings");
+
+    expect(response.status).toBe(200);
+    expect(response.body[0].resolution_in_progress).toBe(false);
+    expect(response.body[0].latest_resolution_log_id).toBe(9);
+  });
+
+  it("defaults resolution_in_progress=false + latest_resolution_log_id=null for a row with no resolution logs", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([mockCompletedJobListing]);
+    vi.mocked(prisma.applicationUrlResolutionLog.findMany).mockResolvedValue([]);
+
+    const response = await request(app).get("/api/job-listings");
+
+    expect(response.status).toBe(200);
+    expect(response.body[0].resolution_in_progress).toBe(false);
+    expect(response.body[0].latest_resolution_log_id).toBe(null);
+  });
+
+  it("skips the resolution-log query entirely when there are no listings", async () => {
+    vi.mocked(prisma.jobListing.findMany).mockResolvedValue([]);
+
+    const response = await request(app).get("/api/job-listings");
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([]);
+    expect(prisma.applicationUrlResolutionLog.findMany).not.toHaveBeenCalled();
   });
 });
 

@@ -55,8 +55,15 @@ model ApplicationProfile {
   github              String?
   linkedin            String?
   website             String?
-  resumeUrl           String?
-  coverLetterUrl      String? // Link to a hosted cover letter (Google Doc / PDF). Agent can open it for cover-letter prompts.
+  // Resume / cover-letter PDFs are uploaded and stored in Google Cloud Storage
+  // (bucket apply-for-me-storage, under the resume/ and cover-letters/ prefixes).
+  // We persist the GCS object key (e.g. "resume/<id>-<uuid>.pdf") plus the
+  // original filename for display/download. A time-limited V4 signed read URL is
+  // generated on demand (apply prompt, download endpoint) — never stored.
+  resumeStorageKey      String?
+  resumeFileName        String?
+  coverLetterStorageKey String?
+  coverLetterFileName   String?
   workAuthorization   WorkAuthorization?
   desiredSalaryMin    Int? // USD, whole dollars; minimum acceptable salary, no max field by design.
   created_date        DateTime           @default(now())

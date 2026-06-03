@@ -213,10 +213,10 @@ function ProfileRow({ profile, onEdit, onDelete, isDeleting }: ProfileRowProps) 
   const minSalaryLabel = profile.desiredSalaryMin === null
     ? "Min salary —"
     : `Min $${String(profile.desiredSalaryMin)}`;
-  const resumeLabel = profile.resumeUrl === null || profile.resumeUrl === ""
+  const resumeLabel = profile.resumeStorageKey === null
     ? <span style={{ color: "var(--text-faint)" }}>No resume</span>
     : <span>Resume</span>;
-  const coverLetterLabel = profile.coverLetterUrl === null || profile.coverLetterUrl === ""
+  const coverLetterLabel = profile.coverLetterStorageKey === null
     ? <span style={{ color: "var(--text-faint)" }}>No cover letter</span>
     : <span>Cover letter</span>;
 

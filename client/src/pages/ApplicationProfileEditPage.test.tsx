@@ -9,6 +9,7 @@ const mockGet = vi.fn();
 const mockCreate = vi.fn();
 const mockUpdate = vi.fn();
 const mockDelete = vi.fn();
+const mockUploadProfileFile = vi.fn();
 
 vi.mock("../services/applicationProfilesApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/applicationProfilesApi")>();
@@ -18,6 +19,10 @@ vi.mock("../services/applicationProfilesApi", async (importOriginal) => {
     createApplicationProfile: (...args: unknown[]) => mockCreate(...args),
     updateApplicationProfile: (...args: unknown[]) => mockUpdate(...args),
     deleteApplicationProfile: (...args: unknown[]) => mockDelete(...args),
+    uploadProfileFile: (...args: unknown[]) => mockUploadProfileFile(...args),
+    extractFromResume: vi.fn(),
+    deleteProfileFile: vi.fn(),
+    getProfileFileUrl: vi.fn(),
   };
 });
 
@@ -47,8 +52,10 @@ const mockProfile = {
   github: null,
   linkedin: null,
   website: null,
-  resumeUrl: null,
-  coverLetterUrl: null,
+  resumeStorageKey: null,
+  resumeFileName: null,
+  coverLetterStorageKey: null,
+  coverLetterFileName: null,
   workAuthorization: null,
   desiredSalaryMin: null,
   created_date: "2026-05-21T00:00:00.000Z",
@@ -89,7 +96,7 @@ describe("ApplicationProfileEditPage — create mode", () => {
     expect(mockGet).not.toHaveBeenCalled();
   });
 
-  it("creates a profile and navigates back to /profiles on success", async () => {
+  it("creates a profile, stays on the page, and shows a Saved indicator on success", async () => {
     mockCreate.mockResolvedValue(mockProfile);
     renderPage("/profiles/new");
 
@@ -104,7 +111,42 @@ describe("ApplicationProfileEditPage — create mode", () => {
     await waitFor(() => {
       expect(mockCreate).toHaveBeenCalledOnce();
     });
-    expect(mockNavigate).toHaveBeenCalledWith("/profiles");
+    // We intentionally do NOT navigate away on create so any staged file
+    // uploads can finish; instead the page shows a "Saved" indicator.
+    await waitFor(() => {
+      expect(screen.getByText("Saved just now")).toBeDefined();
+    });
+    expect(mockNavigate).not.toHaveBeenCalledWith("/profiles");
+  });
+
+  it("uploads a staged resume via uploadProfileFile after a successful create", async () => {
+    mockCreate.mockResolvedValue({ ...mockProfile, id: 7 });
+    mockUploadProfileFile.mockResolvedValue({
+      ...mockProfile,
+      id: 7,
+      resumeStorageKey: "key-7",
+      resumeFileName: "resume.pdf",
+    });
+    renderPage("/profiles/new");
+
+    await user.type(screen.getByRole("textbox", { name: "Name" }), "New");
+    await user.type(screen.getByRole("textbox", { name: "First name" }), "A");
+    await user.type(screen.getByRole("textbox", { name: "Last name" }), "B");
+    await user.type(screen.getByRole("textbox", { name: "Email" }), "a@example.com");
+    await user.type(screen.getByRole("textbox", { name: "Phone" }), "5551234567");
+
+    const resumeInput = document.getElementById("profile-file-input-resume") as HTMLInputElement;
+    const resumeFile = new File(["resume bytes"], "resume.pdf", { type: "application/pdf" });
+    await user.upload(resumeInput, resumeFile);
+
+    await user.click(screen.getByRole("button", { name: "Create profile" }));
+
+    await waitFor(() => {
+      expect(mockCreate).toHaveBeenCalledOnce();
+    });
+    await waitFor(() => {
+      expect(mockUploadProfileFile).toHaveBeenCalledWith(7, "resume", resumeFile);
+    });
   });
 
   it("surfaces a server error when the create request fails", async () => {

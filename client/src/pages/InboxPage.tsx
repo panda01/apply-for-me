@@ -61,6 +61,21 @@ const FILTERS: { id: "all" | "new" | "duplicates" | "imported" | "dismissed"; la
 
 type FilterId = (typeof FILTERS)[number]["id"];
 
+/**
+ * True when a discovery can be selected for import. Only `pending` rows that
+ * are not duplicates qualify — imported rows can't be re-imported, duplicates
+ * point at an already-saved listing, and dismissed rows are explicitly
+ * excluded; the import endpoint rejects any other status. Shared by the
+ * auto-select, select-all, per-group toggle, and per-row enable logic so the
+ * eligibility rule lives in exactly one place.
+ *
+ * @param {DiscoveredJobResponse} row - The discovery row to test
+ * @returns {boolean} Whether the row is eligible for selection/import
+ */
+function isSelectableDiscovery(row: DiscoveredJobResponse): boolean {
+  return row.status === "pending" && row.duplicateOf === null;
+}
+
 interface SnackbarPayload {
   severity: "success" | "error" | "warning" | "info";
   text: string;
@@ -161,10 +176,7 @@ function DiscoveredRow({
   const isDuplicate = item.duplicateOf !== null;
   const isImported = item.status === "imported";
   const isDismissed = item.status === "dismissed";
-  // Imported rows can't be re-imported, duplicates point at an already-saved
-  // listing, and dismissed rows are explicitly excluded by the user. Only
-  // `pending` rows are eligible for selection.
-  const canSelect = !isDuplicate && !isImported && !isDismissed;
+  const canSelect = isSelectableDiscovery(item);
   const dataState = isDismissed
     ? "dismissed"
     : isImported
@@ -340,9 +352,7 @@ function InboxPage(): ReactElement {
       setDiscoveries(records);
       // Port of the design's lines 148–155: auto-select all pending
       // non-duplicate items so the user just deselects what they don't want.
-      const eligibleIds = records
-        .filter((row) => row.status === "pending" && row.duplicateOf === null)
-        .map((row) => row.id);
+      const eligibleIds = records.filter(isSelectableDiscovery).map((row) => row.id);
       setSelected(new Set(eligibleIds));
       setListError("");
     } catch (err) {
@@ -562,6 +572,33 @@ function InboxPage(): ReactElement {
     setSelected(new Set());
   };
 
+  /**
+   * Toggles selection for every selectable discovery within a single email
+   * group, leaving rows in other emails untouched. If every eligible row in
+   * the group is already selected they are all deselected; otherwise every
+   * eligible row in the group is selected. Rows that can't be imported
+   * (duplicate/imported/dismissed) are never affected. No-op when the group
+   * has no selectable rows.
+   *
+   * @param {DiscoveredJobResponse[]} groupItems - All rows in the email group
+   */
+  const toggleGroup = (groupItems: DiscoveredJobResponse[]): void => {
+    const eligibleIds = groupItems.filter(isSelectableDiscovery).map((row) => row.id);
+    if (eligibleIds.length === 0) {
+      return;
+    }
+    setSelected((previous) => {
+      const next = new Set(previous);
+      const everyEligibleSelected = eligibleIds.every((id) => next.has(id));
+      if (everyEligibleSelected) {
+        eligibleIds.forEach((id) => next.delete(id));
+      } else {
+        eligibleIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
   // Counters drive the filter-tab badges and the period-summary text. Each
   // row falls into exactly one bucket so the counts sum back to `all`. The
   // precedence is: dismissed > imported > duplicate > new (pending). Note
@@ -648,16 +685,14 @@ function InboxPage(): ReactElement {
   const selectAllVisible = (): void => {
     const next = new Set<number>();
     filtered.forEach((row) => {
-      if (row.status === "pending" && row.duplicateOf === null) {
+      if (isSelectableDiscovery(row)) {
         next.add(row.id);
       }
     });
     setSelected(next);
   };
 
-  const eligibleCount = filtered.filter(
-    (row) => row.status === "pending" && row.duplicateOf === null
-  ).length;
+  const eligibleCount = filtered.filter(isSelectableDiscovery).length;
   const isAllSelected = eligibleCount > 0 && selected.size === eligibleCount;
 
   const hasConnections = connections.length > 0;
@@ -851,9 +886,25 @@ function InboxPage(): ReactElement {
         </Paper>
       ) : (
         <Box className="disc-groups">
-          {groups.map((g) => (
+          {groups.map((g) => {
+            const groupEligibleIds = g.items.filter(isSelectableDiscovery).map((row) => row.id);
+            const groupHasSelectable = groupEligibleIds.length > 0;
+            const groupAllSelected =
+              groupHasSelectable && groupEligibleIds.every((id) => selected.has(id));
+            const groupSomeSelected =
+              !groupAllSelected && groupEligibleIds.some((id) => selected.has(id));
+            return (
             <Box key={g.email.messageId} className="disc-group">
               <Box className="disc-group-head">
+                <Checkbox
+                  className="cbx"
+                  size="small"
+                  checked={groupAllSelected}
+                  indeterminate={groupSomeSelected}
+                  disabled={!groupHasSelectable}
+                  onChange={() => toggleGroup(g.items)}
+                  inputProps={{ "aria-label": `Select all jobs from ${g.email.fromName}` }}
+                />
                 <EmailTag email={g.email} />
                 <span className="disc-group-time">{formatRelativeTime(g.email.receivedAt)}</span>
               </Box>
@@ -874,7 +925,8 @@ function InboxPage(): ReactElement {
                 ))}
               </Box>
             </Box>
-          ))}
+            );
+          })}
         </Box>
       )}
 

@@ -28,8 +28,34 @@ vi.mock("../services/jobApplicationService.js", () => {
   };
 });
 
+/** Signed read URL the mocked GCS service hands back for any stored object key. */
+const MOCK_SIGNED_URL = "https://signed.example.com/resume?sig=test";
+
+// Mock the GCS storage service so loadUserInfoFromProfile resolves signed URLs
+// without touching Google Cloud Storage. The shared app also mounts the
+// application-profile file router, so every named export it imports is provided.
+vi.mock("../services/gcsStorageService.js", () => {
+  return {
+    getSignedReadUrl: vi.fn(async () => MOCK_SIGNED_URL),
+    APPLY_URL_TTL_MS: 86400000,
+    deleteObject: vi.fn(),
+    buildResumeKey: vi.fn((id: number) => `resume/${String(id)}.pdf`),
+    buildCoverLetterKey: vi.fn((id: number) => `cover-letters/${String(id)}.pdf`),
+    uploadPdf: vi.fn(),
+  };
+});
+
+// The shared app also mounts applicationProfiles router, which imports the
+// resume extractor service; mock it so the module graph loads without Claude.
+vi.mock("../services/resumeProfileExtractorService.js", () => {
+  return {
+    extractProfileFromResume: vi.fn(),
+  };
+});
+
 import prisma from "../prismaClient.js";
 import { applyToJob } from "../services/jobApplicationService.js";
+import { getSignedReadUrl } from "../services/gcsStorageService.js";
 
 /**
  * Fixture mirroring an ApplicationProfile row as returned by Prisma. Used as
@@ -47,8 +73,10 @@ const mockApplicationProfile = {
   github: "https://github.com/panda01",
   linkedin: "https://www.linkedin.com/in/khalahjonesgolden/",
   website: "https://khalah.medium.com",
-  resumeUrl: "https://drive.google.com/file/d/test/view",
-  coverLetterUrl: null,
+  resumeStorageKey: "resume/1-abc.pdf",
+  resumeFileName: "resume.pdf",
+  coverLetterStorageKey: null,
+  coverLetterFileName: null,
   workAuthorization: null,
   desiredSalaryMin: null,
   created_date: new Date("2026-05-21T00:00:00.000Z"),
@@ -124,6 +152,28 @@ describe("POST /api/job-listings/:id/apply", () => {
       expect(applyToJob).toHaveBeenCalledWith(
         "https://acme.com/jobs/123/apply",
         expect.objectContaining({ firstName: "Khalah", lastName: "Jones-Golden" }),
+        "test-profile-id",
+        expect.any(Function),
+        1,
+        expect.any(Function),
+      );
+    });
+  });
+
+  it("signs the stored resume key and passes the resulting URL as userInfo.resumeUrl", async () => {
+    vi.mocked(prisma.jobListing.findUnique).mockResolvedValue(mockInitJobListing);
+    vi.mocked(prisma.jobListing.update).mockResolvedValue(mockApplyingJobListing);
+    vi.mocked(applyToJob).mockResolvedValue({ success: true, message: "Applied" });
+
+    await request(app)
+      .post("/api/job-listings/1/apply")
+      .send({ applicationProfileId: 1 });
+
+    await vi.waitFor(() => {
+      expect(getSignedReadUrl).toHaveBeenCalledWith("resume/1-abc.pdf", 86400000);
+      expect(applyToJob).toHaveBeenCalledWith(
+        "https://acme.com/jobs/123/apply",
+        expect.objectContaining({ resumeUrl: MOCK_SIGNED_URL, coverLetterUrl: null }),
         "test-profile-id",
         expect.any(Function),
         1,

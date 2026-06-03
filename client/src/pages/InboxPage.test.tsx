@@ -658,6 +658,86 @@ describe("InboxPage", () => {
     });
   });
 
+  it("selects every eligible job in one email group via its header checkbox, leaving other groups untouched", async () => {
+    // Two groups: A (msg-1, two pending rows) and B (msg-2, one pending row).
+    const groupARowOne = buildDiscovery({ id: 1, title: "Group A Job 1" });
+    const groupARowTwo = buildDiscovery({ id: 2, title: "Group A Job 2" });
+    const groupBRow = buildDiscovery({
+      id: 3,
+      title: "Group B Job 1",
+      email: { ...buildDiscovery().email, messageId: "msg-2", fromName: "Indeed Alerts" },
+    });
+    mockListDiscoveries.mockResolvedValue([groupARowOne, groupARowTwo, groupBRow]);
+
+    renderPage();
+    await waitFor(() => {
+      expect(screen.getByText("Group A Job 1")).toBeDefined();
+    });
+
+    // All three auto-select on load; clear so the group toggle is observable
+    // from a known-empty baseline.
+    await user.click(screen.getByRole("button", { name: "Clear" }));
+
+    const groupAHeader = screen.getByRole("checkbox", {
+      name: /select all jobs from linkedin jobs/i,
+    });
+    await user.click(groupAHeader);
+
+    // Group A's two rows are now selected; Group B's row is not.
+    await waitFor(() => {
+      expect((screen.getByRole("checkbox", { name: /select group a job 1/i }) as HTMLInputElement).checked).toBe(true);
+    });
+    expect((screen.getByRole("checkbox", { name: /select group a job 2/i }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: /select group b job 1/i }) as HTMLInputElement).checked).toBe(false);
+    // The import button reflects the two-of-three selection.
+    expect(screen.getByRole("button", { name: /import 2 jobs/i })).toBeDefined();
+
+    // Clicking the same group header again deselects only that group's rows.
+    await user.click(groupAHeader);
+    await waitFor(() => {
+      expect((screen.getByRole("checkbox", { name: /select group a job 1/i }) as HTMLInputElement).checked).toBe(false);
+    });
+    expect((screen.getByRole("checkbox", { name: /select group a job 2/i }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("renders the group header checkbox in the indeterminate state when only some of its rows are selected", async () => {
+    const groupRowOne = buildDiscovery({ id: 1, title: "Partial Job 1" });
+    const groupRowTwo = buildDiscovery({ id: 2, title: "Partial Job 2" });
+    mockListDiscoveries.mockResolvedValue([groupRowOne, groupRowTwo]);
+
+    renderPage();
+    await waitFor(() => {
+      expect(screen.getByText("Partial Job 1")).toBeDefined();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Clear" }));
+    // Select exactly one of the two rows in the group.
+    await user.click(screen.getByRole("checkbox", { name: /select partial job 1/i }));
+
+    const groupHeader = screen.getByRole("checkbox", {
+      name: /select all jobs from linkedin jobs/i,
+    });
+    await waitFor(() => {
+      expect(groupHeader.getAttribute("data-indeterminate")).toBe("true");
+    });
+  });
+
+  it("disables the group header checkbox when the group has no selectable rows", async () => {
+    // An imported row is not selectable, so its group header must be disabled.
+    const importedRow = buildDiscovery({ id: 1, title: "Imported Job", status: "imported" });
+    mockListDiscoveries.mockResolvedValue([importedRow]);
+
+    renderPage();
+    await waitFor(() => {
+      expect(screen.getByText("Imported Job")).toBeDefined();
+    });
+
+    const groupHeader = screen.getByRole("checkbox", {
+      name: /select all jobs from linkedin jobs/i,
+    });
+    expect((groupHeader as HTMLInputElement).disabled).toBe(true);
+  });
+
   it("shows an error snackbar when the list call fails", async () => {
     mockListDiscoveries.mockRejectedValue(new Error("network down"));
 

@@ -2,6 +2,9 @@ import { Router, Request, Response } from "express";
 import { Prisma } from "../../prisma/generated/client/client.js";
 import prisma from "../prismaClient.js";
 import { parseIdParam } from "./_helpers.js";
+import { runSinglePdfUpload, isPdfBuffer } from "./_pdfUpload.js";
+import { extractProfileFromResume } from "../services/resumeProfileExtractorService.js";
+import { deleteObject } from "../services/gcsStorageService.js";
 
 const router = Router();
 
@@ -37,8 +40,6 @@ interface ValidatedProfileInput {
   github: string | null;
   linkedin: string | null;
   website: string | null;
-  resumeUrl: string | null;
-  coverLetterUrl: string | null;
   workAuthorization: WorkAuthorizationValue | null;
   desiredSalaryMin: number | null;
 }
@@ -75,8 +76,6 @@ function validateProfileBody(body: unknown): { ok: true; data: ValidatedProfileI
   const github = readOptionalUrl(payload, "github", errors);
   const linkedin = readOptionalUrl(payload, "linkedin", errors);
   const website = readOptionalUrl(payload, "website", errors);
-  const resumeUrl = readOptionalUrl(payload, "resumeUrl", errors);
-  const coverLetterUrl = readOptionalUrl(payload, "coverLetterUrl", errors);
 
   const workAuthorization = readOptionalEnum(payload, "workAuthorization", WORK_AUTHORIZATION_VALUES, errors);
   const desiredSalaryMin = readOptionalPositiveInt(payload, "desiredSalaryMin", errors);
@@ -97,8 +96,6 @@ function validateProfileBody(body: unknown): { ok: true; data: ValidatedProfileI
       github,
       linkedin,
       website,
-      resumeUrl,
-      coverLetterUrl,
       workAuthorization,
       desiredSalaryMin,
     },
@@ -280,8 +277,6 @@ router.get("/:id", async (req: Request, res: Response) => {
  * @param {string} [req.body.github] - Optional GitHub URL
  * @param {string} [req.body.linkedin] - Optional LinkedIn URL
  * @param {string} [req.body.website] - Optional website URL
- * @param {string} [req.body.resumeUrl] - Optional resume URL
- * @param {string} [req.body.coverLetterUrl] - Optional cover letter URL
  * @param {string} [req.body.workAuthorization] - Optional WorkAuthorization enum value
  * @param {number} [req.body.desiredSalaryMin] - Optional minimum desired salary (USD whole dollars)
  * @returns {object} 201 - The created profile record
@@ -307,6 +302,46 @@ router.post("/", async (req: Request, res: Response) => {
       return;
     }
     throw err;
+  }
+});
+
+/**
+ * POST /api/application-profiles/extract-resume
+ * Stateless helper: accepts a resume PDF upload and returns the identity,
+ * contact, and profile-link fields Claude extracts from it, so the client can
+ * pre-fill a profile form. Does not persist anything. Expects a multipart
+ * upload with the PDF under the "file" field.
+ * @param {Express.Multer.File} req.file - The uploaded resume PDF (multipart "file" field)
+ * @returns {object} 200 - { fields } where fields is the ResumeProfileFields object
+ * @returns {object} 400 - No file provided, upload rejected, or file is not a valid PDF
+ * @returns {object} 502 - The Claude extraction call failed
+ */
+router.post("/extract-resume", async (req: Request, res: Response) => {
+  const ok = await runSinglePdfUpload(req, res);
+  if (!ok) {
+    // runSinglePdfUpload already wrote a 400 response on failure.
+    return;
+  }
+
+  if (!req.file) {
+    res.status(400).json({ error: "A PDF file is required" });
+    return;
+  }
+
+  const fileBuffer = req.file.buffer;
+  const isValidPdf = isPdfBuffer(fileBuffer);
+  if (!isValidPdf) {
+    res.status(400).json({ error: "Uploaded file is not a valid PDF" });
+    return;
+  }
+
+  try {
+    const fields = await extractProfileFromResume(fileBuffer);
+    res.status(200).json({ fields });
+  } catch (err) {
+    console.error("Resume profile extraction failed:", err);
+    const message = err instanceof Error ? err.message : "Resume profile extraction failed";
+    res.status(502).json({ error: message });
   }
 });
 
@@ -352,7 +387,9 @@ router.put("/:id", async (req: Request, res: Response) => {
 
 /**
  * DELETE /api/application-profiles/:id
- * Deletes an application profile by id.
+ * Deletes an application profile by id. Any resume / cover-letter PDFs the
+ * profile had stored in GCS are best-effort deleted first so they are not
+ * orphaned in the bucket once their owning row is gone.
  * @param {number} req.params.id - The profile id
  * @returns {object} 200 - The deleted profile record
  * @returns {object} 400 - Invalid id parameter
@@ -362,6 +399,14 @@ router.delete("/:id", async (req: Request, res: Response) => {
   const existing = await findApplicationProfileOrSend404(req, res);
   if (existing === null) {
     return;
+  }
+  // Best-effort GCS cleanup before the row disappears. deleteObject is safe
+  // even when the object is already gone, so a missing file never blocks the
+  // profile delete.
+  const storedObjectKeys = [existing.resumeStorageKey, existing.coverLetterStorageKey]
+    .filter((key): key is string => key !== null);
+  for (const objectKey of storedObjectKeys) {
+    await deleteObject(objectKey);
   }
   const deleted = await prisma.applicationProfile.delete({ where: { id: existing.id } });
   res.json(deleted);

@@ -30,7 +30,7 @@ vi.mock("../services/jobListingsApi", () => ({
 }));
 
 import JobsListPage from "./JobsListPage";
-import { getJobListings, applyToJob, fetchJobData } from "../services/jobListingsApi";
+import { getJobListings, applyToJob, fetchJobData, deleteJobListing } from "../services/jobListingsApi";
 import { type WorkArrangement } from "../components/WorkArrangementChip";
 
 /**
@@ -821,6 +821,267 @@ describe("JobsListPage", () => {
       expect(applyButton.disabled).toBe(false);
     });
     expect(screen.queryByTestId("fetch-info-button-16")).toBeNull();
+  });
+
+  it("renders a Fetch Info button on a missing_form_url row that lacks an application_url", async () => {
+    // A row whose first resolution attempt failed (status missing_form_url, no
+    // application_url) must still offer Fetch Info so the user can retry the
+    // resolve+scrape flow — alongside the usual View button for non-init rows.
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 50,
+        status: "missing_form_url",
+        title: "No Form Found",
+        application_url: null,
+      }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("No Form Found")).toBeDefined();
+    });
+
+    expect(screen.getByTestId("fetch-info-button-50")).toBeDefined();
+    expect(screen.getByRole("button", { name: "View" })).toBeDefined();
+    // No Apply affordance on a non-init row.
+    expect(screen.queryByTestId("apply-button-50")).toBeNull();
+  });
+
+  it("does not render a Fetch Info button on a missing_form_url row that already has an application_url", async () => {
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({
+        id: 51,
+        status: "missing_form_url",
+        title: "Has A Url",
+        application_url: "https://boards.example.com/apply/51",
+      }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Has A Url")).toBeDefined();
+    });
+
+    expect(screen.queryByTestId("fetch-info-button-51")).toBeNull();
+    expect(screen.getByRole("button", { name: "View" })).toBeDefined();
+  });
+
+  it("opens the confirm dialog and bulk-deletes every selected row, then refreshes and clears", async () => {
+    vi.mocked(deleteJobListing).mockResolvedValue(makeListing({ id: 1 }));
+    vi.mocked(getJobListings)
+      .mockResolvedValueOnce([
+        makeListing({ id: 1, status: "init", title: "Delete A" }),
+        makeListing({ id: 2, status: "init", title: "Delete B" }),
+      ])
+      .mockResolvedValue([]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Delete A")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+    expect(screen.getByText(/2 selected/)).toBeDefined();
+
+    // Clicking Delete in the bulk bar opens the confirmation dialog rather than
+    // deleting immediately.
+    fireEvent.click(screen.getByTestId("bulk-delete-button"));
+    expect(screen.getByText("Delete selected jobs?")).toBeDefined();
+    expect(deleteJobListing).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("confirm-bulk-delete-button"));
+
+    await waitFor(() => {
+      expect(deleteJobListing).toHaveBeenCalledTimes(2);
+    });
+    expect(deleteJobListing).toHaveBeenCalledWith(1);
+    expect(deleteJobListing).toHaveBeenCalledWith(2);
+    // The list is refetched (mount + post-delete) and the now-empty result
+    // collapses the bulk bar.
+    await waitFor(() => {
+      expect(getJobListings).toHaveBeenCalledTimes(2);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText(/selected/)).toBeNull();
+    });
+  });
+
+  it("closes the delete dialog without deleting when Cancel is pressed", async () => {
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({ id: 1, status: "init", title: "Keep Me" }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Keep Me")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+    fireEvent.click(screen.getByTestId("bulk-delete-button"));
+    expect(screen.getByText("Delete selected jobs?")).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(screen.queryByText("Delete selected jobs?")).toBeNull();
+    });
+    expect(deleteJobListing).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an Alert when a bulk delete call rejects", async () => {
+    vi.mocked(deleteJobListing).mockRejectedValue(new Error("delete boom"));
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({ id: 1, status: "init", title: "Delete A" }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Delete A")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+    fireEvent.click(screen.getByTestId("bulk-delete-button"));
+    fireEvent.click(screen.getByTestId("confirm-bulk-delete-button"));
+
+    await waitFor(() => {
+      expect(screen.getByText("delete boom")).toBeDefined();
+    });
+  });
+
+  it("shows singular copy in the delete dialog when exactly one row is selected", async () => {
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({ id: 1, status: "init", title: "Solo Row" }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Solo Row")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select Solo Row/ }));
+    fireEvent.click(screen.getByTestId("bulk-delete-button"));
+
+    expect(
+      screen.getByText("This permanently deletes 1 selected job. This action cannot be undone.")
+    ).toBeDefined();
+  });
+
+  it("closes the delete dialog on Escape when no deletion is in flight", async () => {
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({ id: 1, status: "init", title: "Esc Row" }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Esc Row")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+    fireEvent.click(screen.getByTestId("bulk-delete-button"));
+    expect(screen.getByText("Delete selected jobs?")).toBeDefined();
+
+    // Escape fires the Dialog's onClose; with no deletion running it closes.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByText("Delete selected jobs?")).toBeNull();
+    });
+    expect(deleteJobListing).not.toHaveBeenCalled();
+  });
+
+  it("keeps the delete dialog open if a close is attempted while a deletion is in flight", async () => {
+    // Hold deleteJobListing unresolved so isDeleting stays true and the onClose
+    // guard is exercised in its "don't close" branch.
+    let resolveDelete: (() => void) | undefined;
+    vi.mocked(deleteJobListing).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveDelete = () => resolve(makeListing({ id: 1 }));
+        })
+    );
+    vi.mocked(getJobListings).mockResolvedValue([
+      makeListing({ id: 1, status: "init", title: "Slow Delete" }),
+    ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Slow Delete")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+    fireEvent.click(screen.getByTestId("bulk-delete-button"));
+    fireEvent.click(screen.getByTestId("confirm-bulk-delete-button"));
+
+    // Deletion is in flight: the confirm button reports the deleting state.
+    await waitFor(() => {
+      expect((screen.getByTestId("confirm-bulk-delete-button") as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    // Attempting to close (Escape) is ignored while deleting — dialog stays open.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(screen.getByText("Delete selected jobs?")).toBeDefined();
+
+    // Resolve so the component settles and the test exits cleanly.
+    await act(async () => {
+      resolveDelete?.();
+    });
+  });
+
+  it("stops the fetch spinner on a missing_form_url retry once a new resolution attempt finishes", async () => {
+    // The row carries a prior resolution log (id 5). After Fetch Info runs, the
+    // refetched row reports a NEW log (id 6) with resolution finished — even
+    // though status stays missing_form_url and no application_url appears — so
+    // the prune effect drops the spinner via the log-id comparison.
+    vi.mocked(fetchJobData).mockResolvedValue(makeListing({ id: 60 }));
+    vi.mocked(getJobListings)
+      .mockResolvedValueOnce([
+        makeListing({
+          id: 60,
+          status: "missing_form_url",
+          title: "Retry Me",
+          application_url: null,
+          latest_resolution_log_id: 5,
+          resolution_in_progress: false,
+        }),
+      ])
+      .mockResolvedValue([
+        makeListing({
+          id: 60,
+          status: "missing_form_url",
+          title: "Retry Me",
+          application_url: null,
+          latest_resolution_log_id: 6,
+          resolution_in_progress: false,
+        }),
+      ]);
+
+    renderJobsListPage();
+
+    await waitFor(() => {
+      expect(screen.getByText("Retry Me")).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByTestId("fetch-info-button-60"));
+
+    await waitFor(() => {
+      expect(fetchJobData).toHaveBeenCalledWith(60);
+    });
+
+    // Once the new attempt (log 6 ≠ baseline 5, not in progress) is observed,
+    // the spinner clears: the button returns to its enabled idle "Fetch Info".
+    await waitFor(() => {
+      const fetchButton = screen.getByTestId("fetch-info-button-60") as HTMLButtonElement;
+      expect(fetchButton.disabled).toBe(false);
+      expect(fetchButton.textContent).toContain("Fetch Info");
+    });
   });
 
   it("auto-applies to every selected init row in the bulk bar", async () => {

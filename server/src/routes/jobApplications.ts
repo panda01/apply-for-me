@@ -4,6 +4,7 @@ import { applyToJob } from "../services/jobApplicationService.js";
 import type { UserInfo, WorkAuthorization, ApplicationResult } from "../services/jobApplicationService.js";
 import type { ApplicationAttemptOutcome } from "../../prisma/generated/client/enums.js";
 import { findJobListingOrSend404 } from "./_helpers.js";
+import { getSignedReadUrl, APPLY_URL_TTL_MS } from "../services/gcsStorageService.js";
 
 const router = Router();
 
@@ -66,14 +67,23 @@ function parseApplicationProfileIdOrSend400(req: Request, res: Response): number
  * Loads an ApplicationProfile by id and maps it into the UserInfo shape used
  * by the Browser-Use prompt builder. Returns null when the row is missing so
  * the caller can respond with 400 / "profile not found".
+ *
+ * The resume and cover-letter PDFs live in Google Cloud Storage; the profile
+ * row only stores their object keys. For each present key we generate a fresh,
+ * short-lived signed read URL (valid for APPLY_URL_TTL_MS = 24h, i.e. the
+ * duration of an apply run) that the Browser-Use agent can fetch directly.
+ * When a key is absent, the corresponding URL is null.
  * @param {number} applicationProfileId - The selected ApplicationProfile.id
- * @returns {Promise<UserInfo | null>} The mapped UserInfo, or null when the profile is missing
+ * @returns {Promise<UserInfo | null>} The mapped UserInfo (with freshly-signed
+ *   GCS resume/cover-letter URLs), or null when the profile is missing
  */
 async function loadUserInfoFromProfile(applicationProfileId: number): Promise<UserInfo | null> {
   const profile = await prisma.applicationProfile.findUnique({ where: { id: applicationProfileId } });
   if (profile === null) {
     return null;
   }
+  const resumeUrl = profile.resumeStorageKey ? await getSignedReadUrl(profile.resumeStorageKey, APPLY_URL_TTL_MS) : null;
+  const coverLetterUrl = profile.coverLetterStorageKey ? await getSignedReadUrl(profile.coverLetterStorageKey, APPLY_URL_TTL_MS) : null;
   return {
     firstName: profile.firstName,
     middleName: profile.middleName,
@@ -83,8 +93,8 @@ async function loadUserInfoFromProfile(applicationProfileId: number): Promise<Us
     github: profile.github,
     linkedin: profile.linkedin,
     website: profile.website,
-    resumeUrl: profile.resumeUrl,
-    coverLetterUrl: profile.coverLetterUrl,
+    resumeUrl,
+    coverLetterUrl,
     workAuthorization: profile.workAuthorization as WorkAuthorization | null,
     desiredSalaryMin: profile.desiredSalaryMin,
   };

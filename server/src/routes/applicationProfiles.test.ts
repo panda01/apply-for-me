@@ -2,6 +2,29 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import { app } from "../app.js";
 
+// Mock the resume extractor + GCS storage services so the router module loads
+// without reaching out to Claude or Google Cloud Storage. extractProfileFromResume
+// is driven per-test; deleteObject is asserted on the DELETE cleanup path.
+vi.mock("../services/resumeProfileExtractorService.js", () => {
+  return {
+    extractProfileFromResume: vi.fn(),
+  };
+});
+
+vi.mock("../services/gcsStorageService.js", () => {
+  // The shared app also mounts applicationProfileFilesRouter, which imports
+  // several named exports from this module; provide them all so the module
+  // graph loads even though only deleteObject is exercised here.
+  return {
+    deleteObject: vi.fn(),
+    buildResumeKey: vi.fn((id: number) => `resume/${String(id)}.pdf`),
+    buildCoverLetterKey: vi.fn((id: number) => `cover-letters/${String(id)}.pdf`),
+    uploadPdf: vi.fn(),
+    getSignedReadUrl: vi.fn(),
+    APPLY_URL_TTL_MS: 86400000,
+  };
+});
+
 vi.mock("../prismaClient.js", () => {
   return {
     default: {
@@ -40,6 +63,8 @@ vi.mock("../../prisma/generated/client/client.js", () => {
 
 import prisma from "../prismaClient.js";
 import { Prisma } from "../../prisma/generated/client/client.js";
+import { extractProfileFromResume } from "../services/resumeProfileExtractorService.js";
+import { deleteObject } from "../services/gcsStorageService.js";
 
 /**
  * Minimal application profile fixture used as the "stored" record across the
@@ -58,8 +83,10 @@ const sampleProfile = {
   github: "https://github.com/panda01",
   linkedin: "https://www.linkedin.com/in/khalahjonesgolden/",
   website: "https://khalah.medium.com",
-  resumeUrl: "https://drive.google.com/file/d/1/view",
-  coverLetterUrl: null,
+  resumeStorageKey: null,
+  resumeFileName: null,
+  coverLetterStorageKey: null,
+  coverLetterFileName: null,
   workAuthorization: null,
   desiredSalaryMin: null,
   created_date: new Date("2026-05-21T00:00:00.000Z"),
@@ -141,7 +168,6 @@ describe("POST /api/application-profiles", () => {
     const callArg = vi.mocked(prisma.applicationProfile.create).mock.calls[0]?.[0];
     expect(callArg?.data.name).toBe("Default");
     expect(callArg?.data.middleName).toBeNull();
-    expect(callArg?.data.coverLetterUrl).toBeNull();
     expect(callArg?.data.workAuthorization).toBeNull();
     expect(callArg?.data.desiredSalaryMin).toBeNull();
   });
@@ -156,8 +182,6 @@ describe("POST /api/application-profiles", () => {
         github: "https://github.com/panda01",
         linkedin: "https://www.linkedin.com/in/khalahjonesgolden/",
         website: "https://khalah.medium.com",
-        resumeUrl: "https://drive.google.com/file/d/1/view",
-        coverLetterUrl: "https://docs.google.com/document/d/abc/view",
         workAuthorization: "us_citizen",
         desiredSalaryMin: 120000,
       }));
@@ -199,11 +223,11 @@ describe("POST /api/application-profiles", () => {
   it("returns 400 when an optional URL is malformed", async () => {
     const response = await request(app)
       .post("/api/application-profiles")
-      .send(buildValidBody({ coverLetterUrl: "ftp://example.com/doc" }));
+      .send(buildValidBody({ github: "ftp://example.com/doc" }));
 
     expect(response.status).toBe(400);
     expect(response.body.errors).toEqual(
-      expect.arrayContaining([expect.stringContaining("coverLetterUrl")])
+      expect.arrayContaining([expect.stringContaining("github")])
     );
   });
 
@@ -279,6 +303,63 @@ describe("POST validation edge cases", () => {
 
     // Default express error handler turns unhandled rejections into 500
     expect(response.status).toBe(500);
+    errorSpy.mockRestore();
+  });
+});
+
+describe("POST /api/application-profiles/extract-resume", () => {
+  /** Minimal valid PDF byte sequence (starts with the "%PDF-" magic signature). */
+  const VALID_PDF_BYTES = "%PDF-1.4 resume";
+
+  it("returns the extracted fields for a valid PDF upload", async () => {
+    const extractedFields = {
+      firstName: "Khalah",
+      lastName: "Jones-Golden",
+      email: "khasan222@gmail.com",
+      phone: "13479770736",
+      github: "https://github.com/panda01",
+      linkedin: null,
+      website: null,
+    };
+    vi.mocked(extractProfileFromResume).mockResolvedValue(extractedFields as never);
+
+    const response = await request(app)
+      .post("/api/application-profiles/extract-resume")
+      .attach("file", Buffer.from(VALID_PDF_BYTES), { filename: "resume.pdf", contentType: "application/pdf" });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ fields: extractedFields });
+    expect(extractProfileFromResume).toHaveBeenCalledWith(expect.any(Buffer));
+  });
+
+  it("returns 400 when the upload is not a PDF mimetype", async () => {
+    const response = await request(app)
+      .post("/api/application-profiles/extract-resume")
+      .attach("file", Buffer.from("plain text"), { filename: "notes.txt", contentType: "text/plain" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Only PDF files are allowed/);
+    expect(extractProfileFromResume).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when no file is attached", async () => {
+    const response = await request(app).post("/api/application-profiles/extract-resume");
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/PDF file is required/);
+    expect(extractProfileFromResume).not.toHaveBeenCalled();
+  });
+
+  it("returns 502 when the Claude extraction call fails", async () => {
+    vi.mocked(extractProfileFromResume).mockRejectedValue(new Error("Claude unavailable"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await request(app)
+      .post("/api/application-profiles/extract-resume")
+      .attach("file", Buffer.from(VALID_PDF_BYTES), { filename: "resume.pdf", contentType: "application/pdf" });
+
+    expect(response.status).toBe(502);
+    expect(response.body.error).toMatch(/Claude unavailable/);
     errorSpy.mockRestore();
   });
 });
@@ -359,6 +440,25 @@ describe("DELETE /api/application-profiles/:id", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.id).toBe(1);
+    expect(prisma.applicationProfile.delete).toHaveBeenCalledWith({ where: { id: 1 } });
+  });
+
+  it("deletes the stored resume and cover-letter objects from GCS before deleting the row", async () => {
+    const profileWithFiles = {
+      ...sampleProfile,
+      resumeStorageKey: "resume/1-abc.pdf",
+      resumeFileName: "resume.pdf",
+      coverLetterStorageKey: "cover-letters/1-def.pdf",
+      coverLetterFileName: "cover.pdf",
+    };
+    vi.mocked(prisma.applicationProfile.findUnique).mockResolvedValue(profileWithFiles);
+    vi.mocked(prisma.applicationProfile.delete).mockResolvedValue(profileWithFiles);
+
+    const response = await request(app).delete("/api/application-profiles/1");
+
+    expect(response.status).toBe(200);
+    expect(deleteObject).toHaveBeenCalledWith("resume/1-abc.pdf");
+    expect(deleteObject).toHaveBeenCalledWith("cover-letters/1-def.pdf");
     expect(prisma.applicationProfile.delete).toHaveBeenCalledWith({ where: { id: 1 } });
   });
 

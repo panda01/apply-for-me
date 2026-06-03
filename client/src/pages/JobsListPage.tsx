@@ -6,6 +6,11 @@ import {
   Button,
   Checkbox,
   CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
   InputAdornment,
   Paper,
   Table,
@@ -19,6 +24,7 @@ import {
 import Search from "@mui/icons-material/Search";
 import {
   applyToJob,
+  deleteJobListing,
   fetchJobData,
   getJobListings,
   type JobListingResponse,
@@ -64,7 +70,14 @@ function JobsListPage() {
   const [actionErrorMessage, setActionErrorMessage] = useState("");
   const [activeTab, setActiveTab] = useState<string>("all");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
-  const [fetchingIds, setFetchingIds] = useState<Set<number>>(new Set());
+  // Tracks rows with a "Fetch Info" run in flight. The value is the row's
+  // `latest_resolution_log_id` captured at click time (the baseline), so the
+  // prune effect can tell when a NEW resolution attempt has finished — even on
+  // rows that don't change `status` (e.g. a missing_form_url retry that fails
+  // again). null means the row had no prior resolution attempt.
+  const [fetchingInfo, setFetchingInfo] = useState<Map<number, number | null>>(new Map());
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   // Search input is initialised from the URL `?q=` param so deep links and
   // back-navigation restore the previous search context.
@@ -127,7 +140,7 @@ function JobsListPage() {
     const hasApplyingListings = jobListings.some((listing) => listing.status === "applying");
     // Also keep polling while a background "Fetch Info" is in flight so the row
     // refreshes (status / application_url) as soon as the scrape resolves.
-    const hasInFlightFetches = fetchingIds.size > 0;
+    const hasInFlightFetches = fetchingInfo.size > 0;
     const shouldPoll = hasApplyingListings || hasInFlightFetches;
 
     if (shouldPoll) {
@@ -148,23 +161,33 @@ function JobsListPage() {
         pollIntervalRef.current = null;
       }
     };
-  }, [jobListings, fetchListings, fetchingIds]);
+  }, [jobListings, fetchListings, fetchingInfo]);
 
   /**
-   * Prunes the {@link fetchingIds} spinner-tracking set whenever the listings
-   * change. Once a background fetch resolves the row (status moves off "init",
-   * an application_url appears, or the row disappears entirely) we drop its id,
-   * which stops its "Fetching…" spinner and enables the Apply button.
+   * Prunes the {@link fetchingInfo} spinner-tracking map whenever the listings
+   * change. A tracked row is dropped (stopping its "Fetching…" spinner) once
+   * the background fetch is done: the row disappeared, it gained an
+   * application_url (success), or a NEW resolution attempt finished — detected
+   * by the latest resolution log id moving past the baseline captured at click
+   * time while `resolution_in_progress` is false. The log-id comparison is what
+   * lets us stop the spinner on a failed retry of a `missing_form_url` row,
+   * whose status never changes.
    */
   useEffect(() => {
-    setFetchingIds((previous) => {
+    setFetchingInfo((previous) => {
       if (previous.size === 0) return previous;
-      const next = new Set(previous);
-      for (const trackedId of previous) {
+      const next = new Map(previous);
+      for (const [trackedId, baselineLogId] of previous) {
         const listing = jobListings.find((row) => row.id === trackedId);
-        const rowResolvedOrGone =
-          listing === undefined || listing.status !== "init" || !!listing.application_url;
-        if (rowResolvedOrGone) next.delete(trackedId);
+        const rowIsGone = listing === undefined;
+        const rowGainedApplicationUrl = listing !== undefined && !!listing.application_url;
+        const newAttemptFinished =
+          listing !== undefined &&
+          listing.latest_resolution_log_id !== baselineLogId &&
+          !listing.resolution_in_progress;
+        if (rowIsGone || rowGainedApplicationUrl || newAttemptFinished) {
+          next.delete(trackedId);
+        }
       }
       return next.size === previous.size ? previous : next;
     });
@@ -298,24 +321,52 @@ function JobsListPage() {
    * Triggers the scrape + application-URL resolution flow for a single listing
    * via {@link fetchJobData}. This populates the row's `application_url` (and may
    * spawn a managed container), after which Apply becomes available. Tracks the
-   * id in {@link fetchingIds} to show a per-row spinner; on success the id is
-   * left in place and the prune effect removes it once the row resolves, while
-   * on failure it is removed immediately and the error is surfaced.
+   * id in {@link fetchingInfo} (keyed to its baseline resolution-log id) to show
+   * a per-row spinner; on success the id is left in place and the prune effect
+   * removes it once the resolution attempt finishes, while on failure it is
+   * removed immediately and the error is surfaced.
    * @param {number} jobId - The job listing id to fetch info for.
    */
   const handleFetchInfo = async (jobId: number) => {
     setActionErrorMessage("");
-    setFetchingIds((prev) => new Set(prev).add(jobId));
+    const currentListing = jobListings.find((row) => row.id === jobId);
+    const baselineLogId = currentListing?.latest_resolution_log_id ?? null;
+    setFetchingInfo((prev) => new Map(prev).set(jobId, baselineLogId));
     try {
       await fetchJobData(jobId);
       await fetchListings();
     } catch (err) {
       setActionErrorMessage(err instanceof Error ? err.message : "Failed to fetch job info");
-      setFetchingIds((prev) => {
-        const next = new Set(prev);
+      setFetchingInfo((prev) => {
+        const next = new Map(prev);
         next.delete(jobId);
         return next;
       });
+    }
+  };
+
+  /**
+   * Deletes every currently-selected (and visible) row by issuing one
+   * {@link deleteJobListing} call per id, then refreshes the list and clears
+   * the selection. Surfaces a top-of-page Alert on the first failure. Closes
+   * the confirmation dialog when the batch settles.
+   */
+  const handleBulkDelete = async () => {
+    setActionErrorMessage("");
+    setIsDeleting(true);
+    const idsToDelete = [...visibleSelectedIds];
+    try {
+      for (const jobId of idsToDelete) {
+        await deleteJobListing(jobId);
+      }
+      await fetchListings();
+      handleClearSelection();
+      setIsDeleteDialogOpen(false);
+    } catch (err) {
+      const errorText = err instanceof Error ? err.message : "Failed to delete selected jobs";
+      setActionErrorMessage(errorText);
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -470,7 +521,13 @@ function JobsListPage() {
               <Button size="small" variant="outlined" disabled>
                 Export
               </Button>
-              <Button size="small" variant="outlined" color="error" disabled>
+              <Button
+                size="small"
+                variant="outlined"
+                color="error"
+                onClick={() => setIsDeleteDialogOpen(true)}
+                data-testid="bulk-delete-button"
+              >
                 Delete
               </Button>
             </Box>
@@ -549,7 +606,7 @@ function JobsListPage() {
                   : "—";
                 const addedDateText = new Date(listing.created_date).toLocaleDateString();
                 const rowHasApplicationUrl = listing.application_url !== null && listing.application_url !== "";
-                const isRowFetchingInfo = fetchingIds.has(listing.id);
+                const isRowFetchingInfo = fetchingInfo.has(listing.id);
 
                 return (
                   <TableRow
@@ -601,28 +658,34 @@ function JobsListPage() {
                     </TableCell>
                     <TableCell className="mono">{addedDateText}</TableCell>
                     <TableCell sx={{ textAlign: "right", pr: 2 }}>
-                      {listing.status === "init" ? (
-                        rowHasApplicationUrl ? (
+                      <Box sx={{ display: "inline-flex", gap: 1, justifyContent: "flex-end" }}>
+                        {/* Fetch Info stays available on any row missing an
+                            application_url — including non-init rows like
+                            missing_form_url — so the user can (re)run the
+                            resolve+scrape flow that finds the application form. */}
+                        {!rowHasApplicationUrl && (
                           <Button
                             size="small"
-                            variant="contained"
-                            onClick={() => handleApplyOne(listing.id)}
-                            data-testid={`apply-button-${String(listing.id)}`}
+                            variant="outlined"
+                            onClick={() => handleFetchInfo(listing.id)}
+                            disabled={isRowFetchingInfo}
+                            startIcon={isRowFetchingInfo ? <CircularProgress size={14} /> : undefined}
+                            data-testid={`fetch-info-button-${String(listing.id)}`}
                           >
-                            Apply
+                            {isRowFetchingInfo ? "Fetching…" : "Fetch Info"}
                           </Button>
-                        ) : (
-                          <Box sx={{ display: "inline-flex", gap: 1, justifyContent: "flex-end" }}>
+                        )}
+                        {listing.status === "init" ? (
+                          rowHasApplicationUrl ? (
                             <Button
                               size="small"
-                              variant="outlined"
-                              onClick={() => handleFetchInfo(listing.id)}
-                              disabled={isRowFetchingInfo}
-                              startIcon={isRowFetchingInfo ? <CircularProgress size={14} /> : undefined}
-                              data-testid={`fetch-info-button-${String(listing.id)}`}
+                              variant="contained"
+                              onClick={() => handleApplyOne(listing.id)}
+                              data-testid={`apply-button-${String(listing.id)}`}
                             >
-                              {isRowFetchingInfo ? "Fetching…" : "Fetch Info"}
+                              Apply
                             </Button>
+                          ) : (
                             <Tooltip title={FETCH_INFO_HINT}>
                               <span onClick={(event) => event.stopPropagation()}>
                                 <Button
@@ -635,17 +698,17 @@ function JobsListPage() {
                                 </Button>
                               </span>
                             </Tooltip>
-                          </Box>
-                        )
-                      ) : (
-                        <Button
-                          size="small"
-                          variant="outlined"
-                          onClick={() => navigate(`/jobs/${String(listing.id)}`)}
-                        >
-                          View
-                        </Button>
-                      )}
+                          )
+                        ) : (
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            onClick={() => navigate(`/jobs/${String(listing.id)}`)}
+                          >
+                            View
+                          </Button>
+                        )}
+                      </Box>
                     </TableCell>
                   </TableRow>
                 );
@@ -654,6 +717,35 @@ function JobsListPage() {
           </TableBody>
         </Table>
       </Paper>
+
+      <Dialog
+        open={isDeleteDialogOpen}
+        onClose={() => {
+          if (!isDeleting) setIsDeleteDialogOpen(false);
+        }}
+      >
+        <DialogTitle>Delete selected jobs?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            {`This permanently deletes ${String(visibleSelectedIds.length)} selected job${
+              visibleSelectedIds.length === 1 ? "" : "s"
+            }. This action cannot be undone.`}
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setIsDeleteDialogOpen(false)} disabled={isDeleting}>
+            Cancel
+          </Button>
+          <Button
+            color="error"
+            onClick={handleBulkDelete}
+            disabled={isDeleting}
+            data-testid="confirm-bulk-delete-button"
+          >
+            {isDeleting ? "Deleting…" : "Delete"}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </>
   );
 }

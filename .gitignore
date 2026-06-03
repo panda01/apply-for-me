@@ -26,6 +26,9 @@ dev.db
 # LinkedIn credentials
 server/src/scripts/linkedin_credentials.json
 
+# Google Cloud Storage service-account key
+server/src/scripts/gcs_service_account.json
+
 # Application logs and screenshots
 logs/
 
